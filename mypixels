@@ -25,6 +25,7 @@ config = {
     'bg_tint_color': '#140008',
     'hide_single_tab': False,
     'tablist_top': True,
+    'tab_title_max_length': 16, # -1 to disable this
     # TODO:
     'autohide_delay': -1 # if positive, a delay in miliseconds to wait before hiding the tab bar
 };
@@ -50,7 +51,7 @@ def counter():
         yield i
         i += 1
 
-class PTerm:
+class MyPixels:
     def __init__(self):
         # counter used for tab id's
         self.counter = counter()
@@ -165,7 +166,7 @@ class PTerm:
         tab = vte.Terminal()
         tab.connect("child-exited", self.child_exited)
         tab.connect("eof", self.child_exited)
-        # window-title-changed...
+        tab.connect("window-title-changed", self.window_title_changed)
 
         tab.set_font(pango.FontDescription(config["term_font"]))
         tab.set_scrollback_lines(config['scrollback_lines'])
@@ -206,6 +207,7 @@ class PTerm:
         curidx = self.notebook.get_current_page()
 
         tab_format = config['tab_format']
+        max_title_len = config['tab_title_max_length']
 
         for idx, tab in enumerate(self.notebook):
             cname = 'tab_color'
@@ -221,6 +223,9 @@ class PTerm:
 
             if not tname:
                 tname = str(tid)
+
+            if max_title_len > 0 and len(tname) > max_title_len:
+                tname = tname[:max_title_len] + "\xe2\x80\xa6"
 
             if (idx == curidx):
                 cname = 'tab_color_selected'
@@ -333,6 +338,10 @@ class PTerm:
 
     def child_exited(self, term):
         self.close_tab()
+        
+    def window_title_changed(self, term):
+        self.tabs[term]['title'] = term.get_window_title()
+        self.update_tablist()
 
     def tab_opened(self, notebook, tab, index):
         if config["focus_new_tabs"]:
@@ -364,17 +373,18 @@ class PTerm:
         # if there is more than one tab, ask
         if (self.notebook.get_n_pages() > 1):
             # ask first
-            dialog = gtk.MessageDialog(None, gtk.DIALOG_MODAL, gtk.MESSAGE_QUESTION,  gtk.BUTTONS_YES_NO, "Do you really want to close?")
-            dialog.add_button(gtk.STOCK_CLOSE, gtk.RESPONSE_CLOSE)
+            dialog = gtk.MessageDialog(self.window, gtk.DIALOG_MODAL, \
+                gtk.MESSAGE_INFO, gtk.BUTTONS_YES_NO, "Do you really want to close?")
+
             rv = dialog.run()
             dialog.destroy()
 
             if rv == gtk.RESPONSE_NO:
-                return
+                return True # cancel the quit
 
         # TODO: Cleanup
         gtk.main_quit()
 
 if __name__ == '__main__':
-    term = PTerm()
+    term = MyPixels()
     term.run()
