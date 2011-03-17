@@ -177,7 +177,8 @@ class MyPixels:
 
         tid = self.counter.next()
 
-        tab.fork_command()
+        # The empty argv list is a fix for zsh segv...
+        tab.fork_command(argv=[""])
         tab.show()
 
         if (command):
