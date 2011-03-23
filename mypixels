@@ -5,16 +5,25 @@
 # use as you will (but please leave a credit line)
 # heavily inspired by uzbl-tabbed.py
 
+# TODO: Timer for tablist updates - optionally set to refresh if using some dynamic status
+
 import gtk
 import vte
 import pango
+import types
+
+def clock():
+    from time import localtime, strftime
+    return "%s " % strftime("%H:%M", localtime())
 
 # Default config
 config = {
     'tablist_background': "#303030", # Tablist background
     'multiline_tabs': True,
     'focus_new_tabs': True,
-    'tab_format': '<span %(color)s>[%(tidx)d-%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
+    'tab_prepend': clock, # callback to function that generates pango markup text appended to tab list before the tabs
+    'tab_append': None,  # the same, but appended after tab list
+    'tab_format': '<span %(color)s>[%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
     'tab_color': 'foreground = "#888" background = "#303030"',
     'tab_color_selected': 'foreground = "#fff" background = "#505020"',
     'tablist_font': 'Liberation Mono 7',
@@ -26,6 +35,7 @@ config = {
     'hide_single_tab': False,
     'tablist_top': True,
     'tab_title_max_length': 16, # -1 to disable this
+    'tab_title_short_current': 32, # shorten the selected tab title (False - don't, True - do, int > 0 current title max length)
     # TODO:
     'autohide_delay': -1 # if positive, a delay in miliseconds to wait before hiding the tab bar
 };
@@ -139,11 +149,15 @@ class MyPixels:
             self.vbox.reorder_child(self.ebox, 2)
 
         self.window.connect("key-press-event", self.key_pressed)
+        self.window.connect("configure-event", self.resize_request)
 
         self.vbox.show()
         self.window.show()
 
         self.tabs = {}
+
+    def resize_request(self, wnd, event):
+        self.update_tablist()
 
     def key_pressed(self, wnd, event):
         if event.type != gtk.gdk.KEY_PRESS:
@@ -204,6 +218,9 @@ class MyPixels:
 
         multiline = []
         pango = ""
+        
+        if config['tab_prepend']:
+            pango = config['tab_prepend']()
 
         curidx = self.notebook.get_current_page()
 
@@ -225,10 +242,19 @@ class MyPixels:
             if not tname:
                 tname = str(tid)
 
-            if max_title_len > 0 and len(tname) > max_title_len:
-                tname = tname[:max_title_len] + "\xe2\x80\xa6"
+            if (idx != curidx):
+                if max_title_len > 0 and len(tname) > max_title_len:
+                    tname = tname[:max_title_len] + "\xe2\x80\xa6"
+            else:
+                mt_cur = max_title_len
+                sh_cur = config['tab_title_short_current']
+                if (type(sh_cur) == types.IntType):
+                    mt_cur = sh_cur
+                    sh_cur = True
 
-            if (idx == curidx):
+                if sh_cur and mt_cur > 0 and len(tname) > mt_cur:
+                    tname = tname[:mt_cur] + "\xe2\x80\xa6"
+
                 cname = 'tab_color_selected'
 
             color = config[cname]
@@ -243,7 +269,6 @@ class MyPixels:
                 winwidth = self.window.get_size()[0]
 
                 if listwidth > (winwidth - 20):
-                    # TODO: Why this happens?
                     if opango != "":
                         multiline.append(opango)
 
@@ -251,6 +276,9 @@ class MyPixels:
             else:
                 pango += tab_format % locals()
 
+        if (config['tab_append']):
+            pango += " " + config['tab_append']()
+        
         if multiline_tabs:
             multiline.append(pango)
             self.tablist.set_markup('&#10;'.join(multiline))
