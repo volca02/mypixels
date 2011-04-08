@@ -408,7 +408,7 @@ class MyPixels:
             rv = dialog.run()
             dialog.destroy()
 
-            if rv == gtk.RESPONSE_NO:
+            if rv != gtk.RESPONSE_YES:
                 return True # cancel the quit
 
         # TODO: Cleanup
