@@ -32,6 +32,13 @@ config = {
     'scrollback_lines': 1000,
     'term_opacity': 0.1,
     'bg_tint_color': '#140008',
+    # the default palette is "solarized"
+    'palette': '#070736364242:#DCDC32322F2F:#858599990000:#B5B589890000:\
+#26268B8BD2D2:#D3D336368282:#2A2AA1A19898:#EEEEE8E8D5D5:#00002B2B3636:\
+#CBCB4B4B1616:#58586E6E7575:#65657B7B8383:#838394949696:#6C6C7171C4C4:\
+#9393A1A1A1A1:#FDFDF6F6E3E3',
+    'foreground_color': '#BBB',
+    'background_color': '#000',
     'hide_single_tab': False,
     'tablist_top': True,
     'tab_title_max_length': 16, # -1 to disable this
@@ -91,12 +98,28 @@ class MyPixels:
             # tab open/close
             (gtk.keysyms.x, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
             (gtk.keysyms.z, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.new_tab, None),
-            (gtk.keysyms.t, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.new_tab, None)
+            (gtk.keysyms.t, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.new_tab, None),
+
+            # font size - enlarge/shrink
+            (gtk.keysyms.KP_Add     , gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.enlarge_font, None),
+            (gtk.keysyms.KP_Subtract, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.shrink_font, None),
         ];
+
+        self.fontsize = 0
+
 
         # fast direct tab selection via <Mod1>+1-0
         for i in range(0, 10):
             self.keybinds.append((num2key[i], gtk.gdk.MOD1_MASK, self.goto_tab, i));
+
+        colors = config['palette'].split(':')
+        self.palette = []
+        for color in colors:
+            if color:
+                self.palette.append (gtk.gdk.color_parse (color))
+
+        self.fg_color = gtk.gdk.color_parse (config['foreground_color'])
+        self.bg_color = gtk.gdk.color_parse (config['background_color'])
 
         vbox = gtk.VBox()
         self.vbox = vbox
@@ -175,6 +198,27 @@ class MyPixels:
 
         return False
 
+    def enlarge_font(self, param):
+        self.zoom(True)
+
+    def shrink_font(self, param):
+        self.zoom(False)
+
+    def zoom(self, zoom):
+        for idx, tab in enumerate(self.notebook):
+            pangodesc = tab.get_font()
+            fontsize = pangodesc.get_size()
+
+            if fontsize > pango.SCALE and not zoom:
+                fontsize -= pango.SCALE
+            elif zoom:
+                fontsize += pango.SCALE
+
+            pangodesc.set_size(fontsize)
+            self.fontsize=fontsize
+            tab.set_font(pangodesc)
+
+
     def new_tab(self, command=None, tnext=False, title=""):
         # new tab instance
         tab = vte.Terminal()
@@ -189,7 +233,14 @@ class MyPixels:
         tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
         tab.set_background_saturation(config['term_opacity'])
 
+        tab.set_colors(self.fg_color, self.bg_color, self.palette)
+
         tid = self.counter.next()
+
+        if self.fontsize:
+            pangodesc = tab.get_font()
+            pangodesc.set_size(self.fontsize)
+            tab.set_font(pangodesc)
 
         # The empty argv list is a fix for zsh segv...
         tab.fork_command(argv=[""])
@@ -218,7 +269,7 @@ class MyPixels:
 
         multiline = []
         pango = ""
-        
+
         if config['tab_prepend']:
             pango = config['tab_prepend']()
 
@@ -278,7 +329,7 @@ class MyPixels:
 
         if (config['tab_append']):
             pango += " " + config['tab_append']()
-        
+
         if multiline_tabs:
             multiline.append(pango)
             self.tablist.set_markup('&#10;'.join(multiline))
@@ -367,7 +418,7 @@ class MyPixels:
 
     def child_exited(self, term):
         self.close_tab()
-        
+
     def window_title_changed(self, term):
         self.tabs[term]['title'] = term.get_window_title()
         self.update_tablist()
