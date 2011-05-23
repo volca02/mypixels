@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 """ mypixels - A low clutter, python-gtk based terminal emulator.
 """
 # Glued together in free time by Filip Volejnik: f.volejnik at google mail
@@ -6,22 +6,27 @@
 # heavily inspired by uzbl-tabbed.py
 
 # TODO: Timer for tablist updates - optionally set to refresh if using some dynamic status
-
 import gtk
 import vte
 import pango
 import types
+import yaml
+import os.path
 
 def clock():
     from time import localtime, strftime
-    return "%s " % strftime("%H:%M", localtime())
+    return "<span foreground = '#966'>%s</span> " % strftime("%H:%M", localtime())
+
+callables = {
+    'clock' : clock
+    }
 
 # Default config
 config = {
     'tablist_background': "#303030", # Tablist background
     'multiline_tabs': True,
     'focus_new_tabs': True,
-    'tab_prepend': clock, # callback to function that generates pango markup text appended to tab list before the tabs
+    'tab_prepend': 'clock', # name of callback function that generates pango markup text appended to tab list before the tabs
     'tab_append': None,  # the same, but appended after tab list
     'tab_format': '<span %(color)s>[%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
     'tab_color': 'foreground = "#888" background = "#303030"',
@@ -44,8 +49,8 @@ config = {
     'tab_title_max_length': 16, # -1 to disable this
     'tab_title_short_current': 32, # shorten the selected tab title (False - don't, True - do, int > 0 current title max length)
     # TODO:
-    'autohide_delay': -1 # if positive, a delay in miliseconds to wait before hiding the tab bar
-};
+        'autohide_delay': -1 # if positive, a delay in miliseconds to wait before hiding the tab bar
+    };
 
 # Used for quick selection via <Mod1>[0-9]
 num2key = (
@@ -59,7 +64,7 @@ num2key = (
     gtk.keysyms._8,
     gtk.keysyms._9,
     gtk.keysyms._0,
-);
+    );
 
 def counter():
     """ Tab ID generator """
@@ -103,15 +108,28 @@ class MyPixels:
             # font size - enlarge/shrink
             (gtk.keysyms.KP_Add     , gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.enlarge_font, None),
             (gtk.keysyms.KP_Subtract, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.shrink_font, None),
-        ];
+            ];
 
+        # default font size - zero is ignored
         self.fontsize = 0
-
 
         # fast direct tab selection via <Mod1>+1-0
         for i in range(0, 10):
             self.keybinds.append((num2key[i], gtk.gdk.MOD1_MASK, self.goto_tab, i));
 
+        # handle config
+        try:
+            with open(os.path.expanduser("~/.mypixels")) as f:
+                myconfig = yaml.load(f)
+
+            for k in config.keys():
+                if k in myconfig:
+                    config[k] = myconfig[k]
+        except:
+            # if no config is found, write the default mappings into the config
+            self.write_config()
+
+        # convert the call config vars to callables
         colors = config['palette'].split(':')
         self.palette = []
         for color in colors:
@@ -178,6 +196,10 @@ class MyPixels:
         self.window.show()
 
         self.tabs = {}
+
+    def write_config(self):
+        with open(os.path.expanduser('~/.mypixels'), 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
 
     def resize_request(self, wnd, event):
         self.update_tablist()
@@ -271,7 +293,7 @@ class MyPixels:
         pango = ""
 
         if config['tab_prepend']:
-            pango = config['tab_prepend']()
+            pango = callables[config['tab_prepend']]()
 
         curidx = self.notebook.get_current_page()
 
@@ -328,7 +350,7 @@ class MyPixels:
                 pango += tab_format % locals()
 
         if (config['tab_append']):
-            pango += " " + config['tab_append']()
+            pango += " " + callables[config['tab_append']]()
 
         if multiline_tabs:
             multiline.append(pango)
@@ -339,7 +361,7 @@ class MyPixels:
 
     def next_tab(self, skip=1, move=False):
         """ Focuses next tab. If skip is negative, focuses last tab.
-            If move is true, moves the tab to the place (otherwise it just focuses)
+        If move is true, moves the tab to the place (otherwise it just focuses)
         """
         if not skip:
             skip = 1
@@ -358,7 +380,7 @@ class MyPixels:
 
     def prev_tab(self, skip=1, move=False):
         """ Focuses previous tab. If skip is negative, focuses first tab.
-            If move is true, moves the tab to the place (otherwise it just focuses)
+        If move is true, moves the tab to the place (otherwise it just focuses)
         """
         if not skip:
             skip = 1
@@ -407,9 +429,9 @@ class MyPixels:
         if (self.notebook.get_n_pages() <= 0):
             self.quit_request()
         else:
-             tabn = self.notebook.get_current_page()
-             # refocus
-             self.notebook.set_current_page(tabn)
+            tabn = self.notebook.get_current_page()
+            # refocus
+            self.notebook.set_current_page(tabn)
 
         self.update_tablist()
 
