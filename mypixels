@@ -4,7 +4,7 @@
 # Glued together in free time by Filip Volejnik: f.volejnik at google mail
 # use as you will (but please leave a credit line)
 # heavily inspired by uzbl-tabbed.py
-
+# Solarized colors are a great piece of work of Ethan Schoonover
 # TODO: Timer for tablist updates - optionally set to refresh if using some dynamic status
 import gtk
 import vte
@@ -12,6 +12,7 @@ import pango
 import types
 import yaml
 import os.path
+import sys
 
 def clock():
     from time import localtime, strftime
@@ -21,6 +22,8 @@ callables = {
     'clock' : clock
     }
 
+max_groups = 8
+
 # Default config
 config = {
     'tablist_background': "#303030", # Tablist background
@@ -29,8 +32,10 @@ config = {
     'tab_prepend': 'clock', # name of callback function that generates pango markup text appended to tab list before the tabs
     'tab_append': None,  # the same, but appended after tab list
     'tab_format': '<span %(color)s>[%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
-    'tab_color': 'foreground = "#888" background = "#303030"',
-    'tab_color_selected': 'foreground = "#fff" background = "#505020"',
+    'tab_color_bg': '#303030',
+    'tab_color_bg_selected': '#505020',
+    'tab_color_fg': '#888',
+    'tab_color_fg_selected': '#fff',
     'tablist_font': 'Liberation Mono 7',
     'term_font': 'Terminus 8',
     'default_tab_title': '',
@@ -48,8 +53,19 @@ config = {
     'tablist_top': True,
     'tab_title_max_length': 16, # -1 to disable this
     'tab_title_short_current': 32, # shorten the selected tab title (False - don't, True - do, int > 0 current title max length)
+    'tab_title_shorten_start': False, # shorten so that end of the text is visible, not start
     # TODO:
-        'autohide_delay': -1 # if positive, a delay in miliseconds to wait before hiding the tab bar
+        'autohide_delay': -1, # if positive, a delay in miliseconds to wait before hiding the tab bar
+
+    # choosable tab colors (grouping)
+    'col_0': '#b58900',
+    'col_1': '#cb4b16',
+    'col_2': '#dc322f',
+    'col_3': '#d33682',
+    'col_4': '#6c71c4',
+    'col_5': '#268bd2',
+    'col_6': '#2aa198',
+    'col_7': '#859900'
     };
 
 # Used for quick selection via <Mod1>[0-9]
@@ -108,6 +124,15 @@ class MyPixels:
             # font size - enlarge/shrink
             (gtk.keysyms.KP_Add     , gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.enlarge_font, None),
             (gtk.keysyms.KP_Subtract, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.shrink_font, None),
+
+            # Forced hide tabs toggle
+            (gtk.keysyms.v, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.toggle_hide_tabs, None),
+
+            # Tab group/color switcher
+            (gtk.keysyms.braceleft, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, 1),
+            (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
+
+            # (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
             ];
 
         # default font size - zero is ignored
@@ -195,6 +220,8 @@ class MyPixels:
         self.vbox.show()
         self.window.show()
 
+        self.forcedHideTabs = False
+
         self.tabs = {}
 
     def write_config(self):
@@ -241,7 +268,7 @@ class MyPixels:
             tab.set_font(pangodesc)
 
 
-    def new_tab(self, command=None, tnext=False, title=""):
+    def new_tab(self, command=None, tnext=False, title="", cmd=None):
         # new tab instance
         tab = vte.Terminal()
         tab.connect("child-exited", self.child_exited)
@@ -265,7 +292,11 @@ class MyPixels:
             tab.set_font(pangodesc)
 
         # The empty argv list is a fix for zsh segv...
-        tab.fork_command(argv=[""])
+        if (cmd):
+                tab.fork_command(cmd[0], argv=cmd)
+        else:
+                tab.fork_command(argv=[""])
+
         tab.show()
 
         if (command):
@@ -281,10 +312,12 @@ class MyPixels:
         self.update_tablist()
 
     def update_tablist(self):
-        if self.notebook.get_n_pages() <= 1 and config["hide_single_tab"]:
+        if (self.notebook.get_n_pages() <= 1 and config["hide_single_tab"]) \
+            or self.forcedHideTabs:
             self.tablist.hide()
             return
 
+        # TODO: refit the window
         self.tablist.show()
 
         multiline_tabs = config['multiline_tabs']
@@ -301,7 +334,8 @@ class MyPixels:
         max_title_len = config['tab_title_max_length']
 
         for idx, tab in enumerate(self.notebook):
-            cname = 'tab_color'
+            colfg = config["tab_color_fg"]
+            colbg = config["tab_color_bg"]
 
             tidx = idx + 1
             tid = tidx
@@ -317,20 +351,34 @@ class MyPixels:
 
             if (idx != curidx):
                 if max_title_len > 0 and len(tname) > max_title_len:
-                    tname = tname[:max_title_len] + "\xe2\x80\xa6"
+                    if config['tab_title_shorten_start']:
+                        tname = "\xe2\x80\xa6" + tname[len(tname)-max_title_len:]
+                    else:
+                        tname = tname[:max_title_len] + "\xe2\x80\xa6"
             else:
+                colfg = config["tab_color_fg_selected"]
+                colbg = config["tab_color_bg_selected"]
+
+                cname = '_selected'
                 mt_cur = max_title_len
                 sh_cur = config['tab_title_short_current']
+
                 if (type(sh_cur) == types.IntType):
                     mt_cur = sh_cur
                     sh_cur = True
 
                 if sh_cur and mt_cur > 0 and len(tname) > mt_cur:
-                    tname = tname[:mt_cur] + "\xe2\x80\xa6"
+                   if config['tab_title_shorten_start']:
+                       tname = "\xe2\x80\xa6" + tname[len(tname) - mt_cur:]
+                   else:
+                       tname = tname[:mt_cur] + "\xe2\x80\xa6"
 
-                cname = 'tab_color_selected'
+            # now if we have group set for the tab, override
+            grp = self.tabs[tab].get("group", None)
+            if grp:
+                colfg = config["col_%d" % grp]
 
-            color = config[cname]
+            color = "foreground=\"%s\" background=\"%s\"" % (colfg, colbg)
 
             if multiline_tabs:
                 opango = pango
@@ -418,6 +466,10 @@ class MyPixels:
         self.update_tablist()
 
 
+    def toggle_hide_tabs(self, tabn=None):
+        self.forcedHideTabs = not self.forcedHideTabs
+        self.update_tablist()
+
     def close_tab(self, tabn=None):
         # TODO: What if this ended when not a current page?
         if not tabn:
@@ -465,9 +517,40 @@ class MyPixels:
     def tab_reordered(self, notebook, tab, index):
         self.update_tablist()
 
+    def switch_group(self, skip):
+        tabn = self.notebook.get_current_page()
+        tab = self.notebook.get_nth_page(tabn)
+
+        params = self.tabs.setdefault(tab, {})
+
+        grp = params.setdefault("group", 0) + skip
+
+        # if the group goes beyond 0 or max
+        if grp < 0:
+            grp = max_groups - 1
+
+        if grp >= max_groups:
+            grp = 0
+
+        # if the group is zero, remove the def
+        # otherwise replace
+        if grp == 0:
+            del params["group"]
+        else:
+            params["group"] = grp
+
+        # update tab view
+        self.update_tablist()
+
     def run(self):
         # first initial tab
-        self.new_tab()
+
+        # is there any command on the cmdline?
+        if (len(sys.argv) > 1):
+                self.new_tab(cmd=sys.argv[1:])
+        else:
+                self.new_tab()
+
         gtk.main()
 
 
