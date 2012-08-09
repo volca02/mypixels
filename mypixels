@@ -6,13 +6,20 @@
 # heavily inspired by uzbl-tabbed.py
 # Solarized colors are a great piece of work of Ethan Schoonover
 # TODO: Timer for tablist updates - optionally set to refresh if using some dynamic status
+# TODO: Write to buffer - a small box floating somewhere that'll display what user's writing (in parallel with the console).
+# An ability to replay the keystrokes on other console.
+# TODO: CSSH-like multi-input with console pinning -
+# enable multi-input (keystroke forwarding) to pinned consoles (via a hidden/shown focused edit box)
+# TODO: Tagging of consoles - and grouping via those tags
 import gtk
+import gobject
 import vte
 import pango
 import types
 import yaml
 import os.path
 import sys
+import cgi
 
 def clock():
     from time import localtime, strftime
@@ -56,6 +63,8 @@ config = {
     'tab_title_shorten_start': False, # shorten so that end of the text is visible, not start
     # TODO:
         'autohide_delay': -1, # if positive, a delay in miliseconds to wait before hiding the tab bar
+    'default_width': 640,
+    'default_height': 480,
 
     # choosable tab colors (grouping)
     'col_0': '#b58900',
@@ -96,7 +105,7 @@ class MyPixels:
 
         # create a window to hold the thing
         self.window = gtk.Window()
-        self.window.set_title("PTerm")
+        self.window.set_title("mypixels")
         self.window.set_border_width(0)
 
         self.window.connect("delete-event", self.quit_request)
@@ -115,6 +124,9 @@ class MyPixels:
             (gtk.keysyms.Right, gtk.gdk.MOD1_MASK, self.next_tab, None),
             (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK, self.prev_tab, -1),
             (gtk.keysyms.End,   gtk.gdk.MOD1_MASK, self.next_tab, -1),
+
+            (gtk.keysyms.f, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.prev_tab, None),
+            (gtk.keysyms.b, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.next_tab, None),
 
             # tab open/close
             (gtk.keysyms.x, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
@@ -166,6 +178,7 @@ class MyPixels:
 
         vbox = gtk.VBox()
         self.vbox = vbox
+        self.vbox.set_resize_mode(gtk.RESIZE_IMMEDIATE)
         self.window.add(vbox)
 
         ebox = gtk.EventBox()
@@ -217,8 +230,13 @@ class MyPixels:
         self.window.connect("key-press-event", self.key_pressed)
         self.window.connect("configure-event", self.resize_request)
 
+        # window fixup before we create tab
+        self.window.resize(config["default_width"], config["default_height"])
+
         self.vbox.show()
         self.window.show()
+
+        self.notebook.grab_focus()
 
         self.forcedHideTabs = False
 
@@ -310,6 +328,7 @@ class MyPixels:
 
         self.tabs[tab] = {"title": title, "id": tid}
         self.update_tablist()
+        tab.grab_focus()
 
     def update_tablist(self):
         if (self.notebook.get_n_pages() <= 1 and config["hide_single_tab"]) \
@@ -374,11 +393,18 @@ class MyPixels:
                        tname = tname[:mt_cur] + "\xe2\x80\xa6"
 
             # now if we have group set for the tab, override
-            grp = self.tabs[tab].get("group", None)
+            if tab in self.tabs:
+                grp = self.tabs[tab].get("group", None)
+            else:
+                grp = None
+
             if grp:
                 colfg = config["col_%d" % grp]
 
             color = "foreground=\"%s\" background=\"%s\"" % (colfg, colbg)
+
+            # fixup title - dangerous chars
+            tname = cgi.escape(tname)
 
             if multiline_tabs:
                 opango = pango
