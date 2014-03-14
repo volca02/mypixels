@@ -13,6 +13,7 @@ import types
 import yaml
 import os.path
 import sys
+import cgi
 
 def clock():
     from time import localtime, strftime
@@ -42,11 +43,6 @@ config = {
     'scrollback_lines': 1000,
     'term_opacity': 0.1,
     'bg_tint_color': '#140008',
-    # the default palette is "solarized"
-    'palette': '#070736364242:#DCDC32322F2F:#858599990000:#B5B589890000:\
-#26268B8BD2D2:#D3D336368282:#2A2AA1A19898:#EEEEE8E8D5D5:#00002B2B3636:\
-#CBCB4B4B1616:#58586E6E7575:#65657B7B8383:#838394949696:#6C6C7171C4C4:\
-#9393A1A1A1A1:#FDFDF6F6E3E3',
     'foreground_color': '#BBB',
     'background_color': '#000',
     'hide_single_tab': False,
@@ -56,6 +52,8 @@ config = {
     'tab_title_shorten_start': False, # shorten so that end of the text is visible, not start
     # TODO:
         'autohide_delay': -1, # if positive, a delay in miliseconds to wait before hiding the tab bar
+    'default_width': 640,
+    'default_height': 480,
 
     # choosable tab colors (grouping)
     'col_0': '#b58900',
@@ -96,7 +94,7 @@ class MyPixels:
 
         # create a window to hold the thing
         self.window = gtk.Window()
-        self.window.set_title("PTerm")
+        self.window.set_title("mypixels")
         self.window.set_border_width(0)
 
         self.window.connect("delete-event", self.quit_request)
@@ -115,6 +113,10 @@ class MyPixels:
             (gtk.keysyms.Right, gtk.gdk.MOD1_MASK, self.next_tab, None),
             (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK, self.prev_tab, -1),
             (gtk.keysyms.End,   gtk.gdk.MOD1_MASK, self.next_tab, -1),
+
+            (gtk.keysyms.f,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.prev_tab, None),
+            (gtk.keysyms.b, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.next_tab, None),
+
 
             # tab open/close
             (gtk.keysyms.x, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
@@ -155,17 +157,21 @@ class MyPixels:
             self.write_config()
 
         # convert the call config vars to callables
-        colors = config['palette'].split(':')
-        self.palette = []
-        for color in colors:
-            if color:
-                self.palette.append (gtk.gdk.color_parse (color))
+        if 'palette' in config:
+            colors = config['palette'].split(':')
+            self.palette = []
+            for color in colors:
+                if color:
+                    self.palette.append (gtk.gdk.color_parse (color))
+        else:
+            self.palette = None
 
         self.fg_color = gtk.gdk.color_parse (config['foreground_color'])
         self.bg_color = gtk.gdk.color_parse (config['background_color'])
 
         vbox = gtk.VBox()
         self.vbox = vbox
+        self.vbox.set_resize_mode(gtk.RESIZE_IMMEDIATE)
         self.window.add(vbox)
 
         ebox = gtk.EventBox()
@@ -203,22 +209,28 @@ class MyPixels:
         self.notebook.connect("page-added", self.tab_opened)
         self.notebook.connect("page-reordered", self.tab_reordered)
 
-        self.notebook.show()
         vbox.pack_start(self.notebook, True, True, 0)
         vbox.pack_start(self.ebox, False, False, 0)
 
         if config["tablist_top"]:
-            self.vbox.reorder_child(self.ebox, 0)
+            vbox.reorder_child(self.ebox, 0)
             vbox.reorder_child(self.notebook, 1)
         else:
             vbox.reorder_child(self.notebook, 1)
-            self.vbox.reorder_child(self.ebox, 2)
+            vbox.reorder_child(self.ebox, 2)
+
+        self.notebook.show()
 
         self.window.connect("key-press-event", self.key_pressed)
         self.window.connect("configure-event", self.resize_request)
 
+        # window fixup before we create tab
+        self.window.resize(config["default_width"], config["default_height"])
+
         self.vbox.show()
         self.window.show()
+
+        self.notebook.grab_focus()
 
         self.forcedHideTabs = False
 
@@ -282,7 +294,8 @@ class MyPixels:
         tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
         tab.set_background_saturation(config['term_opacity'])
 
-        tab.set_colors(self.fg_color, self.bg_color, self.palette)
+        if self.palette:
+            tab.set_colors(self.fg_color, self.bg_color, self.palette)
 
         tid = self.counter.next()
 
@@ -293,9 +306,11 @@ class MyPixels:
 
         # The empty argv list is a fix for zsh segv...
         if (cmd):
-                tab.fork_command(cmd[0], argv=cmd)
+            tab.fork_command(cmd[0], argv=cmd)
+        elif (self.command):
+            tab.fork_command(self.command[0], argv=self.command)
         else:
-                tab.fork_command(argv=[""])
+            tab.fork_command(argv=[""])
 
         tab.show()
 
@@ -310,6 +325,8 @@ class MyPixels:
 
         self.tabs[tab] = {"title": title, "id": tid}
         self.update_tablist()
+
+        tab.grab_focus()
 
     def update_tablist(self):
         if (self.notebook.get_n_pages() <= 1 and config["hide_single_tab"]) \
@@ -374,11 +391,18 @@ class MyPixels:
                        tname = tname[:mt_cur] + "\xe2\x80\xa6"
 
             # now if we have group set for the tab, override
-            grp = self.tabs[tab].get("group", None)
+            if tab in self.tabs:
+                grp = self.tabs[tab].get("group", None)
+            else:
+                grp = None
+
             if grp:
                 colfg = config["col_%d" % grp]
 
             color = "foreground=\"%s\" background=\"%s\"" % (colfg, colbg)
+
+            # fixup title - dangerous chars
+            tname = cgi.escape(tname)
 
             if multiline_tabs:
                 opango = pango
@@ -544,15 +568,14 @@ class MyPixels:
 
     def run(self):
         # first initial tab
+        self.command = None
 
         # is there any command on the cmdline?
         if (len(sys.argv) > 1):
-                self.new_tab(cmd=sys.argv[1:])
-        else:
-                self.new_tab()
+                self.command=sys.argv[1:]
 
+        self.new_tab()
         gtk.main()
-
 
     def quit_request(self, *args):
         # if there is more than one tab, ask
