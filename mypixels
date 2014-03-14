@@ -6,7 +6,13 @@
 # heavily inspired by uzbl-tabbed.py
 # Solarized colors are a great piece of work of Ethan Schoonover
 # TODO: Timer for tablist updates - optionally set to refresh if using some dynamic status
+# TODO: Write to buffer - a small box floating somewhere that'll display what user's writing (in parallel with the console).
+# An ability to replay the keystrokes on other console.
+# TODO: CSSH-like multi-input with console pinning -
+# enable multi-input (keystroke forwarding) to pinned consoles (via a hidden/shown focused edit box)
+# TODO: Tagging of consoles - and grouping via those tags
 import gtk
+import gobject
 import vte
 import pango
 import types
@@ -114,9 +120,8 @@ class MyPixels:
             (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK, self.prev_tab, -1),
             (gtk.keysyms.End,   gtk.gdk.MOD1_MASK, self.next_tab, -1),
 
-            (gtk.keysyms.f,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.prev_tab, None),
+            (gtk.keysyms.f, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.prev_tab, None),
             (gtk.keysyms.b, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.next_tab, None),
-
 
             # tab open/close
             (gtk.keysyms.x, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
