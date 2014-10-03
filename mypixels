@@ -56,6 +56,7 @@ config = {
     'tab_title_max_length': 16, # -1 to disable this
     'tab_title_short_current': 32, # shorten the selected tab title (False - don't, True - do, int > 0 current title max length)
     'tab_title_shorten_start': False, # shorten so that end of the text is visible, not start
+    'tablist_hide': False,
     # TODO:
         'autohide_delay': -1, # if positive, a delay in miliseconds to wait before hiding the tab bar
     'default_width': 640,
@@ -125,6 +126,7 @@ class MyPixels:
 
             # tab open/close
             (gtk.keysyms.x, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
+            (gtk.keysyms.q, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
             (gtk.keysyms.z, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.new_tab, None),
             (gtk.keysyms.t, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.new_tab, None),
 
@@ -237,7 +239,7 @@ class MyPixels:
 
         self.notebook.grab_focus()
 
-        self.forcedHideTabs = False
+        self.forcedHideTabs = config['tablist_hide']
 
         self.tabs = {}
 
