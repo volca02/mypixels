@@ -4,11 +4,13 @@ Mypixels
 Mypixels is a very simple terminal emulator written in python using python gtk bindings and python vte bindings.
 
 Main design principles:
+
 * screen space effectivity (no menus/status lines that can't be hidden or take up too much space).
 * ease of use
 * all keyboard control (the second this readme is written, even tabs can't be switched using mouse).
 
 Some cool features:
+
 * Term tab colorization - mark your terms with a certain colour so it can be easily found
 * entanglement of terms - write in numerous terms at once
 * all-keyboard operation
