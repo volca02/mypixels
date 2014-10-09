@@ -38,11 +38,12 @@ config = {
     'focus_new_tabs': True,
     'tab_prepend': 'clock', # name of callback function that generates pango markup text appended to tab list before the tabs
     'tab_append': None,  # the same, but appended after tab list
-    'tab_format': '<span %(color)s>[%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
+    'tab_format': '<span %(color)s>[%(entangled)s%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
     'tab_color_bg': '#303030',
     'tab_color_bg_selected': '#505020',
     'tab_color_fg': '#888',
     'tab_color_fg_selected': '#fff',
+    'tab_color_entangle': '#f00',
     'tablist_font': 'Liberation Mono 7',
     'term_font': 'Terminus 8',
     'default_tab_title': '',
@@ -99,6 +100,9 @@ class MyPixels:
         # counter used for tab id's
         self.counter = counter()
 
+        # entangled terms for multi term keyboard events
+        self.entangled = []
+
         # create a window to hold the thing
         self.window = gtk.Window()
         self.window.set_title("mypixels")
@@ -142,6 +146,10 @@ class MyPixels:
             (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
 
             # (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
+
+            # entanglement of tabs
+            (gtk.keysyms.KP_Multiply, gtk.gdk.SHIFT_MASK | gtk.gdk.MOD1_MASK, self.toggle_entangle, None),
+
             ];
 
         # default font size - zero is ignored
@@ -229,6 +237,7 @@ class MyPixels:
         self.notebook.show()
 
         self.window.connect("key-press-event", self.key_pressed)
+        self.window.connect("key-release-event", self.key_released)
         self.window.connect("configure-event", self.resize_request)
 
         # window fixup before we create tab
@@ -251,19 +260,36 @@ class MyPixels:
         self.update_tablist()
 
     def key_pressed(self, wnd, event):
-        if event.type != gtk.gdk.KEY_PRESS:
-            return False
+        if event.type == gtk.gdk.KEY_PRESS:
+            # skim through the bindings
+            mods = event.state & gtk.accelerator_get_default_mod_mask()
+            keyval = gtk.gdk.keyval_to_lower(event.keyval)
 
-        # skim through the bindings
-        mods = event.state & gtk.accelerator_get_default_mod_mask()
-        keyval = gtk.gdk.keyval_to_lower(event.keyval)
+            # TODO: Could accelerate this by placing the key combination into dict
+            for bind in self.keybinds:
+                if (bind[0] == keyval) and (bind[1] & mods == bind[1]):
+                    bind[2](bind[3])
+                    return True
 
-        # TODO: Could accelerate this by placing the key combination into dict
-        for bind in self.keybinds:
-            if (bind[0] == keyval) and (bind[1] & mods == bind[1]):
-                bind[2](bind[3])
-                return True
+        # tangled terminals? if so, propagate
+        tabn = self.notebook.get_current_page()
+        tab = self.notebook.get_nth_page(tabn)
 
+        if (tab in self.entangled):
+            for term in self.entangled:
+                term.emit("key-press-event", event)
+            return True
+
+        return False
+
+    def key_released(self, wnd, event):
+        tabn = self.notebook.get_current_page()
+        tab = self.notebook.get_nth_page(tabn)
+
+        if (tab in self.entangled):
+            for term in self.entangled:
+                term.emit("key-release-event", event)
+            return True
         return False
 
     def enlarge_font(self, param):
@@ -403,6 +429,11 @@ class MyPixels:
             else:
                 grp = None
 
+            if tab in self.entangled:
+                entangled = "<span foreground=\"%s\">*</span>" % (config["tab_color_entangle"])
+            else:
+                entangled = ""
+
             if grp:
                 colfg = config["col_%d" % grp]
 
@@ -496,6 +527,16 @@ class MyPixels:
         self.notebook.set_current_page(tabn)
         self.update_tablist()
 
+    def toggle_entangle(self, ignored):
+        tabn = self.notebook.get_current_page()
+        tab = self.notebook.get_nth_page(tabn)
+
+        if tab in self.entangled:
+            self.entangled = filter(lambda t: t != tab, self.entangled)
+        else:
+            self.entangled.append(tab)
+
+        self.update_tablist()
 
     def toggle_hide_tabs(self, tabn=None):
         self.forcedHideTabs = not self.forcedHideTabs
