@@ -8,9 +8,7 @@
 # TODO: Timer for tablist updates - optionally set to refresh if using some dynamic status
 # TODO: Write to buffer - a small box floating somewhere that'll display what user's writing (in parallel with the console).
 # An ability to replay the keystrokes on other console.
-# TODO: CSSH-like multi-input with console pinning -
-# enable multi-input (keystroke forwarding) to pinned consoles (via a hidden/shown focused edit box)
-# TODO: Tagging of consoles - and grouping via those tags
+# TODO: Tagging of consoles - and grouping via those tags (partially done with tab coloring)
 import gtk
 import gobject
 import vte
