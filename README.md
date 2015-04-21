@@ -75,5 +75,5 @@ Keyboard shortcuts
 * C-SHIFT-[Keypad +] - Enlarge font
 * C-SHIFT-[Keypad -] - Shrink font
 
-* C-SHIFT-[Keypad *] - Toggle tab entanglement for current tab
+* M-SHIFT-[Keypad *] - Toggle tab entanglement for current tab
 
