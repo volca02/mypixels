@@ -54,17 +54,17 @@ Keyboard shortcuts
 ==================
 
 * M-Left - Prev. tab
-* M-SHIFT-b - Prev. tab
+* M-SHIFT-f - Prev. tab
 * M-Right - Next tab
-* M-SHIFT-f - Next. tab
+* M-SHIFT-b - Next. tab
 * M-Home - Switch to first tab
 * M-End - Switch to last tab
 * M-0 - M-9 - Switch to Nth tab
 
-* C-M-Left - Move tab left
-* C-M-Right - Move tab right
-* C-M-Home - Move tab to begining
-* C-M-End - Move tab to end
+* M-Shift-Left - Move tab left
+* M-Shift-Right - Move tab right
+* M-Shift-Home - Move tab to begining
+* M-Shift-End - Move tab to end
 
 * C-M-Z - Open a new tab
 * C-M-X - Close current tab
@@ -72,8 +72,8 @@ Keyboard shortcuts
 * M-SHIFT-[ - Next color for current tab
 * M-SHIFT-] - Prev color for current tab
 * C-SHIFT-v - Toggle tab bar visibility
-* C-SHIFT-[Keypad +] - Enlarge font
-* C-SHIFT-[Keypad -] - Shrink font
+* M-SHIFT-[Keypad +] - Enlarge font
+* M-SHIFT-[Keypad -] - Shrink font
 
 * M-SHIFT-[Keypad *] - Toggle tab entanglement for current tab
 
