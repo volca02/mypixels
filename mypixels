@@ -93,6 +93,31 @@ def counter():
         yield i
         i += 1
 
+def dialog_get_text(parent, message, default=''):
+    """
+    Display a dialog with a text entry.
+    Returns the text, or None if canceled.
+    """
+    d = gtk.MessageDialog(parent,
+                          gtk.DIALOG_MODAL | gtk.DIALOG_DESTROY_WITH_PARENT,
+                          gtk.MESSAGE_QUESTION,
+                          gtk.BUTTONS_OK_CANCEL,
+                          message)
+    entry = gtk.Entry()
+    entry.set_text(default)
+    entry.show()
+    d.vbox.pack_end(entry)
+    entry.connect('activate', lambda _: d.response(gtk.RESPONSE_OK))
+    d.set_default_response(gtk.RESPONSE_OK)
+
+    r = d.run()
+    text = entry.get_text().decode('utf8')
+    d.destroy()
+    if r == gtk.RESPONSE_OK:
+        return text
+    else:
+        return None
+
 class MyPixels:
     def __init__(self):
         # counter used for tab id's
@@ -148,6 +173,8 @@ class MyPixels:
             # entanglement of tabs
             (gtk.keysyms.KP_Multiply, gtk.gdk.SHIFT_MASK | gtk.gdk.MOD1_MASK, self.toggle_entangle, None),
 
+            # rename the current tab
+            (gtk.keysyms.n, gtk.gdk.SHIFT_MASK | gtk.gdk.MOD1_MASK, self.rename_tab, None)
             ];
 
         # default font size - zero is ignored
@@ -393,6 +420,8 @@ class MyPixels:
                 params = self.tabs[tab]
                 tid = params["id"]
                 tname = params["title"]
+                if "name" in params:
+                    tname = params["name"]
 
             if not tname:
                 tname = str(tid)
@@ -556,6 +585,17 @@ class MyPixels:
             self.notebook.set_current_page(tabn)
 
         self.update_tablist()
+
+    def rename_tab(self, tabn=None):
+        if not tabn:
+            tabn = self.notebook.get_current_page()
+
+        tab = self.notebook.get_nth_page(tabn)
+        name = dialog_get_text(
+            self.window, "Tab name", self.tabs[tab].get('name', ''))
+        if name:
+            self.tabs[tab]['name'] = name
+            self.update_tablist()
 
     def tab_closed(self, notebook, tab, index):
         del self.tabs[tab]

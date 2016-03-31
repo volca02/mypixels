@@ -77,3 +77,4 @@ Keyboard shortcuts
 
 * M-SHIFT-[Keypad *] - Toggle tab entanglement for current tab
 
+* M-SHIFT-n - Set a custom tab name
