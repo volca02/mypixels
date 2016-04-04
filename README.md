@@ -1,6 +1,8 @@
 Mypixels
 ========
 
+![Alt text](https://cloud.githubusercontent.com/assets/1075171/14241115/1e141884-fa4a-11e5-8724-95decd9ed17d.png "Screenshot")
+
 Mypixels is a very simple terminal emulator written in python using python gtk bindings and python vte bindings.
 
 Main design principles:
