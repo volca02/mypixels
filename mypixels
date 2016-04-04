@@ -95,6 +95,8 @@ config = {
 
         'toggle_entangle': 'MOD1+SHIFT+KP_Multiply',
 
+        'rename_tab': 'MOD1+SHIFT+n',
+
         'goto_tab_0': 'MOD1+_0',
         'goto_tab_1': 'MOD1+_1',
         'goto_tab_2': 'MOD1+_2',
@@ -208,8 +210,13 @@ class MyPixels:
                 myconfig = yaml.load(f)
 
             for k in config.keys():
-                if k in myconfig:
-                    config[k] = myconfig[k]
+                # if this is a keymap, descend
+                if k == "bindings":
+                    for fn, b in myconfig['bindings']:
+                        config[k][fn] = b
+                else:
+                    if k in myconfig:
+                        config[k] = myconfig[k]
         except:
             # if no config is found, write the default mappings into the config
             self.write_config()
@@ -336,6 +343,8 @@ class MyPixels:
             'next_color': (self.switch_group,  1),
 
             'toggle_entangle': (self.toggle_entangle, None),
+
+            'rename_tab': (self.rename_tab, None)
         }
 
         for i in range(0, 10):
