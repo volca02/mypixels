@@ -97,16 +97,16 @@ config = {
 
         'rename_tab': 'MOD1+SHIFT+n',
 
-        'goto_tab_0': 'MOD1+_0',
-        'goto_tab_1': 'MOD1+_1',
-        'goto_tab_2': 'MOD1+_2',
-        'goto_tab_3': 'MOD1+_3',
-        'goto_tab_4': 'MOD1+_4',
-        'goto_tab_5': 'MOD1+_5',
-        'goto_tab_6': 'MOD1+_6',
-        'goto_tab_7': 'MOD1+_7',
-        'goto_tab_8': 'MOD1+_8',
-        'goto_tab_9': 'MOD1+_9'
+        'goto_tab_0': 'MOD1+_1',
+        'goto_tab_1': 'MOD1+_2',
+        'goto_tab_2': 'MOD1+_3',
+        'goto_tab_3': 'MOD1+_4',
+        'goto_tab_4': 'MOD1+_5',
+        'goto_tab_5': 'MOD1+_6',
+        'goto_tab_6': 'MOD1+_7',
+        'goto_tab_7': 'MOD1+_8',
+        'goto_tab_8': 'MOD1+_9',
+        'goto_tab_9': 'MOD1+_0'
     }
 };
 
