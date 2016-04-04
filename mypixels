@@ -69,8 +69,44 @@ config = {
     'col_4': '#6c71c4',
     'col_5': '#268bd2',
     'col_6': '#2aa198',
-    'col_7': '#859900'
-    };
+    'col_7': '#859900',
+
+    'bindings': {
+        'move_prev_tab' : 'MOD1+SHIFT+Left',
+        'move_next_tab' : 'MOD1+SHIFT+Right',
+        'move_first_tab': 'MOD1+SHIFT+Home',
+        'move_last_tab' : 'MOD1+SHIFT+End',
+
+        'prev_tab': ('MOD1+Left', 'MOD1+SHIFT+f'),
+        'next_tab': ('MOD1+Right', 'MOD1+SHIFT+b'),
+        'first_tab': 'MOD1+Home',
+        'last_tab': 'MOD1+End',
+
+        'close_tab': ('CONTROL+ALT+x', 'CONTROL+ALT+q'),
+        'new_tab': ('CONTROL+ALT+z', 'CONTROL+SHIFT+t'),
+
+        'shrink_font': 'MOD1+SHIFT+KP_Subtract',
+        'enlarge_font': 'MOD1+SHIFT+KP_Add',
+
+        'toggle_hide_tabs': 'CONTROL+SHIFT+v',
+
+        'prev_color': 'MOD1+SHIFT+braceleft',
+        'next_color': 'MOD1+SHIFT+braceright',
+
+        'toggle_entangle': 'MOD1+SHIFT+KP_Multiply',
+
+        'goto_tab_0': 'MOD1+_0',
+        'goto_tab_1': 'MOD1+_1',
+        'goto_tab_2': 'MOD1+_2',
+        'goto_tab_3': 'MOD1+_3',
+        'goto_tab_4': 'MOD1+_4',
+        'goto_tab_5': 'MOD1+_5',
+        'goto_tab_6': 'MOD1+_6',
+        'goto_tab_7': 'MOD1+_7',
+        'goto_tab_8': 'MOD1+_8',
+        'goto_tab_9': 'MOD1+_9'
+    }
+};
 
 # Used for quick selection via <Mod1>[0-9]
 num2key = (
@@ -85,6 +121,33 @@ num2key = (
     gtk.keysyms._9,
     gtk.keysyms._0,
     );
+
+str2mod = {
+    'mod1':  gtk.gdk.MOD1_MASK,
+    'alt':  gtk.gdk.MOD1_MASK,
+    'shift': gtk.gdk.SHIFT_MASK,
+    'control': gtk.gdk.CONTROL_MASK,
+    'ctrl': gtk.gdk.CONTROL_MASK
+}
+
+# parses mod+mod+key
+def key_press_parse(bindstr):
+    key = None
+    mods = 0
+
+    for kp in bindstr.split('+'):
+        kl = kp.lower()
+        if kl in str2mod:
+            mods = mods | str2mod[kl]
+        else:
+            if not key:
+                key = dict(gtk.keysyms.__dict__)[kp]
+
+    return (mods, key)
+
+# parses key_combo=call(arg)
+def key_bind_parse(bindstr):
+    pass
 
 def counter():
     """ Tab ID generator """
@@ -133,56 +196,11 @@ class MyPixels:
 
         self.window.connect("delete-event", self.quit_request)
 
-        # Default key bindings
-        self.keybinds = [
-            # Key, mods, callback, params
-            # tab repositioning
-            (gtk.keysyms.Left,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_prev_tab, None),
-            (gtk.keysyms.Right, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_next_tab, None),
-            (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_prev_tab, -1),
-            (gtk.keysyms.End,   gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.move_next_tab, -1),
-
-            # tab switching
-            (gtk.keysyms.Left,  gtk.gdk.MOD1_MASK, self.prev_tab, None),
-            (gtk.keysyms.Right, gtk.gdk.MOD1_MASK, self.next_tab, None),
-            (gtk.keysyms.Home,  gtk.gdk.MOD1_MASK, self.prev_tab, -1),
-            (gtk.keysyms.End,   gtk.gdk.MOD1_MASK, self.next_tab, -1),
-
-            (gtk.keysyms.f, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.prev_tab, None),
-            (gtk.keysyms.b, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.next_tab, None),
-
-            # tab open/close
-            (gtk.keysyms.x, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
-            (gtk.keysyms.q, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.close_tab, None),
-            (gtk.keysyms.z, gtk.gdk.CONTROL_MASK | gtk.gdk.MOD1_MASK,  self.new_tab, None),
-            (gtk.keysyms.t, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.new_tab, None),
-
-            # font size - enlarge/shrink
-            (gtk.keysyms.KP_Add     , gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.enlarge_font, None),
-            (gtk.keysyms.KP_Subtract, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.shrink_font, None),
-
-            # Forced hide tabs toggle
-            (gtk.keysyms.v, gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK, self.toggle_hide_tabs, None),
-
-            # Tab group/color switcher
-            (gtk.keysyms.braceleft, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, 1),
-            (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
-
-            # (gtk.keysyms.braceright, gtk.gdk.MOD1_MASK | gtk.gdk.SHIFT_MASK, self.switch_group, -1),
-
-            # entanglement of tabs
-            (gtk.keysyms.KP_Multiply, gtk.gdk.SHIFT_MASK | gtk.gdk.MOD1_MASK, self.toggle_entangle, None),
-
-            # rename the current tab
-            (gtk.keysyms.n, gtk.gdk.SHIFT_MASK | gtk.gdk.MOD1_MASK, self.rename_tab, None)
-            ];
+        self.keybinds = []
+        self.keymap = {}
 
         # default font size - zero is ignored
         self.fontsize = 0
-
-        # fast direct tab selection via <Mod1>+1-0
-        for i in range(0, 10):
-            self.keybinds.append((num2key[i], gtk.gdk.MOD1_MASK, self.goto_tab, i));
 
         # handle config
         try:
@@ -195,6 +213,11 @@ class MyPixels:
         except:
             # if no config is found, write the default mappings into the config
             self.write_config()
+
+        # parse the config key bindings
+        self.set_funcmap()
+        self.keymap = config['bindings']
+        self.transform_keybinds()
 
         # convert the call config vars to callables
         if 'palette' in config:
@@ -277,6 +300,47 @@ class MyPixels:
 
         self.tabs = {}
 
+    def transform_keybinds(self):
+        # transforms self.keymap ("function->binds") to self.keybinds
+        for fn, bind in self.keymap.items():
+            func = self.funcmap[fn]
+            if isinstance(bind, list) or isinstance(bind, tuple):
+                for b in bind:
+                   (mods, key) = key_press_parse(b)
+                   self.keybinds.append((key, mods, func[0], func[1]))
+            else:
+                (mods, key) = key_press_parse(bind)
+                self.keybinds.append((key, mods, func[0], func[1]))
+
+    def set_funcmap(self):
+        self.funcmap = {
+            'move_prev_tab':  (self.move_prev_tab, None),
+            'move_next_tab':  (self.move_next_tab, None),
+            'move_first_tab': (self.move_prev_tab, -1),
+            'move_last_tab':  (self.move_next_tab, -1),
+
+            'prev_tab': (self.prev_tab, None),
+            'next_tab': (self.next_tab, None),
+            'first_tab': (self.prev_tab, -1),
+            'last_tab': (self.next_tab, -1),
+
+            'close_tab': (self.close_tab, None),
+            'new_tab': (self.new_tab, None),
+
+            'shrink_font': (self.shrink_font, None),
+            'enlarge_font': (self.enlarge_font, None),
+
+            'toggle_hide_tabs': (self.toggle_hide_tabs, None),
+
+            'prev_color': (self.switch_group, -1),
+            'next_color': (self.switch_group,  1),
+
+            'toggle_entangle': (self.toggle_entangle, None),
+        }
+
+        for i in range(0, 10):
+            self.funcmap['goto_tab_' + str(i)] = (self.goto_tab, i);
+
     def write_config(self):
         with open(os.path.expanduser('~/.mypixels'), 'w') as f:
             yaml.dump(config, f, default_flow_style=False)
@@ -290,7 +354,7 @@ class MyPixels:
             mods = event.state & gtk.accelerator_get_default_mod_mask()
             keyval = gtk.gdk.keyval_to_lower(event.keyval)
 
-            # TODO: Could accelerate this by placing the key combination into dict
+            # TODO: Could accelerate this by placing the key combination into a dict
             for bind in self.keybinds:
                 if (bind[0] == keyval) and (bind[1] & mods == bind[1]):
                     bind[2](bind[3])
@@ -544,6 +608,12 @@ class MyPixels:
     def move_prev_tab(self, skip=1):
         """ Like next_tab, but moves the current tab to the place """
         self.prev_tab(skip, move=True)
+
+    def move_first_tab(self, arg=None):
+        self.prev_tab(-1, move=True)
+
+    def move_last_tab(self, arg=None):
+        self.next_tab(-1, move=True)
 
     def goto_tab(self, tabn, move=False):
         if move:
