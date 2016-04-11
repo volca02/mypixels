@@ -209,14 +209,17 @@ class MyPixels:
             with open(os.path.expanduser("~/.mypixels")) as f:
                 myconfig = yaml.load(f)
 
-            for k in config.keys():
-                # if this is a keymap, descend
-                if k == "bindings":
-                    for fn, b in myconfig['bindings']:
-                        config[k][fn] = b
-                else:
-                    if k in myconfig:
-                        config[k] = myconfig[k]
+            try:
+                for k in config.keys():
+                    # if this is a keymap, descend
+                    if k == "bindings" and "bindings" in myconfig:
+                        for fn, b in myconfig['bindings']:
+                            config[k][fn] = b
+                    else:
+                        if k in myconfig:
+                            config[k] = myconfig[k]
+            except:
+                pass
         except:
             # if no config is found, write the default mappings into the config
             self.write_config()
