@@ -223,8 +223,9 @@ class MyPixels:
                 print("Config parse error: " % str(e))
                 pass
         except:
+            pass
             # if no config is found, write the default mappings into the config
-            self.write_config()
+            #self.write_config()
 
         # parse the config key bindings
         self.set_funcmap()
