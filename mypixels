@@ -426,7 +426,7 @@ class MyPixels:
 
         tab.set_font(pango.FontDescription(config["term_font"]))
         tab.set_scrollback_lines(config['scrollback_lines'])
-        tab.set_word_chars("-A-Za-z0-9,./?%&#:_")
+        tab.set_word_chars("-A-Za-z0-9,./?%&#:_~")
 
         tab.set_property("background-transparent", True)
         tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
