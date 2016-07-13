@@ -9,9 +9,16 @@
 # TODO: Write to buffer - a small box floating somewhere that'll display what user's writing (in parallel with the console).
 # An ability to replay the keystrokes on other console.
 # TODO: Tagging of consoles - and grouping via those tags (partially done with tab coloring)
+
+import gi
+from gi import pygtkcompat
+gi.require_version('Vte', '2.91')
+pygtkcompat.enable()
+pygtkcompat.enable_gtk(version='3.0')
 import gtk
 import gobject
-import vte
+from gi.repository import Vte, GLib, Gdk
+#import vte
 import pango
 import types
 import yaml
@@ -56,8 +63,6 @@ config = {
     'tab_title_short_current': 32, # shorten the selected tab title (False - don't, True - do, int > 0 current title max length)
     'tab_title_shorten_start': False, # shorten so that end of the text is visible, not start
     'tablist_hide': False,
-    # TODO:
-        'autohide_delay': -1, # if positive, a delay in miliseconds to wait before hiding the tab bar
     'default_width': 640,
     'default_height': 480,
 
@@ -96,6 +101,11 @@ config = {
         'toggle_entangle': 'MOD1+SHIFT+KP_Multiply',
 
         'rename_tab': 'MOD1+SHIFT+n',
+
+        'show_search': 'MOD1+SHIFT+s',
+
+        'search_prev': 'MOD1+SHIFT+a',
+        'search_next': 'MOD1+SHIFT+d',
 
         'goto_tab_0': 'MOD1+_1',
         'goto_tab_1': 'MOD1+_2',
@@ -144,12 +154,30 @@ def key_press_parse(bindstr):
         else:
             if not key:
                 key = dict(gtk.keysyms.__dict__)[kp]
+            else:
+                print("Parse error: '%s' - part '%s', state %s, %s" % (bindstr, kp, str(key), str(mods)))
 
     return (mods, key)
 
 # parses key_combo=call(arg)
 def key_bind_parse(bindstr):
     pass
+
+# stolen from Terminator https://github.com/m45t3r/t3rminator/blob/master/terminatorlib/terminator.py
+def eventkey2gdkevent(eventkey):  # FIXME FOR GTK3: is there a simpler way of casting from specific EventKey to generic (union) GdkEvent?
+    gdkevent = Gdk.Event(eventkey.type)
+    gdkevent.key.type = eventkey.type
+    gdkevent.key.window = eventkey.window
+    gdkevent.key.send_event = eventkey.send_event
+    gdkevent.key.time = eventkey.time
+    gdkevent.key.state = eventkey.state
+    gdkevent.key.keyval = eventkey.keyval
+    gdkevent.key.length = eventkey.length
+    gdkevent.key.string = eventkey.string
+    gdkevent.key.hardware_keycode = eventkey.hardware_keycode
+    gdkevent.key.group = eventkey.group
+    gdkevent.key.is_modifier = eventkey.is_modifier
+    return gdkevent
 
 def counter():
     """ Tab ID generator """
@@ -245,10 +273,14 @@ class MyPixels:
         self.fg_color = gtk.gdk.color_parse (config['foreground_color'])
         self.bg_color = gtk.gdk.color_parse (config['background_color'])
 
+        self.overlay = gtk.Overlay()
+        self.window.add(self.overlay)
+        self.overlay.show()
+
         vbox = gtk.VBox()
         self.vbox = vbox
         self.vbox.set_resize_mode(gtk.RESIZE_IMMEDIATE)
-        self.window.add(vbox)
+        self.overlay.add(vbox)
 
         ebox = gtk.EventBox()
         self.ebox = ebox
@@ -304,6 +336,20 @@ class MyPixels:
         # window fixup before we create tab
         self.window.resize(config["default_width"], config["default_height"])
 
+        # searchbox, if it updates, we update the vtk search
+        self.search_entry = gtk.Entry()
+
+        self.search_entry.set_margin_start(5);
+        self.search_entry.set_margin_end(5);
+        self.search_entry.set_margin_top(5);
+        self.search_entry.set_margin_bottom(5);
+        self.search_entry.set_halign(gtk.ALIGN_START);
+        self.search_entry.set_valign(gtk.ALIGN_END);
+        self.search_entry.connect("key-press-event", self.search_key_pressed)
+        self.search_entry.connect("focus-out-event", self.search_lose_focus)
+
+        self.overlay.add_overlay(self.search_entry)
+
         self.vbox.show()
         self.window.show()
 
@@ -350,7 +396,12 @@ class MyPixels:
 
             'toggle_entangle': (self.toggle_entangle, None),
 
-            'rename_tab': (self.rename_tab, None)
+            'rename_tab': (self.rename_tab, None),
+
+            'show_search': (self.show_search, None),
+
+            'search_prev': (self.search_advance, False),
+            'search_next': (self.search_advance, True)
         }
 
         for i in range(0, 10):
@@ -371,7 +422,7 @@ class MyPixels:
 
             # TODO: Could accelerate this by placing the key combination into a dict
             for bind in self.keybinds:
-                if (bind[0] == keyval) and (bind[1] & mods == bind[1]):
+                if (bind[0] == keyval) and (bind[1] == mods):
                     bind[2](bind[3])
                     return True
 
@@ -381,7 +432,7 @@ class MyPixels:
 
         if (tab in self.entangled):
             for term in self.entangled:
-                term.emit("key-press-event", event)
+                term.emit("key-press-event", eventkey2gdkevent(event))
             return True
 
         return False
@@ -392,7 +443,7 @@ class MyPixels:
 
         if (tab in self.entangled):
             for term in self.entangled:
-                term.emit("key-release-event", event)
+                term.emit("key-release-event", eventkey2gdkevent(event))
             return True
         return False
 
@@ -419,18 +470,21 @@ class MyPixels:
 
     def new_tab(self, command=None, tnext=False, title="", cmd=None):
         # new tab instance
-        tab = vte.Terminal()
+        tab = Vte.Terminal()
         tab.connect("child-exited", self.child_exited)
-        tab.connect("eof", self.child_exited)
+        tab.connect("eof", self.child_eof)
         tab.connect("window-title-changed", self.window_title_changed)
+#        tab.connect("key-press-event", self.key_pressed)
+#        tab.connect("key-release-event", self.key_released)
 
         tab.set_font(pango.FontDescription(config["term_font"]))
         tab.set_scrollback_lines(config['scrollback_lines'])
-        tab.set_word_chars("-A-Za-z0-9,./?%&#:_~")
+        tab.search_set_wrap_around(True)
 
-        tab.set_property("background-transparent", True)
-        tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
-        tab.set_background_saturation(config['term_opacity'])
+#        tab.set_word_chars("-A-Za-z0-9,./?%&#:_~")
+#        tab.set_property("background-transparent", True)
+#        tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
+#        tab.set_background_saturation(config['term_opacity'])
 
         if self.palette:
             tab.set_colors(self.fg_color, self.bg_color, self.palette)
@@ -443,19 +497,29 @@ class MyPixels:
             tab.set_font(pangodesc)
 
         # The empty argv list is a fix for zsh segv...
+        command=[Vte.get_user_shell()]
         if (cmd):
-            tab.fork_command(cmd[0], argv=cmd)
+            command = cmd
         elif (self.command):
-            tab.fork_command(self.command[0], argv=self.command)
-        else:
-            tab.fork_command(argv=[""])
+            command=self.command
+
+        tab.spawn_sync(
+            Vte.PtyFlags.DEFAULT,
+            os.environ['HOME'],
+            command,
+            [],
+            0,
+            None,
+            None,
+            None
+        )
 
         tab.show()
 
-        if (command):
-            tab.feed_child(command)
+#        if (command):
+#            tab.feed_child(command)
 
-        self.notebook.insert_page(tab, position=tnext and self.notebook.get_current_page() + 1 or -1)
+        self.notebook.insert_page(tab, None, tnext and self.notebook.get_current_page() + 1 or -1)
         self.notebook.set_tab_reorderable(tab, True)
 
         if not title:
@@ -641,8 +705,7 @@ class MyPixels:
         self.update_tablist()
 
     def toggle_entangle(self, ignored):
-        tabn = self.notebook.get_current_page()
-        tab = self.notebook.get_nth_page(tabn)
+        tab = self.get_current_tab()
 
         if tab in self.entangled:
             self.entangled = filter(lambda t: t != tab, self.entangled)
@@ -686,8 +749,11 @@ class MyPixels:
     def tab_closed(self, notebook, tab, index):
         del self.tabs[tab]
 
-    def child_exited(self, term):
+    def child_exited(self, a=None, b=None):
         self.close_tab()
+
+    def child_eof(self, a=None, b=None):
+        pass
 
     def window_title_changed(self, term):
         self.tabs[term]['title'] = term.get_window_title()
@@ -737,6 +803,46 @@ class MyPixels:
 
         # update tab view
         self.update_tablist()
+
+    def show_search(self, param=None):
+        self.search_entry.show()
+        self.search_entry.grab_focus()
+
+    def hide_search(self, param=None):
+        self.search_entry.hide()
+
+    def search_advance(self, forward=True):
+        tab = self.get_current_tab()
+        if (forward):
+            tab.search_find_next()
+        else:
+            tab.search_find_previous()
+
+    def get_current_tab(self):
+        tabn = self.notebook.get_current_page()
+        return self.notebook.get_nth_page(tabn)
+
+    def search_lose_focus(self, wnd, event):
+        self.hide_search()
+        # re-focus current tab
+        self.get_current_tab().grab_focus()
+
+    def search_key_pressed(self, wnd, event):
+        if event.type == gtk.gdk.KEY_PRESS:
+            if (event.keyval == gtk.keysyms.Escape):
+                self.hide_search()
+                return False
+            if (event.keyval == gtk.keysyms.Return):
+                self.update_search_term(self.search_entry.get_text())
+                self.hide_search()
+                self.search_advance(True)
+                return False
+        return False
+
+    def update_search_term(self, text):
+        tab = self.get_current_tab()
+        regex = GLib.Regex(text, 0, 0)
+        tab.search_set_gregex(regex, 0)
 
     def run(self):
         # first initial tab
