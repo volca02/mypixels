@@ -481,10 +481,11 @@ class MyPixels:
         tab.set_scrollback_lines(config['scrollback_lines'])
         tab.search_set_wrap_around(True)
 
-#        tab.set_word_chars("-A-Za-z0-9,./?%&#:_~")
-#        tab.set_property("background-transparent", True)
-#        tab.set_background_tint_color(gtk.gdk.color_parse(config['bg_tint_color']))
-#        tab.set_background_saturation(config['term_opacity'])
+        tab.set_word_char_exceptions("-A-Za-z0-9,./?%&#:_~")
+        bg_color = Gdk.RGBA()
+        bg_color.parse(config['bg_tint_color'])
+        bg_color.alpha=1.0-config['term_opacity']
+        tab.set_color_background(bg_color)
 
         if self.palette:
             tab.set_colors(self.fg_color, self.bg_color, self.palette)
