@@ -80,3 +80,48 @@ Keyboard shortcuts
 * M-SHIFT-[Keypad *] - Toggle tab entanglement for current tab
 
 * M-SHIFT-n - Set a custom tab name
+
+* M-SHIFT-s - Search for the given text
+* M-SHIFT-a - Skip to previous instance of the search
+* M-SHIFT-d - Skip to next instance of the search
+
+Keyboard shortcuts are configurable. Example config:
+
+```
+bindings:
+  close_tab: !!python/tuple
+  - CONTROL+ALT+x
+  - CONTROL+ALT+q
+  enlarge_font: MOD1+SHIFT+KP_Add
+  first_tab: MOD1+Home
+  goto_tab_0: MOD1+_1
+  goto_tab_1: MOD1+_2
+  goto_tab_2: MOD1+_3
+  goto_tab_3: MOD1+_4
+  goto_tab_4: MOD1+_5
+  goto_tab_5: MOD1+_6
+  goto_tab_6: MOD1+_7
+  goto_tab_7: MOD1+_8
+  goto_tab_8: MOD1+_9
+  goto_tab_9: MOD1+_0
+  last_tab: MOD1+End
+  move_first_tab: MOD1+SHIFT+Home
+  move_last_tab: MOD1+SHIFT+End
+  move_next_tab: MOD1+SHIFT+Right
+  move_prev_tab: MOD1+SHIFT+Left
+  new_tab: !!python/tuple
+  - CONTROL+ALT+z
+  - CONTROL+SHIFT+t
+  next_color: MOD1+SHIFT+braceright
+  next_tab: !!python/tuple
+  - MOD1+Right
+  - MOD1+SHIFT+b
+  prev_color: MOD1+SHIFT+braceleft
+  prev_tab: !!python/tuple
+  - MOD1+Left
+  - MOD1+SHIFT+f
+  rename_tab: MOD1+SHIFT+n
+  shrink_font: MOD1+SHIFT+KP_Subtract
+  toggle_entangle: MOD1+SHIFT+KP_Multiply
+  toggle_hide_tabs: CONTROL+SHIFT+v
+```
