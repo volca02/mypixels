@@ -78,6 +78,8 @@ config = {
     'default_width': 640,
     'default_height': 480,
 
+    'palette': '',
+
     # choosable tab colors (grouping)
     'col_0': '#b58900',
     'col_1': '#cb4b16',
@@ -170,6 +172,12 @@ def key_press_parse(bindstr):
                 print("Parse error: '%s' - part '%s', state %s, %s" % (bindstr, kp, str(key), str(mods)))
 
     return (mods, key)
+
+def parse_rgba(color):
+    col = gtk.gdk.RGBA()
+    col.parse(color)
+    return col
+
 
 # parses key_combo=call(arg)
 def key_bind_parse(bindstr):
@@ -278,12 +286,12 @@ class MyPixels:
             self.palette = []
             for color in colors:
                 if color:
-                    self.palette.append (gtk.gdk.color_parse (color))
+                    self.palette.append(parse_rgba(color))
         else:
             self.palette = None
 
-        self.fg_color = gtk.gdk.color_parse (config['foreground_color'])
-        self.bg_color = gtk.gdk.color_parse (config['background_color'])
+        self.fg_color = parse_rgba(config['foreground_color'])
+        self.bg_color = parse_rgba(config['background_color'])
 
         self.overlay = gtk.Overlay()
         self.window.add(self.overlay)
