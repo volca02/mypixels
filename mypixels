@@ -61,6 +61,7 @@ config = {
     'tab_color_fg': '#888',
     'tab_color_fg_selected': '#fff',
     'tab_color_entangle': '#f00',
+    'tab_color_idx': '#808',
     'tablist_font': 'Liberation Mono 7',
     'term_font': 'Terminus 8',
     'default_tab_title': '',
@@ -89,6 +90,8 @@ config = {
     'col_5': '#268bd2',
     'col_6': '#2aa198',
     'col_7': '#859900',
+
+    'tab_highlight_mod': 'Alt_L',
 
     'bindings': {
         'move_prev_tab' : 'MOD1+SHIFT+Left',
@@ -248,6 +251,7 @@ class MyPixels:
 
         self.keybinds = []
         self.keymap = {}
+        self.on_tabswitch = False
 
         # default font size - zero is ignored
         self.fontsize = 0
@@ -274,6 +278,9 @@ class MyPixels:
             pass
             # if no config is found, write the default mappings into the config
             #self.write_config()
+
+        # parse the on goto key
+        self.on_tabswitch_key = key_press_parse(config["tab_highlight_mod"])[1]
 
         # parse the config key bindings
         self.set_funcmap()
@@ -445,6 +452,9 @@ class MyPixels:
                 if (bind[0] == keyval) and (bind[1] == mods):
                     bind[2](bind[3])
                     return True
+            if (keyval == self.on_tabswitch_key):
+                self.on_tabswitch = True
+                self.update_tablist()
 
         # tangled terminals? if so, propagate
         tabn = self.notebook.get_current_page()
@@ -460,6 +470,13 @@ class MyPixels:
     def key_released(self, wnd, event):
         tabn = self.notebook.get_current_page()
         tab = self.notebook.get_nth_page(tabn)
+
+        if (event.type == gtk.gdk.KEY_RELEASE):
+            mods = event.state & gtk.accelerator_get_default_mod_mask()
+            keyval = gtk.gdk.keyval_to_lower(event.keyval)
+            if (keyval == self.on_tabswitch_key):
+                self.on_tabswitch = False
+                self.update_tablist()
 
         if (tab in self.entangled):
             for term in self.entangled:
@@ -577,9 +594,13 @@ class MyPixels:
             colfg = config["tab_color_fg"]
             colbg = config["tab_color_bg"]
 
-            tidx = idx + 1
-            tid = tidx
+            tid = idx + 1
+            tidx = "<span foreground=\"%s\">%d</span>" % (config["tab_color_idx"], tid)
             tname = ""
+
+            tcorner = "["
+            if (self.on_tabswitch):
+                tcorner = tidx
 
             if tab in self.tabs:
                 params = self.tabs[tab]
@@ -715,6 +736,9 @@ class MyPixels:
 
     def move_last_tab(self, arg=None):
         self.next_tab(-1, move=True)
+
+    def highlight_tabs(self, toggle):
+        pass
 
     def goto_tab(self, tabn, move=False):
         if move:
