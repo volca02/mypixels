@@ -521,8 +521,10 @@ class MyPixels:
         tab.set_word_char_exceptions("-A-Za-z0-9,./?%&#:_~")
         bg_color = Gdk.RGBA()
         bg_color.parse(config['bg_tint_color'])
-        bg_color.alpha=1.0-config['term_opacity']
+        alpha=1.0-config['term_opacity']
+        bg_color.alpha=alpha
         tab.set_color_background(bg_color)
+        self.window.set_opacity(alpha)
 
         if self.palette:
             tab.set_colors(self.fg_color, self.bg_color, self.palette)
