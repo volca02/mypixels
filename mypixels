@@ -769,18 +769,8 @@ class MyPixels:
         # TODO: What if this ended when not a current page?
         if not tabn:
             tabn = self.notebook.get_current_page()
-
         if (tabn >= 0):
             self.notebook.remove_page(tabn)
-
-        if (self.notebook.get_n_pages() <= 0):
-            self.quit_request()
-        else:
-            tabn = self.notebook.get_current_page()
-            # refocus
-            self.notebook.set_current_page(tabn)
-
-        self.update_tablist()
 
     def rename_tab(self, tabn=None):
         if not tabn:
@@ -795,9 +785,21 @@ class MyPixels:
 
     def tab_closed(self, notebook, tab, index):
         del self.tabs[tab]
+        if (self.notebook.get_n_pages() == 0):
+            self.quit_request()
+        else:
+            tabn = self.notebook.get_current_page()
+            # refocus
+            self.notebook.set_current_page(tabn)
 
-    def child_exited(self, a=None, b=None):
-        self.close_tab()
+        self.update_tablist()
+
+
+    def child_exited(self, term, status):
+        for idx, tab in enumerate(self.notebook):
+            if tab == term:
+                self.notebook.remove_page(idx)
+        self.update_tablist()
 
     def child_eof(self, a=None, b=None):
         pass
