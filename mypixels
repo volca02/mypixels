@@ -55,7 +55,7 @@ config = {
     'focus_new_tabs': True,
     'tab_prepend': 'clock', # name of callback function that generates pango markup text appended to tab list before the tabs
     'tab_append': None,  # the same, but appended after tab list
-    'tab_format': '<span %(color)s>[%(entangled)s%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
+    'tab_format': '<span %(color)s>%(tcorner)s%(entangled)s%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
     'tab_color_bg': '#303030',
     'tab_color_bg_selected': '#505020',
     'tab_color_fg': '#888',
@@ -123,6 +123,8 @@ config = {
 
         'search_prev': 'MOD1+SHIFT+a',
         'search_next': 'MOD1+SHIFT+d',
+
+        'font_selector': 'CONTROL+SHIFT+f',
 
         'goto_tab_0': 'MOD1+_1',
         'goto_tab_1': 'MOD1+_2',
@@ -428,7 +430,9 @@ class MyPixels:
             'show_search': (self.show_search, None),
 
             'search_prev': (self.search_advance, False),
-            'search_next': (self.search_advance, True)
+            'search_next': (self.search_advance, True),
+
+            'font_selector': (self.font_selector, True)
         }
 
         for i in range(0, 10):
@@ -521,10 +525,10 @@ class MyPixels:
         tab.set_word_char_exceptions("-A-Za-z0-9,./?%&#:_~")
         bg_color = Gdk.RGBA()
         bg_color.parse(config['bg_tint_color'])
-        alpha=1.0-config['term_opacity']
-        bg_color.alpha=alpha
+        bg_color.alpha=1.0-config['term_opacity']
         tab.set_color_background(bg_color)
-        self.window.set_opacity(alpha)
+	self.window.set_opacity(bg_color.alpha)
+
 
         if self.palette:
             tab.set_colors(self.fg_color, self.bg_color, self.palette)
@@ -866,6 +870,21 @@ class MyPixels:
             tab.search_find_next()
         else:
             tab.search_find_previous()
+
+    def font_selector(self, param=None):
+        font_chooser = gtk.FontSelectionDialog("Terminal font", self.window)
+        font_chooser.set_font_name(config["term_font"])
+        res = font_chooser.run()
+
+        if res == gtk.RESPONSE_OK:
+            fname = font_chooser.get_font_name()
+            font_desc = pango.FontDescription(fname)
+            if font_desc:
+                config["term_font"] = fname
+                for tab in self.tabs:
+                    tab.set_font(font_desc)
+
+        font_chooser.destroy()
 
     def get_current_tab(self):
         tabn = self.notebook.get_current_page()
