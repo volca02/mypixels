@@ -38,6 +38,7 @@ import os.path
 import sys
 import cgi
 import traceback
+import gio
 
 def clock():
     from time import localtime, strftime
@@ -983,7 +984,19 @@ class MyPixels:
         print("Reloading config...")
         # tries to reload config and re-apply what can be
         self.load_config()
+        self.hook_wal_reloads()
         self.apply_config()
+
+    def file_changed(monitor, file, other, unknown, event, self):
+        if event == gio.FileMonitorEvent.CHANGES_DONE_HINT:
+           self.load_wal_palette()
+           self.apply_config()
+
+    def hook_wal_reloads(self):
+        self.wal_file = gio.File.new_for_path(os.path.expanduser(config['wal_palette']))
+        print("Will monitor " + repr(self.wal_file.get_uri()))
+        self.monitor = self.wal_file.monitor_file(gio.FileMonitorFlags.NONE, None)
+        self.monitor.connect("changed", self.file_changed, self)
 
     def load_wal_palette(self):
         # if specified in config file, we try to load the yml version of wal palette
