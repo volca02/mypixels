@@ -37,6 +37,7 @@ import yaml
 import os.path
 import sys
 import cgi
+import traceback
 
 def clock():
     from time import localtime, strftime
@@ -78,6 +79,8 @@ config = {
     'tablist_hide': False,
     'default_width': 640,
     'default_height': 480,
+
+    'wal_palette': '~/.cache/wal/colors.yml',
 
     'palette': '',
 
@@ -126,6 +129,8 @@ config = {
 
         'font_selector': 'CONTROL+SHIFT+f',
 
+        'config_reload': 'CONTROL+SHIFT+r',
+
         'goto_tab_0': 'MOD1+_1',
         'goto_tab_1': 'MOD1+_2',
         'goto_tab_2': 'MOD1+_3',
@@ -160,7 +165,6 @@ str2mod = {
     'control': gtk.gdk.CONTROL_MASK,
     'ctrl': gtk.gdk.CONTROL_MASK
 }
-
 # parses mod+mod+key
 def key_press_parse(bindstr):
     key = None
@@ -183,6 +187,11 @@ def parse_rgba(color):
     col.parse(color)
     return col
 
+def brighten(strcolor, amount = 1.2):
+    col = parse_rgba(strcolor)
+    return '#{:02x}{:02x}{:02x}'.format(min(255, int(255 * col.red * amount)),
+                                        min(255, int(255 * col.green * amount)),
+                                        min(255, int(255 * col.blue * amount)))
 
 # parses key_combo=call(arg)
 def key_bind_parse(bindstr):
@@ -259,48 +268,7 @@ class MyPixels:
         self.fontsize = 0
 
         # handle config
-        try:
-            with open(os.path.expanduser("~/.mypixels")) as f:
-                myconfig = yaml.load(f)
-
-            try:
-                for k in config.keys():
-                    # if this is a keymap, descend
-                    if k == "bindings":
-                        if "bindings" in myconfig:
-                            for fn, b in myconfig['bindings'].items():
-                                config[k][fn] = b
-                    else:
-                        if k in myconfig:
-                            config[k] = myconfig[k]
-            except Exception as e:
-                print("Config parse error: " % str(e))
-                pass
-        except:
-            pass
-            # if no config is found, write the default mappings into the config
-            #self.write_config()
-
-        # parse the on goto key
-        self.on_tabswitch_key = key_press_parse(config["tab_highlight_mod"])[1]
-
-        # parse the config key bindings
-        self.set_funcmap()
-        self.keymap = config['bindings']
-        self.transform_keybinds()
-
-        # convert the call config vars to callables
-        if 'palette' in config:
-            colors = config['palette'].split(':')
-            self.palette = []
-            for color in colors:
-                if color:
-                    self.palette.append(parse_rgba(color))
-        else:
-            self.palette = None
-
-        self.fg_color = parse_rgba(config['foreground_color'])
-        self.bg_color = parse_rgba(config['background_color'])
+        self.load_config()
 
         self.overlay = gtk.Overlay()
         self.window.add(self.overlay)
@@ -316,8 +284,6 @@ class MyPixels:
 
         self.tablist = gtk.Label()
 
-        fontdesc = pango.FontDescription(config["tablist_font"])
-        self.tablist.modify_font(fontdesc)
         self.tablist.set_use_markup(True)
         self.tablist.set_justify(gtk.JUSTIFY_LEFT)
         self.tablist.set_line_wrap(False)
@@ -330,8 +296,6 @@ class MyPixels:
 
         ebox.add(self.tablist)
         ebox.show()
-        bgcolor = gtk.gdk.color_parse(config['tablist_background'])
-        ebox.modify_bg(gtk.STATE_NORMAL, bgcolor)
 
         # gtk notebook that holds the vterms
         self.notebook = gtk.Notebook()
@@ -386,6 +350,9 @@ class MyPixels:
 
         self.forcedHideTabs = config['tablist_hide']
 
+        # try re-applying the configuration
+        self.apply_config()
+
         self.tabs = {}
 
     def transform_keybinds(self):
@@ -432,7 +399,9 @@ class MyPixels:
             'search_prev': (self.search_advance, False),
             'search_next': (self.search_advance, True),
 
-            'font_selector': (self.font_selector, True)
+            'font_selector': (self.font_selector, True),
+
+            'config_reload': (self.reload_config, None)
         }
 
         for i in range(0, 10):
@@ -523,15 +492,7 @@ class MyPixels:
         tab.search_set_wrap_around(True)
 
         tab.set_word_char_exceptions("-A-Za-z0-9,./?%&#:_~")
-        bg_color = Gdk.RGBA()
-        bg_color.parse(config['bg_tint_color'])
-        bg_color.alpha=1.0-config['term_opacity']
-        tab.set_color_background(bg_color)
-	self.window.set_opacity(bg_color.alpha)
-
-
-        if self.palette:
-            tab.set_colors(self.fg_color, self.bg_color, self.palette)
+        self.apply_tab_colors(tab)
 
         tid = self.counter.next()
 
@@ -938,6 +899,138 @@ class MyPixels:
 
         # TODO: Cleanup
         gtk.main_quit()
+
+    def load_config(self):
+        try:
+            with open(os.path.expanduser("~/.mypixels")) as f:
+                myconfig = yaml.load(f, Loader=yaml.FullLoader)
+
+            try:
+                for k in config.keys():
+                    # if this is a keymap, descend
+                    if k == "bindings":
+                        if "bindings" in myconfig:
+                            for fn, b in myconfig['bindings'].items():
+                                config[k][fn] = b
+                    else:
+                        if k in myconfig:
+                            config[k] = myconfig[k]
+            except Exception as e:
+                print("Config parse error: " % str(e))
+                pass
+        except:
+            pass
+            # if no config is found, write the default mappings into the config
+            #self.write_config()
+
+        # try to override the colors from wal palette if that is set to be used
+        self.load_wal_palette()
+
+    def apply_tab_colors(self, tab):
+        bg_color = Gdk.RGBA()
+        bg_color.parse(config['bg_tint_color'])
+        bg_color.alpha=1.0-config['term_opacity']
+        tab.set_color_background(bg_color)
+        if self.palette:
+            tab.set_colors(self.fg_color, self.bg_color, self.palette)
+
+    def apply_config(self):
+        # higlights tab nums on press
+        self.on_tabswitch_key = key_press_parse(config["tab_highlight_mod"])[1]
+
+        # parse the config key bindings
+        self.set_funcmap()
+        self.keymap = config['bindings']
+        self.transform_keybinds()
+
+        # convert the call config vars to callables
+        if 'palette' in config:
+            colors = config['palette'].split(':')
+            self.palette = []
+            for color in colors:
+                if color:
+                    self.palette.append(parse_rgba(color))
+        else:
+            self.palette = None
+
+        self.fg_color = parse_rgba(config['foreground_color'])
+        self.bg_color = parse_rgba(config['background_color'])
+
+        fontdesc = pango.FontDescription(config["tablist_font"])
+        self.tablist.modify_font(fontdesc)
+
+        bgcolor = gtk.gdk.color_parse(config['tablist_background'])
+        self.ebox.modify_bg(gtk.STATE_NORMAL, bgcolor)
+
+        if config["tablist_top"]:
+            self.vbox.reorder_child(self.ebox, 0)
+            self.vbox.reorder_child(self.notebook, 1)
+        else:
+            self.vbox.reorder_child(self.notebook, 1)
+            self.vbox.reorder_child(self.ebox, 2)
+
+        # window fixup before we create tab
+        self.window.resize(config["default_width"], config["default_height"])
+
+        # iterate all tabs in our list and re-apply the background
+        for idx, tab in enumerate(self.notebook):
+            self.apply_tab_colors(tab)
+
+        # repaint the tab bar
+        self.update_tablist()
+
+    def reload_config(self, arg=None):
+        print("Reloading config...")
+        # tries to reload config and re-apply what can be
+        self.load_config()
+        self.apply_config()
+
+    def load_wal_palette(self):
+        # if specified in config file, we try to load the yml version of wal palette
+        if ('wal_palette' not in config) or config['wal_palette'] == '':
+            print("No wal_palette specified in config. Skipping")
+            return
+
+        try:
+            with open(os.path.expanduser(config['wal_palette'])) as f:
+                mypal = yaml.load(f, Loader=yaml.FullLoader)
+                # special category contains foreground and background
+                bgcol  = mypal['special']['background']
+                fgcol  = mypal['special']['foreground']
+                curcol = mypal['special']['cursor']
+
+                src_cols = mypal['colors']
+                colors = []
+                for n in range(0, 16):
+                      colors.append(src_cols['color' + str(n)])
+
+                # that's all there's to it, really. Now we apply those
+                tab_bg = brighten(bgcol, 1.5)
+
+                config['background_color']   = bgcol
+                config['bg_tint_color']      = bgcol
+                config['foreground_color']   = fgcol
+
+                config['tablist_background'] = tab_bg
+                config['tab_color_bg'] = tab_bg
+                config['tab_color_bg_selected'] = brighten(tab_bg, 1.5)
+                config['tab_color_fg'] = fgcol
+                config['tab_color_fg_selected'] = curcol
+
+                config['tab_color_entangle'] = colors[1]
+                config['tab_color_idx'] = colors[2]
+
+                for n in range(0,8):
+                      config['col_' + str(n)] = colors[n]
+
+                # and at last, the palette
+                config['palette'] = ':'.join(colors)
+
+                print("Loaded wal colors")
+        except Exception, e:
+            exc_info = sys.exc_info()
+            traceback.print_exception(*exc_info)
+            print("Cannot load/apply wal colors: %s!" % repr(e))
 
 if __name__ == '__main__':
     term = MyPixels()
