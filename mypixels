@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 """ mypixels - A low clutter, python-gtk based terminal emulator.
 """
 
@@ -36,7 +36,7 @@ import types
 import yaml
 import os.path
 import sys
-import cgi
+import html
 import traceback
 import gio
 
@@ -495,7 +495,7 @@ class MyPixels:
         tab.set_word_char_exceptions("-A-Za-z0-9,./?%&#:_~")
         self.apply_tab_colors(tab)
 
-        tid = self.counter.next()
+        tid = self.counter.__next__()
 
         if self.fontsize:
             pangodesc = tab.get_font()
@@ -594,7 +594,7 @@ class MyPixels:
                 mt_cur = max_title_len
                 sh_cur = config['tab_title_short_current']
 
-                if (type(sh_cur) == types.IntType):
+                if (type(sh_cur) is int):
                     mt_cur = sh_cur
                     sh_cur = True
 
@@ -621,7 +621,7 @@ class MyPixels:
             color = "foreground=\"%s\" background=\"%s\"" % (colfg, colbg)
 
             # fixup title - dangerous chars
-            tname = cgi.escape(tname)
+            tname = html.escape(tname)
 
             if multiline_tabs:
                 opango = pango
@@ -1040,7 +1040,7 @@ class MyPixels:
                 config['palette'] = ':'.join(colors)
 
                 print("Loaded wal colors")
-        except Exception, e:
+        except Exception as e:
             exc_info = sys.exc_info()
             traceback.print_exception(*exc_info)
             print("Cannot load/apply wal colors: %s!" % repr(e))
