@@ -58,6 +58,7 @@ config = {
     'tab_prepend': 'clock', # name of callback function that generates pango markup text appended to tab list before the tabs
     'tab_append': None,  # the same, but appended after tab list
     'tab_format': '<span %(color)s>%(tcorner)s%(entangled)s%(tname)s]</span>', # tid Tab id (unique), tname - tab name, tidx - tab index (from 1 on the left)
+    'tab_shorten_str': '\xe2\x80\xa6',
     'tab_color_bg': '#303030',
     'tab_color_bg_selected': '#505020',
     'tab_color_fg': '#888',
@@ -557,6 +558,7 @@ class MyPixels:
 
         tab_format = config['tab_format']
         max_title_len = config['tab_title_max_length']
+        tabl_short = config['tab_shorten_str']
 
         for idx, tab in enumerate(self.notebook):
             colfg = config["tab_color_fg"]
@@ -583,9 +585,9 @@ class MyPixels:
             if (idx != curidx):
                 if max_title_len > 0 and len(tname) > max_title_len:
                     if config['tab_title_shorten_start']:
-                        tname = "\xe2\x80\xa6" + tname[len(tname)-max_title_len:]
+                        tname = tabl_short + tname[len(tname)-max_title_len:]
                     else:
-                        tname = tname[:max_title_len] + "\xe2\x80\xa6"
+                        tname = tname[:max_title_len] + tabl_short
             else:
                 colfg = config["tab_color_fg_selected"]
                 colbg = config["tab_color_bg_selected"]
@@ -600,9 +602,10 @@ class MyPixels:
 
                 if sh_cur and mt_cur > 0 and len(tname) > mt_cur:
                    if config['tab_title_shorten_start']:
-                       tname = "\xe2\x80\xa6" + tname[len(tname) - mt_cur:]
+                       #   
+                       tname = tabl_short + tname[len(tname) - mt_cur:]
                    else:
-                       tname = tname[:mt_cur] + "\xe2\x80\xa6"
+                       tname = tname[:mt_cur] + tabl_short
 
             # now if we have group set for the tab, override
             if tab in self.tabs:
