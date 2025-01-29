@@ -240,7 +240,7 @@ def dialog_get_text(parent, message, default=''):
     d.set_default_response(gtk.RESPONSE_OK)
 
     r = d.run()
-    text = entry.get_text().decode('utf8')
+    text = entry.get_text()
     d.destroy()
     if r == gtk.RESPONSE_OK:
         return text
@@ -465,6 +465,16 @@ class MyPixels:
     def shrink_font(self, param):
         self.zoom(False)
 
+    def on_scroll(self, widget, event):
+        # Handles zoom in / zoom out on Ctrl+mouse wheel
+        accel_mask = gtk.accelerator_get_default_mod_mask()
+        if event.state & accel_mask == gtk.gdk.ModifierType.CONTROL_MASK:
+            direction = event.get_scroll_deltas()[2]
+        if direction > 0:  # scrolling down -> zoom out
+            self.zoom(False)
+        else:
+            self.zoom(True)
+
     def zoom(self, zoom):
         for idx, tab in enumerate(self.notebook):
             pangodesc = tab.get_font()
@@ -486,6 +496,7 @@ class MyPixels:
         tab.connect("child-exited", self.child_exited)
         tab.connect("eof", self.child_eof)
         tab.connect("window-title-changed", self.window_title_changed)
+        tab.connect("scroll-event", self.on_scroll)
 #        tab.connect("key-press-event", self.key_pressed)
 #        tab.connect("key-release-event", self.key_released)
 
