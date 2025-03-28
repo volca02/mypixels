@@ -291,8 +291,10 @@ class MyPixels:
         self.tablist.set_justify(Gtk.Justification.LEFT)
         self.tablist.set_line_wrap(False)
         self.tablist.set_selectable(False)
-        self.tablist.set_padding(2,2)
-        self.tablist.set_alignment(0,0)
+        self.tablist.set_margin_top(2)
+        self.tablist.set_margin_bottom(2)
+        self.tablist.set_halign(Gtk.Align.START)
+        self.tablist.set_valign(Gtk.Align.START)
         self.tablist.set_ellipsize(Pango.EllipsizeMode.END)
         self.tablist.set_text(" ")
         self.tablist.show()
@@ -979,13 +981,14 @@ class MyPixels:
         self.bg_color = parse_rgba(config['background_color'])
 
         fontdesc = Pango.FontDescription(config["tablist_font"])
-        self.tablist.modify_font(fontdesc)
 
         bgcolor = config['tablist_background']
         # TODO: self.ebox.modify_bg(Gtk.STATE_NORMAL, bgcolor)
 
         css = f"""
         #tabbar {{
+        font-family: "{fontdesc.get_family()}";
+        font-size: {fontdesc.get_size() / Pango.SCALE}px;
         background-color: {bgcolor};
         }}
         """
