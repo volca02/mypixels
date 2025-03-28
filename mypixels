@@ -25,20 +25,18 @@
 import gi
 from gi import pygtkcompat
 gi.require_version('Vte', '2.91')
-pygtkcompat.enable()
-pygtkcompat.enable_gtk(version='3.0')
-import gtk
+# pygtkcompat.enable()
+# pygtkcompat.enable_gtk(version='3.0')
 import gobject
-from gi.repository import Vte, GLib, Gdk
+from gi.repository import Vte, GLib, Gtk, Gdk, Pango, Gio
 #import vte
-import pango
+#import pango
 import types
 import yaml
 import os.path
 import sys
 import html
 import traceback
-import gio
 
 def clock():
     from time import localtime, strftime
@@ -148,24 +146,24 @@ config = {
 
 # Used for quick selection via <Mod1>[0-9]
 num2key = (
-    gtk.keysyms._1,
-    gtk.keysyms._2,
-    gtk.keysyms._3,
-    gtk.keysyms._4,
-    gtk.keysyms._5,
-    gtk.keysyms._6,
-    gtk.keysyms._7,
-    gtk.keysyms._8,
-    gtk.keysyms._9,
-    gtk.keysyms._0,
+    Gdk.KEY_1,
+    Gdk.KEY_2,
+    Gdk.KEY_3,
+    Gdk.KEY_4,
+    Gdk.KEY_5,
+    Gdk.KEY_6,
+    Gdk.KEY_7,
+    Gdk.KEY_8,
+    Gdk.KEY_9,
+    Gdk.KEY_0,
     );
 
 str2mod = {
-    'mod1':  gtk.gdk.MOD1_MASK,
-    'alt':  gtk.gdk.MOD1_MASK,
-    'shift': gtk.gdk.SHIFT_MASK,
-    'control': gtk.gdk.CONTROL_MASK,
-    'ctrl': gtk.gdk.CONTROL_MASK
+    'mod1':  Gdk.ModifierType.MOD1_MASK,
+    'alt':  Gdk.ModifierType.MOD1_MASK,
+    'shift': Gdk.ModifierType.SHIFT_MASK,
+    'control': Gdk.ModifierType.CONTROL_MASK,
+    'ctrl': Gdk.ModifierType.CONTROL_MASK
 }
 # parses mod+mod+key
 def key_press_parse(bindstr):
@@ -178,14 +176,14 @@ def key_press_parse(bindstr):
             mods = mods | str2mod[kl]
         else:
             if not key:
-                key = dict(gtk.keysyms.__dict__)[kp]
+                key = Gdk.keyval_from_name(kp)
             else:
                 print("Parse error: '%s' - part '%s', state %s, %s" % (bindstr, kp, str(key), str(mods)))
 
     return (mods, key)
 
 def parse_rgba(color):
-    col = gtk.gdk.RGBA()
+    col = Gdk.RGBA()
     col.parse(color)
     return col
 
@@ -227,22 +225,22 @@ def dialog_get_text(parent, message, default=''):
     Display a dialog with a text entry.
     Returns the text, or None if canceled.
     """
-    d = gtk.MessageDialog(parent,
-                          gtk.DIALOG_MODAL | gtk.DIALOG_DESTROY_WITH_PARENT,
-                          gtk.MESSAGE_QUESTION,
-                          gtk.BUTTONS_OK_CANCEL,
+    d = Gtk.MessageDialog(parent,
+                          Gtk.DIALOG_MODAL | Gtk.DIALOG_DESTROY_WITH_PARENT,
+                          Gtk.MESSAGE_QUESTION,
+                          Gtk.BUTTONS_OK_CANCEL,
                           message)
-    entry = gtk.Entry()
+    entry = Gtk.Entry()
     entry.set_text(default)
     entry.show()
     d.vbox.pack_end(entry)
-    entry.connect('activate', lambda _: d.response(gtk.RESPONSE_OK))
-    d.set_default_response(gtk.RESPONSE_OK)
+    entry.connect('activate', lambda _: d.response(Gtk.RESPONSE_OK))
+    d.set_default_response(Gtk.RESPONSE_OK)
 
     r = d.run()
     text = entry.get_text()
     d.destroy()
-    if r == gtk.RESPONSE_OK:
+    if r == Gtk.RESPONSE_OK:
         return text
     else:
         return None
@@ -256,7 +254,7 @@ class MyPixels:
         self.entangled = []
 
         # create a window to hold the thing
-        self.window = gtk.Window()
+        self.window = Gtk.Window()
         self.window.set_title("mypixels")
         self.window.set_border_width(0)
 
@@ -272,27 +270,29 @@ class MyPixels:
         # handle config
         self.load_config()
 
-        self.overlay = gtk.Overlay()
+        self.overlay = Gtk.Overlay()
         self.window.add(self.overlay)
         self.overlay.show()
 
-        vbox = gtk.VBox()
+        vbox = Gtk.VBox()
         self.vbox = vbox
-        self.vbox.set_resize_mode(gtk.RESIZE_IMMEDIATE)
+        # self.vbox.set_resize_mode(Gtk.RESIZE_IMMEDIATE)
         self.overlay.add(vbox)
 
-        ebox = gtk.EventBox()
+        ebox = Gtk.EventBox()
         self.ebox = ebox
 
-        self.tablist = gtk.Label()
+        self.ebox.set_name("tabbar")
+
+        self.tablist = Gtk.Label()
 
         self.tablist.set_use_markup(True)
-        self.tablist.set_justify(gtk.JUSTIFY_LEFT)
+        self.tablist.set_justify(Gtk.Justification.LEFT)
         self.tablist.set_line_wrap(False)
         self.tablist.set_selectable(False)
         self.tablist.set_padding(2,2)
         self.tablist.set_alignment(0,0)
-        self.tablist.set_ellipsize(pango.ELLIPSIZE_END)
+        self.tablist.set_ellipsize(Pango.EllipsizeMode.END)
         self.tablist.set_text(" ")
         self.tablist.show()
 
@@ -300,7 +300,7 @@ class MyPixels:
         ebox.show()
 
         # gtk notebook that holds the vterms
-        self.notebook = gtk.Notebook()
+        self.notebook = Gtk.Notebook()
         self.notebook.set_show_tabs(False)
 
         self.notebook.set_show_border(False)
@@ -332,14 +332,14 @@ class MyPixels:
         self.window.resize(config["default_width"], config["default_height"])
 
         # searchbox, if it updates, we update the vtk search
-        self.search_entry = gtk.Entry()
+        self.search_entry = Gtk.Entry()
 
         self.search_entry.set_margin_start(5);
         self.search_entry.set_margin_end(5);
         self.search_entry.set_margin_top(5);
         self.search_entry.set_margin_bottom(5);
-        self.search_entry.set_halign(gtk.ALIGN_START);
-        self.search_entry.set_valign(gtk.ALIGN_END);
+        self.search_entry.set_halign(Gtk.Align.START);
+        self.search_entry.set_valign(Gtk.Align.END);
         self.search_entry.connect("key-press-event", self.search_key_pressed)
         self.search_entry.connect("focus-out-event", self.search_lose_focus)
 
@@ -417,10 +417,10 @@ class MyPixels:
         self.update_tablist()
 
     def key_pressed(self, wnd, event):
-        if event.type == gtk.gdk.KEY_PRESS:
+        if event.type == Gdk.EventType.KEY_PRESS:
             # skim through the bindings
-            mods = event.state & gtk.accelerator_get_default_mod_mask()
-            keyval = gtk.gdk.keyval_to_lower(event.keyval)
+            mods = event.state & Gtk.accelerator_get_default_mod_mask()
+            keyval = Gdk.keyval_to_lower(event.keyval)
 
             # TODO: Could accelerate this by placing the key combination into a dict
             for bind in self.keybinds:
@@ -446,9 +446,9 @@ class MyPixels:
         tabn = self.notebook.get_current_page()
         tab = self.notebook.get_nth_page(tabn)
 
-        if (event.type == gtk.gdk.KEY_RELEASE):
-            mods = event.state & gtk.accelerator_get_default_mod_mask()
-            keyval = gtk.gdk.keyval_to_lower(event.keyval)
+        if (event.type == Gdk.EventType.KEY_RELEASE):
+            mods = event.state & Gtk.accelerator_get_default_mod_mask()
+            keyval = Gdk.keyval_to_lower(event.keyval)
             if (keyval == self.on_tabswitch_key):
                 self.on_tabswitch = False
                 self.update_tablist()
@@ -467,8 +467,8 @@ class MyPixels:
 
     def on_scroll(self, widget, event):
         # Handles zoom in / zoom out on Ctrl+mouse wheel
-        accel_mask = gtk.accelerator_get_default_mod_mask()
-        if event.state & accel_mask == gtk.gdk.ModifierType.CONTROL_MASK:
+        accel_mask = Gtk.accelerator_get_default_mod_mask()
+        if event.state & accel_mask == Gdk.ModifierType.CONTROL_MASK:
             direction = event.get_scroll_deltas()[2]
         if direction > 0:  # scrolling down -> zoom out
             self.zoom(False)
@@ -480,10 +480,10 @@ class MyPixels:
             pangodesc = tab.get_font()
             fontsize = pangodesc.get_size()
 
-            if fontsize > pango.SCALE and not zoom:
-                fontsize -= pango.SCALE
+            if fontsize > Pango.SCALE and not zoom:
+                fontsize -= Pango.SCALE
             elif zoom:
-                fontsize += pango.SCALE
+                fontsize += Pango.SCALE
 
             pangodesc.set_size(fontsize)
             self.fontsize=fontsize
@@ -500,7 +500,7 @@ class MyPixels:
 #        tab.connect("key-press-event", self.key_pressed)
 #        tab.connect("key-release-event", self.key_released)
 
-        tab.set_font(pango.FontDescription(config["term_font"]))
+        tab.set_font(Pango.FontDescription(config["term_font"]))
         tab.set_scrollback_lines(config['scrollback_lines'])
         tab.search_set_wrap_around(True)
 
@@ -848,13 +848,13 @@ class MyPixels:
             tab.search_find_previous()
 
     def font_selector(self, param=None):
-        font_chooser = gtk.FontSelectionDialog("Terminal font", self.window)
+        font_chooser = Gtk.FontSelectionDialog("Terminal font", self.window)
         font_chooser.set_font_name(config["term_font"])
         res = font_chooser.run()
 
-        if res == gtk.RESPONSE_OK:
+        if res == Gtk.RESPONSE_OK:
             fname = font_chooser.get_font_name()
-            font_desc = pango.FontDescription(fname)
+            font_desc = Pango.FontDescription(fname)
             if font_desc:
                 config["term_font"] = fname
                 for tab in self.tabs:
@@ -872,11 +872,11 @@ class MyPixels:
         self.get_current_tab().grab_focus()
 
     def search_key_pressed(self, wnd, event):
-        if event.type == gtk.gdk.KEY_PRESS:
-            if (event.keyval == gtk.keysyms.Escape):
+        if event.type == Gdk.KEY_PRESS:
+            if (event.keyval == Gdk.KEY_Escape):
                 self.hide_search()
                 return False
-            if (event.keyval == gtk.keysyms.Return):
+            if (event.keyval == Gdk.KEY_Return):
                 self.update_search_term(self.search_entry.get_text())
                 self.hide_search()
                 self.search_advance(True)
@@ -897,23 +897,23 @@ class MyPixels:
                 self.command=sys.argv[1:]
 
         self.new_tab()
-        gtk.main()
+        Gtk.main()
 
     def quit_request(self, *args):
         # if there is more than one tab, ask
         if (self.notebook.get_n_pages() > 1):
             # ask first
-            dialog = gtk.MessageDialog(self.window, gtk.DIALOG_MODAL, \
-                gtk.MESSAGE_INFO, gtk.BUTTONS_YES_NO, "Do you really want to close?")
+            dialog = Gtk.MessageDialog(self.window, Gtk.DIALOG_MODAL, \
+                Gtk.MESSAGE_INFO, Gtk.BUTTONS_YES_NO, "Do you really want to close?")
 
             rv = dialog.run()
             dialog.destroy()
 
-            if rv != gtk.RESPONSE_YES:
+            if rv != Gtk.RESPONSE_YES:
                 return True # cancel the quit
 
         # TODO: Cleanup
-        gtk.main_quit()
+        Gtk.main_quit()
 
     def load_config(self):
         try:
@@ -971,11 +971,25 @@ class MyPixels:
         self.fg_color = parse_rgba(config['foreground_color'])
         self.bg_color = parse_rgba(config['background_color'])
 
-        fontdesc = pango.FontDescription(config["tablist_font"])
+        fontdesc = Pango.FontDescription(config["tablist_font"])
         self.tablist.modify_font(fontdesc)
 
-        bgcolor = gtk.gdk.color_parse(config['tablist_background'])
-        self.ebox.modify_bg(gtk.STATE_NORMAL, bgcolor)
+        bgcolor = config['tablist_background']
+        # TODO: self.ebox.modify_bg(Gtk.STATE_NORMAL, bgcolor)
+
+        css = f"""
+        #tabbar {{
+        background-color: {bgcolor};
+        }}
+        """
+
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
         if config["tablist_top"]:
             self.vbox.reorder_child(self.ebox, 0)
@@ -1002,14 +1016,14 @@ class MyPixels:
         self.apply_config()
 
     def file_changed(monitor, file, other, unknown, event, self):
-        if event == gio.FileMonitorEvent.CHANGES_DONE_HINT:
+        if event == Gio.FileMonitorEvent.CHANGES_DONE_HINT:
            self.load_wal_palette()
            self.apply_config()
 
     def hook_wal_reloads(self):
-        self.wal_file = gio.File.new_for_path(os.path.expanduser(config['wal_palette']))
+        self.wal_file = Gio.File.new_for_path(os.path.expanduser(config['wal_palette']))
         print("Will monitor " + repr(self.wal_file.get_uri()))
-        self.monitor = self.wal_file.monitor_file(gio.FileMonitorFlags.NONE, None)
+        self.monitor = self.wal_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
         self.monitor.connect("changed", self.file_changed, self)
 
     def load_wal_palette(self):
