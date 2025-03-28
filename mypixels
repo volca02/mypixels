@@ -225,22 +225,23 @@ def dialog_get_text(parent, message, default=''):
     Display a dialog with a text entry.
     Returns the text, or None if canceled.
     """
-    d = Gtk.MessageDialog(parent,
-                          Gtk.DIALOG_MODAL | Gtk.DIALOG_DESTROY_WITH_PARENT,
-                          Gtk.MESSAGE_QUESTION,
-                          Gtk.BUTTONS_OK_CANCEL,
-                          message)
+    d = Gtk.MessageDialog(transient_for=parent,
+                          modal=True,
+                          destroy_with_parent=True,
+                          message_type=Gtk.MessageType.QUESTION,
+                          buttons=Gtk.ButtonsType.OK_CANCEL,
+                          text=message)
     entry = Gtk.Entry()
     entry.set_text(default)
     entry.show()
-    d.vbox.pack_end(entry)
-    entry.connect('activate', lambda _: d.response(Gtk.RESPONSE_OK))
-    d.set_default_response(Gtk.RESPONSE_OK)
+    d.vbox.pack_end(entry, False, False, 0)
+    entry.connect('activate', lambda _: d.response(Gtk.ResponseType.OK))
+    d.set_default_response(Gtk.ResponseType.OK)
 
     r = d.run()
     text = entry.get_text()
     d.destroy()
-    if r == Gtk.RESPONSE_OK:
+    if r == Gtk.ResponseType.OK:
         return text
     else:
         return None
@@ -521,15 +522,18 @@ class MyPixels:
         elif (self.command):
             command=self.command
 
-        tab.spawn_sync(
+        tab.spawn_async(
             Vte.PtyFlags.DEFAULT,
             os.environ['HOME'],
             command,
             [],
-            0,
-            None,
-            None,
-            None
+            GLib.SpawnFlags.DEFAULT,
+            None,   # child_setup
+            None,   # child_setup_data
+            -1,     # timeout (no timeout)
+            None,   # cancellable
+            None,   # callback (optional)
+            None    # user_data (optional)
         )
 
         tab.show()
@@ -785,7 +789,7 @@ class MyPixels:
         pass
 
     def window_title_changed(self, term):
-        self.tabs[term]['title'] = term.get_window_title()
+        self.tabs[term]['title'] = term.get_property("window-title")
         self.update_tablist()
 
     def tab_opened(self, notebook, tab, index):
@@ -852,7 +856,7 @@ class MyPixels:
         font_chooser.set_font_name(config["term_font"])
         res = font_chooser.run()
 
-        if res == Gtk.RESPONSE_OK:
+        if res == Gtk.ResponseType.OK:
             fname = font_chooser.get_font_name()
             font_desc = Pango.FontDescription(fname)
             if font_desc:
@@ -903,13 +907,16 @@ class MyPixels:
         # if there is more than one tab, ask
         if (self.notebook.get_n_pages() > 1):
             # ask first
-            dialog = Gtk.MessageDialog(self.window, Gtk.DIALOG_MODAL, \
-                Gtk.MESSAGE_INFO, Gtk.BUTTONS_YES_NO, "Do you really want to close?")
+            dialog = Gtk.MessageDialog(transient_for=self.window,
+                                       modal=True, destroy_with_parent=True,
+                                       message_type=Gtk.MessageType.INFO,
+                                       buttons=Gtk.ButtonsType.YES_NO,
+                                       text="Do you really want to close?")
 
             rv = dialog.run()
             dialog.destroy()
 
-            if rv != Gtk.RESPONSE_YES:
+            if rv != Gtk.ResponseType.YES:
                 return True # cancel the quit
 
         # TODO: Cleanup
