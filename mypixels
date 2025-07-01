@@ -51,7 +51,7 @@ max_groups = 8
 # Default config
 config = {
     'tablist_background': "#303030", # Tablist background
-    'multiline_tabs': True,
+    
     'focus_new_tabs': True,
     'tab_prepend': 'clock', # name of callback function that generates pango markup text appended to tab list before the tabs
     'tab_append': None,  # the same, but appended after tab list
@@ -285,21 +285,12 @@ class MyPixels:
 
         self.ebox.set_name("tabbar")
 
-        self.tablist = Gtk.Label()
+        self.tab_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.tab_container.set_halign(Gtk.Align.START)
+        self.tab_container.set_valign(Gtk.Align.START)
+        self.tab_container.show()
 
-        self.tablist.set_use_markup(True)
-        self.tablist.set_justify(Gtk.Justification.LEFT)
-        self.tablist.set_line_wrap(False)
-        self.tablist.set_selectable(False)
-        self.tablist.set_margin_top(2)
-        self.tablist.set_margin_bottom(2)
-        self.tablist.set_halign(Gtk.Align.START)
-        self.tablist.set_valign(Gtk.Align.START)
-        self.tablist.set_ellipsize(Pango.EllipsizeMode.END)
-        self.tablist.set_text(" ")
-        self.tablist.show()
-
-        ebox.add(self.tablist)
+        ebox.add(self.tab_container)
         ebox.show()
 
         # gtk notebook that holds the vterms
@@ -555,21 +546,22 @@ class MyPixels:
         tab.grab_focus()
 
     def update_tablist(self):
-        if (self.notebook.get_n_pages() <= 1 and config["hide_single_tab"]) \
-            or self.forcedHideTabs:
-            self.tablist.hide()
+        # Clear existing tabs
+        for child in self.tab_container.get_children():
+            self.tab_container.remove(child)
+
+        if (self.notebook.get_n_pages() <= 1 and config["hide_single_tab"])             or self.forcedHideTabs:
+            self.ebox.hide()
             return
 
-        # TODO: refit the window
-        self.tablist.show()
+        self.ebox.show()
 
-        multiline_tabs = config['multiline_tabs']
-
-        multiline = []
-        pango = ""
-
-        if config['tab_prepend']:
-            pango = callables[config['tab_prepend']]()
+        if (config['tab_prepend']):
+            prepend_label = Gtk.Label()
+            prepend_label.set_use_markup(True)
+            prepend_label.set_markup(callables[config['tab_prepend']]())
+            self.tab_container.pack_start(prepend_label, False, False, 0)
+            prepend_label.show()
 
         curidx = self.notebook.get_current_page()
 
@@ -643,31 +635,41 @@ class MyPixels:
             # fixup title - dangerous chars
             tname = html.escape(tname)
 
-            if multiline_tabs:
-                opango = pango
+            # Create a new EventBox for each tab
+            tab_event_box = Gtk.EventBox()
+            tab_event_box.set_name(f"tab-{idx}") # Set a name for CSS styling
+            tab_event_box.set_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            tab_event_box.connect("button-press-event", self.on_tab_clicked, idx)
 
-                pango += tab_format % locals()
+            tab_label = Gtk.Label()
+            tab_label.set_use_markup(True)
+            tab_label.set_justify(Gtk.Justification.LEFT)
+            tab_label.set_line_wrap(False)
+            tab_label.set_selectable(False)
+            tab_label.set_margin_top(2)
+            tab_label.set_margin_bottom(2)
+            tab_label.set_halign(Gtk.Align.START)
+            tab_label.set_valign(Gtk.Align.START)
+            tab_label.set_ellipsize(Pango.EllipsizeMode.END)
+            tab_label.get_style_context().add_class("tab-label")
 
-                self.tablist.set_markup(pango)
-                listwidth = self.tablist.get_layout().get_pixel_size()[0]
-                winwidth = self.window.get_size()[0]
+            pango_markup = tab_format % locals()
+            tab_label.set_markup(pango_markup)
 
-                if listwidth > (winwidth - 20):
-                    if opango != "":
-                        multiline.append(opango)
-
-                    pango = tab_format % locals()
-            else:
-                pango += tab_format % locals()
+            tab_event_box.add(tab_label)
+            tab_event_box.show_all()
+            self.tab_container.pack_start(tab_event_box, False, False, 0)
 
         if (config['tab_append']):
-            pango += " " + callables[config['tab_append']]()
+            append_label = Gtk.Label()
+            append_label.set_use_markup(True)
+            append_label.set_markup(" " + callables[config['tab_append']]())
+            self.tab_container.pack_start(append_label, False, False, 0)
+            append_label.show()
 
-        if multiline_tabs:
-            multiline.append(pango)
-            self.tablist.set_markup('&#10;'.join(multiline))
-        else:
-            self.tablist.set_markup(pango)
+    def on_tab_clicked(self, widget, event, tab_index):
+        if event.button == 1:  # Left mouse button
+            self.goto_tab(tab_index)
 
 
     def next_tab(self, skip=1, move=False):
@@ -980,16 +982,25 @@ class MyPixels:
         self.fg_color = parse_rgba(config['foreground_color'])
         self.bg_color = parse_rgba(config['background_color'])
 
+        
+
         fontdesc = Pango.FontDescription(config["tablist_font"])
+        font_size_in_pt = fontdesc.get_size() / Pango.SCALE
 
         bgcolor = config['tablist_background']
         # TODO: self.ebox.modify_bg(Gtk.STATE_NORMAL, bgcolor)
 
         css = f"""
         #tabbar {{
-        font-family: "{fontdesc.get_family()}";
-        font-size: {fontdesc.get_size() / Pango.SCALE}px;
-        background-color: {bgcolor};
+            background-color: {bgcolor};
+        }}
+        #tabbar GtkEventBox {{ /* Style for individual tab containers */
+            padding: 2px 8px; /* Add some padding for visual separation */
+            margin-right: 1px; /* Space between tabs */
+        }}
+        #tabbar .tab-label {{ /* Style for the text within tabs */
+            font-family: "{fontdesc.get_family()}";
+            font-size: {font_size_in_pt}pt;
         }}
         """
 
