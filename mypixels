@@ -96,6 +96,8 @@ config = {
 
     'tab_highlight_mod': 'Alt_L',
 
+    'add_button_color': '#FFA500', # Default color for the add new tab button
+
     'bindings': {
         'move_prev_tab' : 'MOD1+SHIFT+Left',
         'move_next_tab' : 'MOD1+SHIFT+Right',
@@ -563,6 +565,23 @@ class MyPixels:
             self.tab_container.pack_start(prepend_label, False, False, 0)
             prepend_label.show()
 
+        # Add the [+] button
+        add_tab_event_box = Gtk.EventBox()
+        add_tab_event_box.set_name("add-tab-button")
+        add_tab_event_box.set_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        add_tab_event_box.connect("button-press-event", self.on_add_tab_clicked)
+        add_tab_event_box.set_tooltip_text("Create a new tab")
+
+        add_tab_label = Gtk.Label()
+        add_tab_label.set_markup("[+]")
+        add_tab_label.set_margin_top(2)
+        add_tab_label.set_margin_bottom(2)
+        add_tab_label.get_style_context().add_class("tab-label") # Use existing tab-label style
+
+        add_tab_event_box.add(add_tab_label)
+        add_tab_event_box.show_all()
+        self.tab_container.pack_start(add_tab_event_box, False, False, 0)
+
         curidx = self.notebook.get_current_page()
 
         tab_format = config['tab_format']
@@ -660,16 +679,15 @@ class MyPixels:
             tab_event_box.show_all()
             self.tab_container.pack_start(tab_event_box, False, False, 0)
 
-        if (config['tab_append']):
-            append_label = Gtk.Label()
-            append_label.set_use_markup(True)
-            append_label.set_markup(" " + callables[config['tab_append']]())
-            self.tab_container.pack_start(append_label, False, False, 0)
-            append_label.show()
+        
 
     def on_tab_clicked(self, widget, event, tab_index):
         if event.button == 1:  # Left mouse button
             self.goto_tab(tab_index)
+
+    def on_add_tab_clicked(self, widget, event):
+        if event.button == 1:  # Left mouse button
+            self.new_tab()
 
 
     def next_tab(self, skip=1, move=False):
@@ -1001,6 +1019,14 @@ class MyPixels:
         #tabbar .tab-label {{ /* Style for the text within tabs */
             font-family: "{fontdesc.get_family()}";
             font-size: {font_size_in_pt}pt;
+        }}
+        #tabbar #add-tab-button {{ /* Style for the add tab button */
+            background-color: {brighten(bgcolor, 1.1)}; /* Slightly brighter background for the button */
+            padding: 2px 8px;
+            margin-right: 1px;
+        }}
+        #tabbar #add-tab-button .tab-label {{ /* Style for the text within the add tab button */
+            color: {config['add_button_color']};
         }}
         """
 
