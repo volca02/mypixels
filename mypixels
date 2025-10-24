@@ -79,6 +79,7 @@ config = {
     'tablist_hide': False,
     'default_width': 640,
     'default_height': 480,
+    'default_maximize': False,
 
     'wal_palette': '~/.cache/wal/colors.yml',
 
@@ -325,7 +326,8 @@ class MyPixels:
         self.window.connect("configure-event", self.resize_request)
 
         # window fixup before we create tab
-        self.window.resize(config["default_width"], config["default_height"])
+        if not config["default_maximize"]:
+            self.window.resize(config["default_width"], config["default_height"])
 
         # searchbox, if it updates, we update the vtk search
         self.search_entry = Gtk.Entry()
@@ -343,6 +345,11 @@ class MyPixels:
 
         self.vbox.show()
         self.window.show()
+
+        # Maximize after showing the window (GTK requirement)
+        if config["default_maximize"]:
+            self.window.maximize()
+
 
         self.notebook.grab_focus()
 
@@ -1046,7 +1053,11 @@ class MyPixels:
             self.vbox.reorder_child(self.ebox, 2)
 
         # window fixup before we create tab
-        self.window.resize(config["default_width"], config["default_height"])
+        if config["default_maximize"]:
+            self.window.maximize()
+        else:
+            self.window.resize(config["default_width"], config["default_height"])
+
 
         # iterate all tabs in our list and re-apply the background
         for idx, tab in enumerate(self.notebook):
