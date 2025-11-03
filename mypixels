@@ -25,10 +25,11 @@
 import gi
 from gi import pygtkcompat
 gi.require_version('Vte', '2.91')
+gi.require_version('GdkPixbuf', '2.0')
 # pygtkcompat.enable()
 # pygtkcompat.enable_gtk(version='3.0')
 import gobject
-from gi.repository import Vte, GLib, Gtk, Gdk, Pango, Gio
+from gi.repository import Vte, GLib, Gtk, Gdk, Pango, Gio, GdkPixbuf
 #import vte
 #import pango
 import types
@@ -37,6 +38,7 @@ import os.path
 import sys
 import html
 import traceback
+import cairo
 
 def clock():
     from time import localtime, strftime
@@ -80,6 +82,9 @@ config = {
     'default_width': 640,
     'default_height': 480,
     'default_maximize': False,
+
+    'tab_overview_on_alt': True,  # Show tab overview when Alt is held during tab switching
+    'tab_overview_opacity': 0.3,  # Background opacity for tab overview (0.0 - 1.0)
 
     'wal_palette': '~/.cache/wal/colors.yml',
 
@@ -133,6 +138,8 @@ config = {
         'font_selector': 'CONTROL+SHIFT+f',
 
         'config_reload': 'CONTROL+SHIFT+r',
+
+        'show_tab_overview': 'MOD1+o',
 
         'goto_tab_0': 'MOD1+_1',
         'goto_tab_1': 'MOD1+_2',
@@ -223,6 +230,542 @@ def counter():
         yield i
         i += 1
 
+class TabOverview:
+    """Standalone tab overview/switcher class"""
+
+    def __init__(self, parent_window, overlay, notebook, tabs_dict, entangled_list, config, mypixels_instance):
+        self.window = parent_window
+        self.overlay = overlay
+        self.notebook = notebook
+        self.tabs = tabs_dict
+        self.entangled = entangled_list
+        self.config = config
+        self.mypixels = mypixels_instance
+
+        self.active = False
+        self.selected = 0
+        self.mode = 'standalone'  # 'standalone' or 'switcher'
+
+        self.overview_box = None
+        self.overview_bg_box = None
+        self.overview_tiles = []
+
+        # Cache for terminal snapshots
+        self.snapshot_cache = {}
+        self.cache_timestamp = 0
+
+        # Key bindings for standalone mode
+        self.setup_keybinds()
+
+    def setup_keybinds(self):
+        """Setup key bindings for standalone mode"""
+        self.keybinds = {
+            'close_tab': (Gdk.KEY_x, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK),
+            'close_tab_alt': (Gdk.KEY_q, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK),
+            'new_tab': (Gdk.KEY_z, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK),
+            'new_tab_alt': (Gdk.KEY_t, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK),
+        }
+
+    def capture_terminal_snapshot(self, terminal):
+        """Capture a snapshot of the terminal widget"""
+        alloc = terminal.get_allocation()
+        width = alloc.width
+        height = alloc.height
+
+        if width <= 0 or height <= 0:
+            return None
+
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        context = cairo.Context(surface)
+        terminal.draw(context)
+        pixbuf = Gdk.pixbuf_get_from_surface(surface, 0, 0, width, height)
+
+        return pixbuf
+
+    def update_snapshot_cache(self, force=False):
+        """Update snapshot cache for all tabs
+
+        Args:
+            force: If True, bypass the time throttle
+        """
+        import time
+        current_time = time.time()
+
+        # Only update cache if more than 0.5 seconds have passed (unless forced)
+        if not force and current_time - self.cache_timestamp < 0.5:
+            return False
+
+        self.cache_timestamp = current_time
+        current_page = self.notebook.get_current_page()
+
+        # Capture current tab (always visible) - key by terminal widget
+        if current_page >= 0:
+            tab = self.notebook.get_nth_page(current_page)
+            pixbuf = self.capture_terminal_snapshot(tab)
+            if pixbuf:
+                self.snapshot_cache[tab] = pixbuf
+
+        return False  # For GLib.timeout_add
+
+    def get_cached_or_capture(self, terminal):
+        """Get cached snapshot or capture new one
+
+        Args:
+            terminal: The VTE terminal widget to capture
+
+        Returns:
+            GdkPixbuf or None
+        """
+        # Try to get from cache first (keyed by terminal widget)
+        if terminal in self.snapshot_cache:
+            return self.snapshot_cache[terminal]
+
+        # Try to capture (will only work if visible)
+        pixbuf = self.capture_terminal_snapshot(terminal)
+        if pixbuf:
+            self.snapshot_cache[terminal] = pixbuf
+        return pixbuf
+
+    def invalidate_cache(self, terminal=None):
+        """Invalidate snapshot cache
+
+        Args:
+            terminal: Specific terminal to invalidate, or None for all
+        """
+        if terminal is None:
+            self.snapshot_cache.clear()
+        elif terminal in self.snapshot_cache:
+            del self.snapshot_cache[terminal]
+
+    def show(self, mode='standalone'):
+        """Show tab overview
+
+        Args:
+            mode: 'standalone' for full control, 'switcher' for Alt-held mode
+        """
+        # If already active, check if we're switching modes
+        if self.active:
+            if self.mode == mode:
+                # Same mode, toggle off
+                self.hide()
+                return
+            else:
+                # Different mode, switch to new mode
+                self.hide()
+
+        n_pages = self.notebook.get_n_pages()
+        if n_pages == 0:
+            return
+
+        # Capture fresh snapshot of active tab before showing
+        current_page = self.notebook.get_current_page()
+        if current_page >= 0:
+            tab = self.notebook.get_nth_page(current_page)
+            pixbuf = self.capture_terminal_snapshot(tab)
+            if pixbuf:
+                self.snapshot_cache[tab] = pixbuf
+
+        self.active = True
+        self.mode = mode
+        self.selected = current_page
+
+        # Create main container
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        # Add mode indicator at the top
+        mode_label = Gtk.Label()
+        mode_label.set_use_markup(True)
+
+        # Get font from config
+        fontdesc = Pango.FontDescription(self.config["tablist_font"])
+        font_size_in_pt = fontdesc.get_size() / Pango.SCALE
+        font_family = fontdesc.get_family()
+
+        if mode == 'standalone':
+            mode_text = f'<span font_family="{font_family}" size="{int(font_size_in_pt * 2)}pt" foreground="#4a9a9a"><b>TAB OVERVIEW MODE</b></span>\n<span font_family="{font_family}" size="{int(font_size_in_pt * 1.2)}pt" foreground="#888">ESC: exit | Enter: select | Arrows: navigate | Shift+Arrows: move tab | Ctrl+Alt+X: close | Ctrl+Alt+Z: new tab</span>'
+        else:
+            mode_text = f'<span font_family="{font_family}" size="{int(font_size_in_pt * 1.5)}pt" foreground="#888"><b>Tab Switcher</b></span>'
+        mode_label.set_markup(mode_text)
+        mode_label.set_margin_bottom(10)
+        main_vbox.pack_start(mode_label, False, False, 0)
+
+        # Create overview container
+        self.overview_box = Gtk.Grid()
+        self.overview_box.set_row_spacing(10)
+        self.overview_box.set_column_spacing(10)
+        self.overview_box.set_margin_start(20)
+        self.overview_box.set_margin_end(20)
+        self.overview_box.set_margin_top(0)
+        self.overview_box.set_margin_bottom(20)
+        self.overview_box.set_halign(Gtk.Align.CENTER)
+        self.overview_box.set_valign(Gtk.Align.CENTER)
+
+        main_vbox.pack_start(self.overview_box, True, True, 0)
+
+        # Create event box for background
+        bg_box = Gtk.EventBox()
+        bg_box.set_name("overview-background")
+        bg_box.add(main_vbox)
+
+        # Calculate grid dimensions
+        import math
+        cols = math.ceil(math.sqrt(n_pages * 1.5))
+        rows = math.ceil(n_pages / cols)
+
+        # Calculate thumbnail size
+        window_width = self.window.get_allocated_width()
+        window_height = self.window.get_allocated_height()
+        available_width = window_width - 100
+        available_height = window_height - 100
+        thumb_width = min(400, (available_width // cols) - 20)
+        thumb_height = min(300, (available_height // rows) - 60)
+
+        self.overview_tiles = []
+
+        # Create tiles for each tab
+        for idx in range(n_pages):
+            tab = self.notebook.get_nth_page(idx)
+            row = idx // cols
+            col = idx % cols
+
+            tile_box = Gtk.EventBox()
+            tile_box.set_name("overview-tile")
+            tile_box.set_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+
+            # Only connect click handler in standalone mode
+            if mode == 'standalone':
+                tile_box.connect("button-press-event", self.on_tile_clicked, idx)
+
+            tile_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            tile_vbox.set_margin_start(10)
+            tile_vbox.set_margin_end(10)
+            tile_vbox.set_margin_top(10)
+            tile_vbox.set_margin_bottom(10)
+
+            # Get tab title
+            if tab in self.tabs:
+                params = self.tabs[tab]
+                title = params.get("name", params.get("title", ""))
+            else:
+                title = ""
+
+            if not title:
+                title = f"Tab {idx + 1}"
+
+            if len(title) > 30:
+                title = title[:27] + "..."
+
+            # Create label
+            label_text = f"<b>{idx + 1}</b>: {html.escape(title)}"
+            label = Gtk.Label()
+            label.set_use_markup(True)
+            label.set_markup(label_text)
+            label.set_line_wrap(True)
+            label.set_max_width_chars(30)
+            label.set_justify(Gtk.Justification.CENTER)
+
+            # Color indicator
+            if tab in self.tabs and "group" in self.tabs[tab]:
+                grp = self.tabs[tab]["group"]
+                color_indicator = Gtk.Label()
+                color_indicator.set_markup(f'<span foreground="{self.config["col_" + str(grp)]}">\u25cf</span>')
+                tile_vbox.pack_start(color_indicator, False, False, 0)
+
+            tile_vbox.pack_start(label, False, False, 0)
+
+            # Terminal snapshot (use cache if available, keyed by terminal widget)
+            pixbuf = self.get_cached_or_capture(tab)
+            if pixbuf:
+                scaled_pixbuf = pixbuf.scale_simple(
+                    thumb_width, thumb_height,
+                    GdkPixbuf.InterpType.BILINEAR
+                )
+                image = Gtk.Image.new_from_pixbuf(scaled_pixbuf)
+                image.set_name(f"terminal-preview-{idx}")
+                tile_vbox.pack_start(image, True, True, 0)
+            else:
+                placeholder = Gtk.Label()
+                placeholder.set_markup("<i>Preview unavailable</i>")
+                placeholder.set_size_request(thumb_width, thumb_height)
+                tile_vbox.pack_start(placeholder, True, True, 0)
+
+            # Entangled indicator
+            if tab in self.entangled:
+                entangled_label = Gtk.Label()
+                entangled_label.set_markup(f'<span foreground="{self.config["tab_color_entangle"]}">*entangled*</span>')
+                tile_vbox.pack_start(entangled_label, False, False, 0)
+
+            tile_box.add(tile_vbox)
+            self.overview_box.attach(tile_box, col, row, 1, 1)
+            self.overview_tiles.append(tile_box)
+
+        # Apply CSS for background and tile styling
+        opacity = self.config.get('tab_overview_opacity', 0.85)
+
+        css = f"""
+        #overview-background {{
+            background-color: rgba(0, 0, 0, {opacity});
+        }}
+        #overview-tile {{
+            border: 2px solid #444;
+            border-radius: 5px;
+            background-color: rgba(26, 26, 26, 0.9);
+            min-width: 200px;
+            min-height: 100px;
+        }}
+        #overview-tile label {{
+            color: #ccc;
+        }}
+        #overview-tile-selected {{
+            background-color: rgba(42, 90, 90, 0.9);
+            border: 3px solid #4a9a9a;
+            border-radius: 5px;
+            min-width: 200px;
+            min-height: 100px;
+        }}
+        #overview-tile-selected label {{
+            color: #fff;
+        }}
+        """
+
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
+        )
+
+        self.overlay.add_overlay(bg_box)
+        bg_box.show_all()
+        self.overview_bg_box = bg_box
+
+        self.update_selection()
+
+    def hide(self):
+        """Hide the tab overview"""
+        if not self.active:
+            return
+
+        self.active = False
+        if self.overview_bg_box:
+            self.overlay.remove(self.overview_bg_box)
+            self.overview_bg_box = None
+        self.overview_tiles = []
+
+        # Refocus current tab in standalone mode
+        if self.mode == 'standalone':
+            current_page = self.notebook.get_current_page()
+            if current_page >= 0:
+                tab = self.notebook.get_nth_page(current_page)
+                tab.grab_focus()
+
+    def update_selection(self, new_index=None):
+        """Update visual indication of selected tile"""
+        if not self.active or not self.overview_tiles:
+            return
+
+        if new_index is not None:
+            self.selected = new_index
+
+        for idx, tile in enumerate(self.overview_tiles):
+            if idx == self.selected:
+                tile.set_name("overview-tile-selected")
+            else:
+                tile.set_name("overview-tile")
+
+    def update_tile_image(self, tab_index):
+        """Update the image of a specific tile
+
+        Args:
+            tab_index: Index of the tab to update
+        """
+        if not self.active or not self.overview_tiles:
+            return
+
+        if tab_index < 0 or tab_index >= len(self.overview_tiles):
+            return
+
+        # Get the terminal widget
+        tab = self.notebook.get_nth_page(tab_index)
+        if tab not in self.snapshot_cache:
+            return
+
+        # Find the image widget in the tile and update it
+        tile_box = self.overview_tiles[tab_index]
+        tile_vbox = tile_box.get_child()
+        if not tile_vbox:
+            return
+
+        # Find the image widget (it should be the child with the preview name)
+        for child in tile_vbox.get_children():
+            if isinstance(child, Gtk.Image):
+                # Update the image
+                pixbuf = self.snapshot_cache[tab]
+                # Calculate thumbnail size
+                n_pages = self.notebook.get_n_pages()
+                import math
+                cols = math.ceil(math.sqrt(n_pages * 1.5))
+                rows = math.ceil(n_pages / cols)
+                window_width = self.window.get_allocated_width()
+                window_height = self.window.get_allocated_height()
+                available_width = window_width - 100
+                available_height = window_height - 100
+                thumb_width = min(400, (available_width // cols) - 20)
+                thumb_height = min(300, (available_height // rows) - 60)
+
+                scaled_pixbuf = pixbuf.scale_simple(
+                    thumb_width, thumb_height,
+                    GdkPixbuf.InterpType.BILINEAR
+                )
+                child.set_from_pixbuf(scaled_pixbuf)
+                break
+
+    def handle_key(self, event):
+        """Handle keyboard navigation (standalone mode only)
+
+        Returns True if handled, False otherwise
+        """
+        if not self.active or self.mode != 'standalone':
+            return False
+
+        keyval = event.keyval
+        mods = event.state & Gtk.accelerator_get_default_mod_mask()
+        n_pages = self.notebook.get_n_pages()
+
+        import math
+        cols = math.ceil(math.sqrt(n_pages * 1.5))
+
+        # Check for close tab keybinds
+        close_key, close_mods = self.keybinds['close_tab']
+        close_key_alt, close_mods_alt = self.keybinds['close_tab_alt']
+
+        if (keyval == close_key and mods == close_mods) or \
+           (keyval == close_key_alt and mods == close_mods_alt):
+            # Close the selected tab
+            if self.selected >= 0 and self.selected < n_pages:
+                self.notebook.remove_page(self.selected)
+                # Refresh the overview
+                new_n_pages = self.notebook.get_n_pages()
+                if new_n_pages == 0:
+                    self.hide()
+                else:
+                    # Adjust selection if needed
+                    if self.selected >= new_n_pages:
+                        self.selected = new_n_pages - 1
+                    # Refresh overview
+                    self.hide()
+                    self.show(mode='standalone')
+            return True
+
+        # Check for new tab keybinds
+        new_key, new_mods = self.keybinds['new_tab']
+        new_key_alt, new_mods_alt = self.keybinds['new_tab_alt']
+
+        if (keyval == new_key and mods == new_mods) or \
+           (keyval == new_key_alt and mods == new_mods_alt):
+            # Create new tab
+            self.mypixels.new_tab()
+            # Refresh overview to show new tab
+            self.hide()
+            self.show(mode='standalone')
+            return True
+
+        if keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        elif keyval == Gdk.KEY_Return or keyval == Gdk.KEY_KP_Enter:
+            self.notebook.set_current_page(self.selected)
+            self.hide()
+            return True
+        elif keyval == Gdk.KEY_Left:
+            if mods & Gdk.ModifierType.SHIFT_MASK:
+                # Shift+Left: Move tab left
+                if self.selected > 0:
+                    tab = self.notebook.get_nth_page(self.selected)
+                    self.notebook.reorder_child(tab, self.selected - 1)
+                    self.selected -= 1
+                    # Refresh overview
+                    self.hide()
+                    self.show(mode='standalone')
+            else:
+                # Left: Navigate left
+                if self.selected > 0:
+                    self.update_selection(self.selected - 1)
+            return True
+        elif keyval == Gdk.KEY_Right:
+            if mods & Gdk.ModifierType.SHIFT_MASK:
+                # Shift+Right: Move tab right
+                if self.selected < n_pages - 1:
+                    tab = self.notebook.get_nth_page(self.selected)
+                    self.notebook.reorder_child(tab, self.selected + 1)
+                    self.selected += 1
+                    # Refresh overview
+                    self.hide()
+                    self.show(mode='standalone')
+            else:
+                # Right: Navigate right
+                if self.selected < n_pages - 1:
+                    self.update_selection(self.selected + 1)
+            return True
+        elif keyval == Gdk.KEY_Up:
+            if mods & Gdk.ModifierType.SHIFT_MASK:
+                # Shift+Up: Move tab up (towards beginning)
+                if self.selected >= cols:
+                    tab = self.notebook.get_nth_page(self.selected)
+                    new_pos = self.selected - cols
+                    self.notebook.reorder_child(tab, new_pos)
+                    self.selected = new_pos
+                    # Refresh overview
+                    self.hide()
+                    self.show(mode='standalone')
+            else:
+                # Up: Navigate up
+                if self.selected >= cols:
+                    self.update_selection(self.selected - cols)
+            return True
+        elif keyval == Gdk.KEY_Down:
+            if mods & Gdk.ModifierType.SHIFT_MASK:
+                # Shift+Down: Move tab down (towards end)
+                if self.selected + cols < n_pages:
+                    tab = self.notebook.get_nth_page(self.selected)
+                    new_pos = self.selected + cols
+                    self.notebook.reorder_child(tab, new_pos)
+                    self.selected = new_pos
+                    # Refresh overview
+                    self.hide()
+                    self.show(mode='standalone')
+            else:
+                # Down: Navigate down
+                if self.selected + cols < n_pages:
+                    self.update_selection(self.selected + cols)
+            return True
+        elif keyval == Gdk.KEY_Home:
+            self.update_selection(0)
+            return True
+        elif keyval == Gdk.KEY_End:
+            self.update_selection(n_pages - 1)
+            return True
+        elif keyval >= Gdk.KEY_1 and keyval <= Gdk.KEY_9:
+            idx = keyval - Gdk.KEY_1
+            if idx < n_pages:
+                self.notebook.set_current_page(idx)
+                self.hide()
+            return True
+        elif keyval == Gdk.KEY_0:
+            if n_pages > 9:
+                self.notebook.set_current_page(9)
+                self.hide()
+            return True
+
+        return False
+
+    def on_tile_clicked(self, widget, event, tab_index):
+        """Handle mouse click on tile (standalone mode only)"""
+        if event.button == 1 and self.mode == 'standalone':
+            self.notebook.set_current_page(tab_index)
+            self.hide()
+
 def dialog_get_text(parent, message, default=''):
     """
     Display a dialog with a text entry.
@@ -275,6 +818,16 @@ class MyPixels:
         self.load_config()
 
         self.overlay = Gtk.Overlay()
+
+        # Enable RGBA visual for transparency support in overlays
+        screen = self.window.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.window.set_visual(visual)
+
+        # Required for transparency to work
+        self.window.set_app_paintable(True)
+
         self.window.add(self.overlay)
         self.overlay.show()
 
@@ -343,6 +896,9 @@ class MyPixels:
 
         self.overlay.add_overlay(self.search_entry)
 
+        # Initialize tabs dict and entangled list before TabOverview
+        self.tabs = {}
+
         self.vbox.show()
         self.window.show()
 
@@ -358,7 +914,14 @@ class MyPixels:
         # try re-applying the configuration
         self.apply_config()
 
-        self.tabs = {}
+        # hook up wal palette monitoring
+        self.hook_wal_reloads()
+
+        # Tab overview instance (after tabs dict is created)
+        self.tab_overview = TabOverview(
+            self.window, self.overlay, self.notebook,
+            self.tabs, self.entangled, config, self
+        )
 
     def transform_keybinds(self):
         # transforms self.keymap ("function->binds") to self.keybinds
@@ -406,7 +969,9 @@ class MyPixels:
 
             'font_selector': (self.font_selector, True),
 
-            'config_reload': (self.reload_config, None)
+            'config_reload': (self.reload_config, None),
+
+            'show_tab_overview': (self.show_tab_overview, None)
         }
 
         for i in range(0, 10):
@@ -421,6 +986,10 @@ class MyPixels:
 
     def key_pressed(self, wnd, event):
         if event.type == Gdk.EventType.KEY_PRESS:
+            # If tab overview is active in standalone mode, handle navigation
+            if self.tab_overview.active and self.tab_overview.mode == 'standalone':
+                return self.tab_overview.handle_key(event)
+
             # skim through the bindings
             mods = event.state & Gtk.accelerator_get_default_mod_mask()
             keyval = Gdk.keyval_to_lower(event.keyval)
@@ -433,6 +1002,9 @@ class MyPixels:
             if (keyval == self.on_tabswitch_key):
                 self.on_tabswitch = True
                 self.update_tablist()
+                # Show overview in switcher mode when Alt is pressed (if enabled)
+                if config['tab_overview_on_alt'] and not self.tab_overview.active:
+                    self.tab_overview.show(mode='switcher')
 
         # tangled terminals? if so, propagate
         tabn = self.notebook.get_current_page()
@@ -455,6 +1027,9 @@ class MyPixels:
             if (keyval == self.on_tabswitch_key):
                 self.on_tabswitch = False
                 self.update_tablist()
+                # Hide overview when Alt is released (only if in switcher mode)
+                if self.tab_overview.active and self.tab_overview.mode == 'switcher':
+                    self.tab_overview.hide()
 
         if (tab in self.entangled):
             for term in self.entangled:
@@ -797,7 +1372,11 @@ class MyPixels:
             self.update_tablist()
 
     def tab_closed(self, notebook, tab, index):
-        del self.tabs[tab]
+        # Clean up tab data and cache
+        if tab in self.tabs:
+            del self.tabs[tab]
+        self.tab_overview.invalidate_cache(tab)
+
         if (self.notebook.get_n_pages() == 0):
             self.quit_request()
         else:
@@ -835,11 +1414,44 @@ class MyPixels:
             self.notebook.set_focus_child(oldtab)
             self.notebook.set_current_page(oldindex)
 
+        # Refresh overview if active
+        if self.tab_overview.active:
+            mode = self.tab_overview.mode
+            self.tab_overview.hide()
+            self.tab_overview.show(mode=mode)
+
     def tab_changed(self, notebook, tab, index):
         self.update_tablist()
 
+        # Update overview selection if in switcher mode
+        if self.tab_overview.active and self.tab_overview.mode == 'switcher':
+            # Update selection to highlight current tab immediately
+            self.tab_overview.update_selection(index)
+
+            # Capture snapshot with delay to allow terminal to render
+            def capture_and_update():
+                current_page = self.notebook.get_current_page()
+                if current_page >= 0 and current_page == index:  # Still on the same tab
+                    tab = self.notebook.get_nth_page(current_page)
+                    pixbuf = self.tab_overview.capture_terminal_snapshot(tab)
+                    if pixbuf:
+                        self.tab_overview.snapshot_cache[tab] = pixbuf
+                        # Update the tile image
+                        self.tab_overview.update_tile_image(index)
+                return False
+
+            GLib.timeout_add(500, capture_and_update)  # 500ms delay for terminal rendering
+        else:
+            # Normal update with delay when not in switcher mode
+            GLib.timeout_add(50, lambda: self.tab_overview.update_snapshot_cache(force=True))
+
     def tab_reordered(self, notebook, tab, index):
         self.update_tablist()
+        # Refresh overview if active in switcher mode
+        if self.tab_overview.active and self.tab_overview.mode == 'switcher':
+            # Hide and re-show to refresh the grid layout
+            self.tab_overview.hide()
+            self.tab_overview.show(mode='switcher')
 
     def switch_group(self, skip):
         tabn = self.notebook.get_current_page()
@@ -921,6 +1533,10 @@ class MyPixels:
         regex = GLib.Regex(text, 0, 0)
         tab.search_set_gregex(regex, 0)
 
+    def show_tab_overview(self, param=None):
+        """Show tab overview - delegates to TabOverview class"""
+        self.tab_overview.show(mode='standalone')
+
     def run(self):
         # first initial tab
         self.command = None
@@ -981,9 +1597,15 @@ class MyPixels:
         bg_color = Gdk.RGBA()
         bg_color.parse(config['bg_tint_color'])
         bg_color.alpha=1.0-config['term_opacity']
-        tab.set_color_background(bg_color)
+
         if self.palette:
-            tab.set_colors(self.fg_color, self.bg_color, self.palette)
+            # Apply the same alpha to the palette background color
+            transparent_bg = self.bg_color.copy()
+            transparent_bg.alpha = 1.0-config['term_opacity']
+            tab.set_colors(self.fg_color, transparent_bg, self.palette)
+        else:
+            # No palette, just set foreground and background with transparency
+            tab.set_colors(self.fg_color, bg_color, [])
 
     def apply_config(self):
         # higlights tab nums on press
