@@ -119,6 +119,7 @@ config = {
 
         'close_tab': ('CONTROL+ALT+x', 'CONTROL+ALT+q'),
         'new_tab': ('CONTROL+ALT+z', 'CONTROL+SHIFT+t'),
+        'new_window': 'CONTROL+SHIFT+n',
 
         'shrink_font': 'MOD1+SHIFT+KP_Subtract',
         'enlarge_font': 'MOD1+SHIFT+KP_Add',
@@ -1182,15 +1183,23 @@ class TabList:
         if event.button == 1 and self.on_add_tab_cb:
             self.on_add_tab_cb()
 
-class MyPixels:
-    def __init__(self):
+class MypixelsWindow:
+    def __init__(self, app):
+        """Initialize a new window
+
+        Args:
+            app: MypixelsApplication instance that owns this window
+        """
+        self.app = app
+        self.config = app.config  # Reference to shared config
+
         # command to run in new tabs (set by Application)
         self.command = None
 
-        # counter used for tab id's
-        self.counter = counter()
+        # counter used for tab id's - use app's global counter
+        self.counter = app.tab_counter
 
-        # entangled terms for multi term keyboard events
+        # entangled terms for multi term keyboard events (window-specific)
         self.entangled = []
 
         # create a window to hold the thing
@@ -1248,14 +1257,14 @@ class MyPixels:
         # Create TabList instance
         self.tab_list = TabList(
             self.notebook, self.tabs, self.entangled,
-            config, lambda: self.on_tabswitch
+            self.config, lambda: self.on_tabswitch
         )
         self.tab_list.set_callbacks(self.goto_tab, self.new_tab)
 
         vbox.pack_start(self.notebook, True, True, 0)
         vbox.pack_start(self.tab_list.get_widget(), False, False, 0)
 
-        if config["tablist_top"]:
+        if self.config["tablist_top"]:
             vbox.reorder_child(self.tab_list.get_widget(), 0)
             vbox.reorder_child(self.notebook, 1)
         else:
@@ -1269,8 +1278,8 @@ class MyPixels:
         self.window.connect("configure-event", self.resize_request)
 
         # window fixup before we create tab
-        if not config["default_maximize"]:
-            self.window.resize(config["default_width"], config["default_height"])
+        if not self.config["default_maximize"]:
+            self.window.resize(self.config["default_width"], self.config["default_height"])
 
         # searchbox, if it updates, we update the vtk search
         self.search_entry = Gtk.Entry()
@@ -1290,13 +1299,13 @@ class MyPixels:
         self.window.show()
 
         # Maximize after showing the window (GTK requirement)
-        if config["default_maximize"]:
+        if self.config["default_maximize"]:
             self.window.maximize()
 
 
         self.notebook.grab_focus()
 
-        self.forcedHideTabs = config['tablist_hide']
+        self.forcedHideTabs = self.config['tablist_hide']
 
         # try re-applying the configuration
         self.apply_config()
@@ -1307,7 +1316,7 @@ class MyPixels:
         # Tab overview instance (after tabs dict is created)
         self.tab_overview = TabOverview(
             self.window, self.overlay, self.notebook,
-            self.tabs, self.entangled, config, self
+            self.tabs, self.entangled, self.config, self
         )
 
     def transform_keybinds(self):
@@ -1358,7 +1367,9 @@ class MyPixels:
 
             'config_reload': (self.reload_config, None),
 
-            'show_tab_overview': (self.show_tab_overview, None)
+            'show_tab_overview': (self.show_tab_overview, None),
+
+            'new_window': (self.new_window, None)
         }
 
         for i in range(0, 10):
@@ -1367,7 +1378,7 @@ class MyPixels:
     def write_config(self):
         config_path = Path.home() / '.mypixels'
         with open(config_path, 'w') as f:
-            yaml.dump(config, f, default_flow_style=False)
+            yaml.dump(self.config, f, default_flow_style=False)
 
     def resize_request(self, wnd, event):
         self.update_tablist()
@@ -1391,7 +1402,7 @@ class MyPixels:
                 self.on_tabswitch = True
                 self.update_tablist()
                 # Show overview in switcher mode when Alt is pressed (if enabled)
-                if config['tab_overview_on_alt'] and not self.tab_overview.active:
+                if self.config['tab_overview_on_alt'] and not self.tab_overview.active:
                     self.tab_overview.show(mode='switcher')
 
         # tangled terminals? if so, propagate
@@ -1466,8 +1477,8 @@ class MyPixels:
 #        tab.connect("key-press-event", self.key_pressed)
 #        tab.connect("key-release-event", self.key_released)
 
-        tab.set_font(Pango.FontDescription(config["term_font"]))
-        tab.set_scrollback_lines(config['scrollback_lines'])
+        tab.set_font(Pango.FontDescription(self.config["term_font"]))
+        tab.set_scrollback_lines(self.config['scrollback_lines'])
         tab.search_set_wrap_around(True)
 
         tab.set_word_char_exceptions("-A-Za-z0-9,./?%&#:_~")
@@ -1510,12 +1521,16 @@ class MyPixels:
         self.notebook.set_tab_reorderable(tab, True)
 
         if not title:
-            title = config["default_tab_title"]
+            title = self.config["default_tab_title"]
 
         self.tabs[tab] = {"title": title, "id": tid}
         self.update_tablist()
 
         tab.grab_focus()
+
+    def new_window(self, param=None):
+        """Create a new window"""
+        self.app.new_window()
 
     def update_tablist(self):
         """Update the tab list display"""
@@ -1652,7 +1667,7 @@ class MyPixels:
         self.update_tablist()
 
     def tab_opened(self, notebook, tab, index):
-        if config["focus_new_tabs"]:
+        if self.config["focus_new_tabs"]:
             self.notebook.set_focus_child(tab)
             self.notebook.set_current_page(index)
         else:
@@ -1745,14 +1760,14 @@ class MyPixels:
 
     def font_selector(self, param=None):
         font_chooser = Gtk.FontSelectionDialog("Terminal font", self.window)
-        font_chooser.set_font_name(config["term_font"])
+        font_chooser.set_font_name(self.config["term_font"])
         res = font_chooser.run()
 
         if res == Gtk.ResponseType.OK:
             fname = font_chooser.get_font_name()
             font_desc = Pango.FontDescription(fname)
             if font_desc:
-                config["term_font"] = fname
+                self.config["term_font"] = fname
                 for tab in self.tabs:
                     tab.set_font(font_desc)
 
@@ -1816,12 +1831,17 @@ class MyPixels:
                 return True # cancel the quit
 
         # Cleanup and quit
-        # Use the application instance if available, otherwise fall back to Gtk.main_quit
-        app = self.window.get_application()
-        if app:
-            app.quit()
+        # Remove this window from the application
+        self.app.remove_window(self)
+
+        # If this was the last window, quit the application
+        if len(self.app.windows) == 0:
+            self.app.quit()
         else:
-            Gtk.main_quit()
+            # Just close this window
+            self.window.destroy()
+
+        return True  # Prevent default close handler
 
     def load_config(self):
         config_path = Path.home() / ".mypixels"
@@ -1836,20 +1856,20 @@ class MyPixels:
                 myconfig = yaml.load(f, Loader=yaml.FullLoader)
 
             try:
-                for k in config.keys():
+                for k in self.config.keys():
                     # if this is a keymap, descend
                     if k == "bindings":
                         if "bindings" in myconfig:
                             for fn, b in myconfig['bindings'].items():
-                                config[k][fn] = b
+                                self.config[k][fn] = b
                     else:
                         if k in myconfig:
-                            config[k] = myconfig[k]
+                            self.config[k] = myconfig[k]
             except Exception as e:
                 print(f"Config parse error: {e}")
 
             # Validate configuration
-            validation_warnings = validate_config(config)
+            validation_warnings = validate_config(self.config)
             if validation_warnings:
                 print("Configuration validation warnings:")
                 for warning in validation_warnings:
@@ -1864,13 +1884,13 @@ class MyPixels:
 
     def apply_tab_colors(self, tab):
         bg_color = Gdk.RGBA()
-        bg_color.parse(config['bg_tint_color'])
-        bg_color.alpha=1.0-config['term_opacity']
+        bg_color.parse(self.config['bg_tint_color'])
+        bg_color.alpha=1.0-self.config['term_opacity']
 
         if self.palette:
             # Apply the same alpha to the palette background color
             transparent_bg = self.bg_color.copy()
-            transparent_bg.alpha = 1.0-config['term_opacity']
+            transparent_bg.alpha = 1.0-self.config['term_opacity']
             tab.set_colors(self.fg_color, transparent_bg, self.palette)
         else:
             # No palette, just set foreground and background with transparency
@@ -1878,16 +1898,16 @@ class MyPixels:
 
     def apply_config(self):
         # higlights tab nums on press
-        self.on_tabswitch_key = key_press_parse(config["tab_highlight_mod"])[1]
+        self.on_tabswitch_key = key_press_parse(self.config["tab_highlight_mod"])[1]
 
         # parse the config key bindings
         self.set_funcmap()
-        self.keymap = config['bindings']
+        self.keymap = self.config['bindings']
         self.transform_keybinds()
 
         # convert the call config vars to callables
-        if 'palette' in config:
-            colors = config['palette'].split(':')
+        if 'palette' in self.config:
+            colors = self.config['palette'].split(':')
             self.palette = []
             for color in colors:
                 if color:
@@ -1895,15 +1915,15 @@ class MyPixels:
         else:
             self.palette = None
 
-        self.fg_color = parse_rgba(config['foreground_color'])
-        self.bg_color = parse_rgba(config['background_color'])
+        self.fg_color = parse_rgba(self.config['foreground_color'])
+        self.bg_color = parse_rgba(self.config['background_color'])
 
         
 
-        fontdesc = Pango.FontDescription(config["tablist_font"])
+        fontdesc = Pango.FontDescription(self.config["tablist_font"])
         font_size_in_pt = fontdesc.get_size() / Pango.SCALE
 
-        bgcolor = config['tablist_background']
+        bgcolor = self.config['tablist_background']
         # TODO: self.tab_list.get_widget().modify_bg(Gtk.STATE_NORMAL, bgcolor)
 
         css = f"""
@@ -1924,7 +1944,7 @@ class MyPixels:
             margin-right: 1px;
         }}
         #tabbar #add-tab-button .tab-label {{ /* Style for the text within the add tab button */
-            color: {config['add_button_color']};
+            color: {self.config['add_button_color']};
         }}
         """
 
@@ -1936,7 +1956,7 @@ class MyPixels:
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-        if config["tablist_top"]:
+        if self.config["tablist_top"]:
             self.vbox.reorder_child(self.tab_list.get_widget(), 0)
             self.vbox.reorder_child(self.notebook, 1)
         else:
@@ -1944,10 +1964,10 @@ class MyPixels:
             self.vbox.reorder_child(self.tab_list.get_widget(), 2)
 
         # window fixup before we create tab
-        if config["default_maximize"]:
+        if self.config["default_maximize"]:
             self.window.maximize()
         else:
-            self.window.resize(config["default_width"], config["default_height"])
+            self.window.resize(self.config["default_width"], self.config["default_height"])
 
 
         # iterate all tabs in our list and re-apply the background
@@ -1970,7 +1990,7 @@ class MyPixels:
            self.apply_config()
 
     def hook_wal_reloads(self):
-        wal_path = Path(config['wal_palette']).expanduser()
+        wal_path = Path(self.config['wal_palette']).expanduser()
         self.wal_file = Gio.File.new_for_path(str(wal_path))
         print(f"Will monitor {self.wal_file.get_uri()}")
         self.monitor = self.wal_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
@@ -1978,11 +1998,11 @@ class MyPixels:
 
     def load_wal_palette(self):
         # if specified in config file, we try to load the yml version of wal palette
-        if ('wal_palette' not in config) or config['wal_palette'] == '':
+        if ('wal_palette' not in self.config) or self.config['wal_palette'] == '':
             print("No wal_palette specified in config. Skipping")
             return
 
-        wal_path = Path(config['wal_palette']).expanduser()
+        wal_path = Path(self.config['wal_palette']).expanduser()
 
         try:
             if not wal_path.exists():
@@ -2004,24 +2024,24 @@ class MyPixels:
                 # that's all there's to it, really. Now we apply those
                 tab_bg = brighten(bgcol, 1.5)
 
-                config['background_color']   = bgcol
-                config['bg_tint_color']      = bgcol
-                config['foreground_color']   = fgcol
+                self.config['background_color']   = bgcol
+                self.config['bg_tint_color']      = bgcol
+                self.config['foreground_color']   = fgcol
 
-                config['tablist_background'] = tab_bg
-                config['tab_color_bg'] = tab_bg
-                config['tab_color_bg_selected'] = brighten(tab_bg, 1.5)
-                config['tab_color_fg'] = fgcol
-                config['tab_color_fg_selected'] = curcol
+                self.config['tablist_background'] = tab_bg
+                self.config['tab_color_bg'] = tab_bg
+                self.config['tab_color_bg_selected'] = brighten(tab_bg, 1.5)
+                self.config['tab_color_fg'] = fgcol
+                self.config['tab_color_fg_selected'] = curcol
 
-                config['tab_color_entangle'] = colors[1]
-                config['tab_color_idx'] = colors[2]
+                self.config['tab_color_entangle'] = colors[1]
+                self.config['tab_color_idx'] = colors[2]
 
                 for n in range(0,8):
-                      config['col_' + str(n)] = colors[n]
+                      self.config['col_' + str(n)] = colors[n]
 
                 # and at last, the palette
-                config['palette'] = ':'.join(colors)
+                self.config['palette'] = ':'.join(colors)
 
                 print("Loaded wal colors")
         except Exception as e:
@@ -2032,8 +2052,7 @@ class MyPixels:
 class MypixelsApplication(Gtk.Application):
     """Application-level manager for mypixels
 
-    Handles single-instance detection via D-Bus and manages the main loop.
-    Future: Will manage multiple windows and shared config.
+    Manages multiple windows, shared configuration, and D-Bus single-instance detection.
     """
 
     def __init__(self):
@@ -2041,26 +2060,44 @@ class MypixelsApplication(Gtk.Application):
             application_id="com.github.volca.mypixels",
             flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
         )
-        self.window = None
+        self.windows = []  # List of MypixelsWindow instances
         self.command_args = None
+        self.config = config  # Shared config across all windows
+        self.tab_counter = counter()  # Global tab ID generator
 
     def do_activate(self):
         """Called when application is activated (first launch or by remote instance)"""
-        if self.window is None:
-            # First activation - create the main window
-            self.window = MyPixels()
-            self.add_window(self.window.window)
+        # Always create a new window
+        self.new_window(self.command_args)
 
-            # Run with command args if provided
-            if self.command_args:
-                self.window.command = self.command_args
+    def new_window(self, command=None):
+        """Create a new window
 
-            # Create first tab
-            self.window.new_tab()
-        else:
-            # Application already running - could add new window here in Phase 2
-            # For now, just bring existing window to front
-            self.window.window.present()
+        Args:
+            command: Optional command to run in new tabs
+        """
+        window = MypixelsWindow(self)
+        self.windows.append(window)
+        self.add_window(window.window)
+
+        # Set command if provided
+        if command:
+            window.command = command
+
+        # Create first tab
+        window.new_tab()
+
+        # Show window
+        window.window.present()
+
+    def remove_window(self, window):
+        """Remove a window from the application
+
+        Args:
+            window: MypixelsWindow instance to remove
+        """
+        if window in self.windows:
+            self.windows.remove(window)
 
     def do_command_line(self, command_line):
         """Called when mypixels is run again while already running"""
