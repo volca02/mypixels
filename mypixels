@@ -254,6 +254,9 @@ class TabOverview:
         self.snapshot_cache = {}
         self.cache_timestamp = 0
 
+        # Timer for periodic updates in switcher mode
+        self.update_timer_id = None
+
         # Key bindings for standalone mode
         self.setup_keybinds()
 
@@ -336,6 +339,27 @@ class TabOverview:
             self.snapshot_cache.clear()
         elif terminal in self.snapshot_cache:
             del self.snapshot_cache[terminal]
+
+    def periodic_update_callback(self):
+        """Periodic callback to update active tab preview in switcher mode
+
+        Returns:
+            True to continue the timer, False to stop
+        """
+        if not self.active or self.mode != 'switcher':
+            self.update_timer_id = None
+            return False
+
+        # Capture and update the current tab
+        current_page = self.notebook.get_current_page()
+        if current_page >= 0:
+            tab = self.notebook.get_nth_page(current_page)
+            pixbuf = self.capture_terminal_snapshot(tab)
+            if pixbuf:
+                self.snapshot_cache[tab] = pixbuf
+                self.update_tile_image(current_page)
+
+        return True  # Continue the timer
 
     def show(self, mode='standalone'):
         """Show tab overview
@@ -542,12 +566,23 @@ class TabOverview:
 
         self.update_selection()
 
+        # Start periodic updates in switcher mode
+        if mode == 'switcher':
+            # Update every 1000ms (1 second)
+            self.update_timer_id = GLib.timeout_add(1000, self.periodic_update_callback)
+
     def hide(self):
         """Hide the tab overview"""
         if not self.active:
             return
 
         self.active = False
+
+        # Cancel periodic update timer if running
+        if self.update_timer_id is not None:
+            GLib.source_remove(self.update_timer_id)
+            self.update_timer_id = None
+
         if self.overview_bg_box:
             self.overlay.remove(self.overview_bg_box)
             self.overview_bg_box = None
