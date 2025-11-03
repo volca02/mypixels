@@ -1184,6 +1184,9 @@ class TabList:
 
 class MyPixels:
     def __init__(self):
+        # command to run in new tabs (set by Application)
+        self.command = None
+
         # counter used for tab id's
         self.counter = counter()
 
@@ -1786,13 +1789,13 @@ class MyPixels:
         self.tab_overview.show(mode='standalone')
 
     def run(self):
-        # first initial tab
+        """Deprecated - kept for backward compatibility
+
+        The main loop is now handled by MypixelsApplication.
+        This method is only called from old code paths.
+        """
+        # Command args now handled by Application
         self.command = None
-
-        # is there any command on the cmdline?
-        if (len(sys.argv) > 1):
-                self.command=sys.argv[1:]
-
         self.new_tab()
         Gtk.main()
 
@@ -1812,8 +1815,13 @@ class MyPixels:
             if rv != Gtk.ResponseType.YES:
                 return True # cancel the quit
 
-        # TODO: Cleanup
-        Gtk.main_quit()
+        # Cleanup and quit
+        # Use the application instance if available, otherwise fall back to Gtk.main_quit
+        app = self.window.get_application()
+        if app:
+            app.quit()
+        else:
+            Gtk.main_quit()
 
     def load_config(self):
         config_path = Path.home() / ".mypixels"
@@ -2021,6 +2029,60 @@ class MyPixels:
             traceback.print_exception(*exc_info)
             print("Cannot load/apply wal colors: %s!" % repr(e))
 
+class MypixelsApplication(Gtk.Application):
+    """Application-level manager for mypixels
+
+    Handles single-instance detection via D-Bus and manages the main loop.
+    Future: Will manage multiple windows and shared config.
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="com.github.volca.mypixels",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+        )
+        self.window = None
+        self.command_args = None
+
+    def do_activate(self):
+        """Called when application is activated (first launch or by remote instance)"""
+        if self.window is None:
+            # First activation - create the main window
+            self.window = MyPixels()
+            self.add_window(self.window.window)
+
+            # Run with command args if provided
+            if self.command_args:
+                self.window.command = self.command_args
+
+            # Create first tab
+            self.window.new_tab()
+        else:
+            # Application already running - could add new window here in Phase 2
+            # For now, just bring existing window to front
+            self.window.window.present()
+
+    def do_command_line(self, command_line):
+        """Called when mypixels is run again while already running"""
+        # Get command line arguments
+        argv = command_line.get_arguments()
+
+        # Store args for new window (skip program name)
+        if len(argv) > 1:
+            self.command_args = argv[1:]
+        else:
+            self.command_args = None
+
+        # Activate (will create window or bring to front)
+        self.activate()
+
+        return 0  # Return 0 for success
+
+def main():
+    """Main entry point for mypixels"""
+    app = MypixelsApplication()
+    exit_status = app.run(sys.argv)
+    sys.exit(exit_status)
+
 if __name__ == '__main__':
-    term = MyPixels()
-    term.run()
+    main()
