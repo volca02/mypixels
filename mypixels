@@ -1011,6 +1011,8 @@ class TabList:
         self.ebox = Gtk.EventBox()
         self.ebox.set_name("tabbar")
         self.ebox.add(self.container)
+        self.ebox.show()  # Show the tab bar widget
+        self.container.show()
 
         # Callbacks
         self.on_tab_clicked_cb = None
