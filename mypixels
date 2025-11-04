@@ -143,6 +143,7 @@ config = {
         'config_reload': 'CONTROL+SHIFT+r',
 
         'show_tab_overview': 'MOD1+o',
+        'send_tab_to_window': 'MOD1+SHIFT+w',
 
         'goto_tab_0': 'MOD1+_1',
         'goto_tab_1': 'MOD1+_2',
@@ -1369,7 +1370,8 @@ class MypixelsWindow:
 
             'show_tab_overview': (self.show_tab_overview, None),
 
-            'new_window': (self.new_window, None)
+            'new_window': (self.new_window, None),
+            'send_tab_to_window': (self.send_tab_to_window, None)
         }
 
         for i in range(0, 10):
@@ -1467,15 +1469,26 @@ class MypixelsWindow:
             tab.set_font(pangodesc)
 
 
-    def new_tab(self, command=None, tnext=False, title="", cmd=None):
-        # new tab instance
-        tab = Vte.Terminal()
+    def _connect_tab_signals(self, tab):
+        """Connect signal handlers to a terminal tab"""
         tab.connect("child-exited", self.child_exited)
         tab.connect("eof", self.child_eof)
         tab.connect("window-title-changed", self.window_title_changed)
         tab.connect("scroll-event", self.on_scroll)
 #        tab.connect("key-press-event", self.key_pressed)
 #        tab.connect("key-release-event", self.key_released)
+
+    def _disconnect_tab_signals(self, tab):
+        """Disconnect all signal handlers from a terminal tab"""
+        tab.disconnect_by_func(self.child_exited)
+        tab.disconnect_by_func(self.child_eof)
+        tab.disconnect_by_func(self.window_title_changed)
+        tab.disconnect_by_func(self.on_scroll)
+
+    def new_tab(self, command=None, tnext=False, title="", cmd=None):
+        # new tab instance
+        tab = Vte.Terminal()
+        self._connect_tab_signals(tab)
 
         tab.set_font(Pango.FontDescription(self.config["term_font"]))
         tab.set_scrollback_lines(self.config['scrollback_lines'])
@@ -1531,6 +1544,279 @@ class MypixelsWindow:
     def new_window(self, param=None):
         """Create a new window"""
         self.app.new_window()
+
+    def send_tab_to_window(self, param=None):
+        """Show window picker and move current tab to selected window"""
+        # Hide tab overview if active to avoid key state issues
+        if hasattr(self, 'tab_overview') and self.tab_overview.active:
+            self.tab_overview.hide()
+
+        # Get current tab
+        current_page = self.notebook.get_current_page()
+        if current_page < 0:
+            return
+
+        # Show window picker dialog
+        dialog = Gtk.Dialog(
+            title="Send Tab to Window",
+            transient_for=self.window,
+            modal=True,
+            destroy_with_parent=True
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            "New Window", Gtk.ResponseType.APPLY,
+            Gtk.STOCK_OK, Gtk.ResponseType.OK
+        )
+        dialog.set_default_size(600, 400)
+
+        content_area = dialog.get_content_area()
+        content_area.set_border_width(10)
+
+        label = Gtk.Label(label="Select destination window:")
+        label.set_halign(Gtk.Align.START)
+        content_area.pack_start(label, False, False, 5)
+
+        # Scrolled window for window list
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_height(300)
+        content_area.pack_start(scrolled, True, True, 5)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        scrolled.add(vbox)
+
+        # Create radio buttons for each window with tab previews
+        # Build list of windows excluding current one
+        other_windows = [w for w in self.app.windows if w != self]
+
+        if len(other_windows) == 0:
+            # No other windows available, just show new window option
+            dialog.destroy()
+            target_window = self.app.new_window()
+            # Remove the default first tab that was created
+            if target_window.notebook.get_n_pages() > 0:
+                target_window.notebook.remove_page(0)
+            self.move_tab_to_window(current_page, target_window)
+            return
+
+        radio_group = None
+        self.selected_window = None
+
+        for window in other_windows:
+            # Window container
+            window_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+
+            # Get window info
+            desktop, pos_x, pos_y, win_title = self._get_window_info(window.window)
+
+            # Build window label with info
+            window_num = self.app.windows.index(window) + 1
+            window_label = f"Window {window_num} ({window.notebook.get_n_pages()} tabs)"
+            if desktop is not None:
+                window_label += f" - Desktop {desktop + 1}"
+            if pos_x is not None and pos_y is not None:
+                window_label += f" @ ({pos_x}, {pos_y})"
+
+            radio = Gtk.RadioButton.new_with_label_from_widget(radio_group, window_label)
+            if radio_group is None:
+                radio_group = radio
+                radio.set_active(True)
+                self.selected_window = window  # Set default selection
+
+            radio.connect("toggled", self._on_window_radio_toggled, window)
+            window_box.pack_start(radio, False, False, 0)
+
+            # Window title as subtitle
+            if win_title and win_title != "mypixels":
+                title_label = Gtk.Label()
+                title_label.set_markup(f"<i>{html.escape(win_title)}</i>")
+                title_label.set_halign(Gtk.Align.START)
+                title_label.set_margin_start(30)
+                window_box.pack_start(title_label, False, False, 0)
+
+            # Tab preview container (show first 4 tabs)
+            preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+            preview_box.set_margin_start(30)  # Indent under radio button
+
+            max_previews = 4
+            for tab_idx in range(min(max_previews, window.notebook.get_n_pages())):
+                tab = window.notebook.get_nth_page(tab_idx)
+
+                # Create small preview
+                tab_preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+
+                # Tab title
+                if tab in window.tabs:
+                    tab_title = window.tabs[tab].get('name', window.tabs[tab].get('title', ''))
+                    if not tab_title:
+                        tab_title = f"Tab {tab_idx + 1}"
+                else:
+                    tab_title = f"Tab {tab_idx + 1}"
+
+                if len(tab_title) > 15:
+                    tab_title = tab_title[:12] + "..."
+
+                title_label = Gtk.Label(label=tab_title)
+                title_label.set_ellipsize(Pango.EllipsizeMode.END)
+                title_label.set_max_width_chars(15)
+                tab_preview.pack_start(title_label, False, False, 0)
+
+                # Small thumbnail (80x60)
+                pixbuf = self._capture_tab_snapshot(tab)
+                if pixbuf:
+                    scaled = pixbuf.scale_simple(80, 60, GdkPixbuf.InterpType.BILINEAR)
+                    image = Gtk.Image.new_from_pixbuf(scaled)
+                else:
+                    # Placeholder
+                    placeholder = Gtk.Label(label="[preview]")
+                    placeholder.set_size_request(80, 60)
+                    image = placeholder
+
+                tab_preview.pack_start(image, False, False, 0)
+                preview_box.pack_start(tab_preview, False, False, 0)
+
+            # Show "..." if more tabs exist
+            if window.notebook.get_n_pages() > max_previews:
+                more_label = Gtk.Label(label=f"...+{window.notebook.get_n_pages() - max_previews} more")
+                more_label.set_margin_top(25)
+                preview_box.pack_start(more_label, False, False, 0)
+
+            window_box.pack_start(preview_box, False, False, 0)
+
+            # Separator
+            separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            window_box.pack_start(separator, False, False, 5)
+
+            vbox.pack_start(window_box, False, False, 0)
+
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.OK:
+            # Move to selected window
+            if self.selected_window and self.selected_window != self:
+                self.move_tab_to_window(current_page, self.selected_window)
+        elif response == Gtk.ResponseType.APPLY:
+            # Create new window and move tab there
+            target_window = self.app.new_window()
+            # Remove the default first tab
+            if target_window.notebook.get_n_pages() > 0:
+                target_window.notebook.remove_page(0)
+            self.move_tab_to_window(current_page, target_window)
+
+    def _capture_tab_snapshot(self, terminal):
+        """Capture a snapshot of a terminal widget
+
+        Args:
+            terminal: VTE terminal widget
+
+        Returns:
+            GdkPixbuf or None
+        """
+        alloc = terminal.get_allocation()
+        width = alloc.width
+        height = alloc.height
+
+        if width <= 0 or height <= 0:
+            return None
+
+        try:
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+            context = cairo.Context(surface)
+            terminal.draw(context)
+            pixbuf = Gdk.pixbuf_get_from_surface(surface, 0, 0, width, height)
+            return pixbuf
+        except:
+            return None
+
+    def _get_window_info(self, gtk_window):
+        """Get display information about a GTK window
+
+        Args:
+            gtk_window: Gtk.Window instance
+
+        Returns:
+            tuple of (desktop_number, position_x, position_y, window_title)
+        """
+        gdk_window = gtk_window.get_window()
+        if not gdk_window:
+            return (None, None, None, gtk_window.get_title())
+
+        # Get desktop/workspace (X11 specific)
+        desktop = None
+        try:
+            display = gdk_window.get_display()
+            if hasattr(gdk_window, 'get_desktop'):
+                desktop = gdk_window.get_desktop()
+        except:
+            pass
+
+        # Get position
+        pos_x, pos_y = gtk_window.get_position()
+
+        return (desktop, pos_x, pos_y, gtk_window.get_title())
+
+    def _on_window_radio_toggled(self, button, window):
+        """Handle window radio button toggle"""
+        if button.get_active():
+            self.selected_window = window
+
+    def move_tab_to_window(self, tab_index, target_window):
+        """Move a tab from this window to another window
+
+        Args:
+            tab_index: Index of tab to move
+            target_window: MypixelsWindow instance to move tab to
+        """
+        # Get terminal and metadata
+        terminal = self.notebook.get_nth_page(tab_index)
+        if not terminal:
+            return
+
+        tab_data = self.tabs[terminal].copy()
+
+        # Remove from entangled list if present (untangle on move)
+        if terminal in self.entangled:
+            self.entangled.remove(terminal)
+
+        # Disconnect signal handlers from source window
+        self._disconnect_tab_signals(terminal)
+
+        # Remove from source tabs dict BEFORE removing from notebook
+        # (widget identity may change after removal)
+        del self.tabs[terminal]
+
+        # Reparent the widget by removing from source and adding to target
+        self.notebook.remove(terminal)
+
+        # Add to target window
+        page_num = target_window.notebook.append_page(terminal, None)
+        target_window.notebook.set_tab_reorderable(terminal, True)
+        target_window.tabs[terminal] = tab_data
+
+        # Reconnect signal handlers to target window
+        target_window._connect_tab_signals(terminal)
+
+        # Check if source window will be empty
+        source_window_empty = self.notebook.get_n_pages() == 0
+
+        # Update target window tab list
+        target_window.update_tablist()
+
+        # Update source window tab list only if it still has tabs
+        if not source_window_empty:
+            self.update_tablist()
+
+        # Focus target window and new tab
+        target_window.window.present()
+        target_window.notebook.set_current_page(page_num)
+
+        # Close source window if no tabs left
+        if source_window_empty:
+            self.app.remove_window(self)
+            self.window.destroy()
 
     def update_tablist(self):
         """Update the tab list display"""
@@ -2098,6 +2384,8 @@ class MypixelsApplication(Gtk.Application):
         """
         if window in self.windows:
             self.windows.remove(window)
+            # Also remove from GTK application
+            super().remove_window(window.window)
 
     def do_command_line(self, command_line):
         """Called when mypixels is run again while already running"""
