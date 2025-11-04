@@ -145,6 +145,25 @@ config = {
         'show_tab_overview': 'MOD1+o',
         'send_tab_to_window': 'MOD1+SHIFT+w',
 
+        # Tab Overview/Switcher navigation
+        'overview_exit': 'Escape',
+        'overview_select': 'Return',
+        'overview_new_tab': 'MOD1+Return',
+        'overview_nav_left': 'Left',
+        'overview_nav_right': 'Right',
+        'overview_nav_up': 'Up',
+        'overview_nav_down': 'Down',
+        'overview_move_left': 'SHIFT+Left',
+        'overview_move_right': 'SHIFT+Right',
+        'overview_move_up': 'SHIFT+Up',
+        'overview_move_down': 'SHIFT+Down',
+        'overview_first': 'Home',
+        'overview_last': 'End',
+
+        # Full Tab Overview specific
+        'overview_new_window': 'CONTROL+n',
+        'overview_move_tab': 'CONTROL+m',
+
         'goto_tab_0': 'MOD1+_1',
         'goto_tab_1': 'MOD1+_2',
         'goto_tab_2': 'MOD1+_3',
@@ -330,6 +349,8 @@ class TabOverview:
         self.entangled = entangled_list
         self.config = config
         self.mypixels = mypixels_instance
+        # Get application instance for multi-window support
+        self.app = mypixels_instance.app
 
         self.active = False
         self.selected = 0
@@ -350,13 +371,108 @@ class TabOverview:
         self.setup_keybinds()
 
     def setup_keybinds(self):
-        """Setup key bindings for standalone mode"""
-        self.keybinds = {
-            'close_tab': (Gdk.KEY_x, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK),
-            'close_tab_alt': (Gdk.KEY_q, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK),
-            'new_tab': (Gdk.KEY_z, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK),
-            'new_tab_alt': (Gdk.KEY_t, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK),
-        }
+        """Setup key bindings for standalone mode - parse from config"""
+        # Get the parent MypixelsWindow's parsed keybindings
+        # We'll look them up by action name during key handling
+        self.keybinds = {}
+
+        # Parse overview-specific bindings from config
+        bindings = self.config.get('bindings', {})
+        for action, binding in bindings.items():
+            if action.startswith('overview_') or action in ['close_tab', 'new_tab']:
+                # Parse the binding string
+                parsed = self._parse_keybind(binding)
+                if parsed:
+                    self.keybinds[action] = parsed
+
+    def _parse_keybind(self, binding_str):
+        """Parse a keybinding string like 'MOD1+Return' into (keyval, modmask)
+
+        Args:
+            binding_str: String or tuple of strings like 'MOD1+Return' or ('CONTROL+x', 'CONTROL+q')
+
+        Returns:
+            Tuple of (keyval, modmask) or list of tuples if multiple bindings
+        """
+        if isinstance(binding_str, (list, tuple)):
+            # Multiple bindings - return list
+            return [self._parse_single_keybind(b) for b in binding_str if self._parse_single_keybind(b)]
+        else:
+            return self._parse_single_keybind(binding_str)
+
+    def _parse_single_keybind(self, binding_str):
+        """Parse a single keybinding string
+
+        Args:
+            binding_str: String like 'MOD1+Return' or 'SHIFT+Left'
+
+        Returns:
+            Tuple of (keyval, modmask) or None if invalid
+        """
+        if not binding_str:
+            return None
+
+        parts = binding_str.split('+')
+        if not parts:
+            return None
+
+        # Last part is the key
+        key_name = parts[-1]
+
+        # Build modifier mask
+        modmask = 0
+        for mod in parts[:-1]:
+            mod_upper = mod.upper()
+            if mod_upper == 'MOD1' or mod_upper == 'ALT':
+                modmask |= Gdk.ModifierType.MOD1_MASK
+            elif mod_upper == 'CONTROL' or mod_upper == 'CTRL':
+                modmask |= Gdk.ModifierType.CONTROL_MASK
+            elif mod_upper == 'SHIFT':
+                modmask |= Gdk.ModifierType.SHIFT_MASK
+            elif mod_upper == 'MOD4' or mod_upper == 'SUPER':
+                modmask |= Gdk.ModifierType.MOD4_MASK
+
+        # Get keyval from key name
+        keyval = getattr(Gdk, f'KEY_{key_name}', None)
+        if keyval is None:
+            # Try lowercase
+            keyval = getattr(Gdk, f'KEY_{key_name.lower()}', None)
+
+        if keyval is None:
+            return None
+
+        return (keyval, modmask)
+
+    def _check_keybind(self, keyval, mods, action_name):
+        """Check if keyval+mods matches a configured keybinding
+
+        Args:
+            keyval: Gdk keyval from event
+            mods: Modifier mask from event
+            action_name: Action name to check (e.g. 'overview_exit')
+
+        Returns:
+            True if the key matches the action binding
+        """
+        if action_name not in self.keybinds:
+            return False
+
+        binding = self.keybinds[action_name]
+
+        # Handle list of bindings
+        if isinstance(binding, list):
+            for b in binding:
+                if b and len(b) == 2:
+                    bind_key, bind_mods = b
+                    if keyval == bind_key and mods == bind_mods:
+                        return True
+            return False
+        # Handle single binding
+        elif binding and len(binding) == 2:
+            bind_key, bind_mods = binding
+            return keyval == bind_key and mods == bind_mods
+
+        return False
 
     def capture_terminal_snapshot(self, terminal):
         """Capture a snapshot of the terminal widget"""
@@ -466,11 +582,12 @@ class TabOverview:
                 # Different mode, switch to new mode
                 self.hide()
 
+        # Tab switcher only shows current window
         n_pages = self.notebook.get_n_pages()
         if n_pages == 0:
             return
 
-        # Capture fresh snapshot of active tab before showing
+        # Capture fresh snapshot of active tab in current window before showing
         current_page = self.notebook.get_current_page()
         if current_page >= 0:
             tab = self.notebook.get_nth_page(current_page)
@@ -495,7 +612,7 @@ class TabOverview:
         font_family = fontdesc.get_family()
 
         if mode == 'standalone':
-            mode_text = f'<span font_family="{font_family}" size="{int(font_size_in_pt * 2)}pt" foreground="#4a9a9a"><b>TAB OVERVIEW MODE</b></span>\n<span font_family="{font_family}" size="{int(font_size_in_pt * 1.2)}pt" foreground="#888">ESC: exit | Enter: select | Arrows: navigate | Shift+Arrows: move tab | Ctrl+Alt+X: close | Ctrl+Alt+Z: new tab</span>'
+            mode_text = f'<span font_family="{font_family}" size="{int(font_size_in_pt * 2)}pt" foreground="#4a9a9a"><b>TAB OVERVIEW MODE</b></span>\n<span font_family="{font_family}" size="{int(font_size_in_pt * 1.2)}pt" foreground="#888">ESC: exit | Enter: select | Alt+Return: new tab | Arrows: navigate | Shift+Arrows: move tab | Ctrl+Alt+X: close</span>'
         else:
             mode_text = f'<span font_family="{font_family}" size="{int(font_size_in_pt * 1.5)}pt" foreground="#888"><b>Tab Switcher</b></span>'
         mode_label.set_markup(mode_text)
@@ -520,20 +637,34 @@ class TabOverview:
         bg_box.set_name("overview-background")
         bg_box.add(main_vbox)
 
-        # Calculate grid dimensions
-        import math
-        cols = math.ceil(math.sqrt(n_pages * 1.5))
-        rows = math.ceil(n_pages / cols)
+        # Make it focusable and capture all key events
+        bg_box.set_can_focus(True)
+        bg_box.set_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.KEY_RELEASE_MASK)
+        bg_box.connect("key-press-event", self.on_key_press)
+        bg_box.connect("key-release-event", self.on_key_release)
 
         # Calculate thumbnail size
         window_width = self.window.get_allocated_width()
         window_height = self.window.get_allocated_height()
         available_width = window_width - 100
-        available_height = window_height - 100
-        thumb_width = min(400, (available_width // cols) - 20)
-        thumb_height = min(300, (available_height // rows) - 60)
+
+        # Use config values or defaults
+        max_thumb_width = self.config.get('tab_overview_thumb_width', 300)
+        max_thumb_height = self.config.get('tab_overview_thumb_height', 225)
+
+        thumb_width = min(max_thumb_width, available_width // 4 - 20)
+        thumb_height = min(max_thumb_height, int(thumb_width * 0.75))
+
+        # Store thumbnail dimensions for consistent sizing during updates
+        self.thumb_width = thumb_width
+        self.thumb_height = thumb_height
 
         self.overview_tiles = []
+
+        # Calculate grid dimensions
+        import math
+        cols = math.ceil(math.sqrt(n_pages * 1.5))
+        rows = math.ceil(n_pages / cols)
 
         # Create tiles for each tab
         for idx in range(n_pages):
@@ -598,7 +729,7 @@ class TabOverview:
             pixbuf = self.get_cached_or_capture(tab)
             if pixbuf:
                 scaled_pixbuf = pixbuf.scale_simple(
-                    thumb_width, thumb_height,
+                    self.thumb_width, self.thumb_height,
                     GdkPixbuf.InterpType.BILINEAR
                 )
                 image = Gtk.Image.new_from_pixbuf(scaled_pixbuf)
@@ -607,7 +738,7 @@ class TabOverview:
             else:
                 placeholder = Gtk.Label()
                 placeholder.set_markup("<i>Preview unavailable</i>")
-                placeholder.set_size_request(thumb_width, thumb_height)
+                placeholder.set_size_request(self.thumb_width, self.thumb_height)
                 preview_overlay.add(placeholder)
 
             # Add close button overlaid on top right corner
@@ -693,6 +824,9 @@ class TabOverview:
         bg_box.show_all()
         self.overview_bg_box = bg_box
 
+        # Grab focus to capture all key events
+        bg_box.grab_focus()
+
         self.update_selection()
 
         # Start periodic updates in switcher mode
@@ -717,12 +851,11 @@ class TabOverview:
             self.overview_bg_box = None
         self.overview_tiles = []
 
-        # Refocus current tab in standalone mode
-        if self.mode == 'standalone':
-            current_page = self.notebook.get_current_page()
-            if current_page >= 0:
-                tab = self.notebook.get_nth_page(current_page)
-                tab.grab_focus()
+        # Refocus current tab
+        current_page = self.notebook.get_current_page()
+        if current_page >= 0:
+            tab = self.notebook.get_nth_page(current_page)
+            tab.grab_focus()
 
     def update_selection(self, new_index=None):
         """Update visual indication of selected tile"""
@@ -776,19 +909,12 @@ class TabOverview:
         if not isinstance(image, Gtk.Image):
             return
 
-        # Update the image
+        # Update the image using stored thumbnail dimensions
         pixbuf = self.snapshot_cache[tab]
-        # Calculate thumbnail size
-        n_pages = self.notebook.get_n_pages()
-        import math
-        cols = math.ceil(math.sqrt(n_pages * 1.5))
-        rows = math.ceil(n_pages / cols)
-        window_width = self.window.get_allocated_width()
-        window_height = self.window.get_allocated_height()
-        available_width = window_width - 100
-        available_height = window_height - 100
-        thumb_width = min(400, (available_width // cols) - 20)
-        thumb_height = min(300, (available_height // rows) - 60)
+
+        # Use the thumbnail dimensions that were calculated when overview was shown
+        thumb_width = getattr(self, 'thumb_width', 300)
+        thumb_height = getattr(self, 'thumb_height', 225)
 
         scaled_pixbuf = pixbuf.scale_simple(
             thumb_width, thumb_height,
@@ -796,12 +922,38 @@ class TabOverview:
         )
         image.set_from_pixbuf(scaled_pixbuf)
 
+    def on_key_press(self, widget, event):
+        """Capture key press events when overview is active
+
+        Returns True to stop propagation to terminals
+        """
+        if not self.active:
+            return False
+
+        # Handle the key if in standalone mode
+        if self.mode == 'standalone':
+            self.handle_key(event)
+
+        # Always stop propagation when overview is active
+        return True
+
+    def on_key_release(self, widget, event):
+        """Capture key release events when overview is active
+
+        Returns True to stop propagation to terminals
+        """
+        if not self.active:
+            return False
+
+        # Always stop propagation when overview is active
+        return True
+
     def handle_key(self, event):
-        """Handle keyboard navigation (standalone mode only)
+        """Handle keyboard navigation
 
         Returns True if handled, False otherwise
         """
-        if not self.active or self.mode != 'standalone':
+        if not self.active:
             return False
 
         keyval = event.keyval
@@ -811,114 +963,121 @@ class TabOverview:
         import math
         cols = math.ceil(math.sqrt(n_pages * 1.5))
 
-        # Check for close tab keybinds
-        close_key, close_mods = self.keybinds['close_tab']
-        close_key_alt, close_mods_alt = self.keybinds['close_tab_alt']
-
-        if (keyval == close_key and mods == close_mods) or \
-           (keyval == close_key_alt and mods == close_mods_alt):
-            # Close the selected tab
+        # Close tab
+        if self._check_keybind(keyval, mods, 'close_tab'):
             if self.selected >= 0 and self.selected < n_pages:
+                current_mode = self.mode
                 self.notebook.remove_page(self.selected)
-                # Refresh the overview
                 new_n_pages = self.notebook.get_n_pages()
                 if new_n_pages == 0:
                     self.hide()
                 else:
-                    # Adjust selection if needed
                     if self.selected >= new_n_pages:
                         self.selected = new_n_pages - 1
-                    # Refresh overview
                     self.hide()
-                    self.show(mode='standalone')
+                    self.show(mode=current_mode)
             return True
 
-        # Check for new tab keybinds
-        new_key, new_mods = self.keybinds['new_tab']
-        new_key_alt, new_mods_alt = self.keybinds['new_tab_alt']
-
-        if (keyval == new_key and mods == new_mods) or \
-           (keyval == new_key_alt and mods == new_mods_alt):
-            # Create new tab
+        # New tab (from config bindings)
+        if self._check_keybind(keyval, mods, 'new_tab'):
+            current_mode = self.mode
             self.mypixels.new_tab()
-            # Refresh overview to show new tab
             self.hide()
-            self.show(mode='standalone')
+            self.show(mode=current_mode)
             return True
 
-        if keyval == Gdk.KEY_Escape:
+        # Exit overview
+        if self._check_keybind(keyval, mods, 'overview_exit'):
             self.hide()
             return True
-        elif keyval == Gdk.KEY_Return or keyval == Gdk.KEY_KP_Enter:
+
+        # New tab (Alt+Return) - check this BEFORE overview_select
+        if self._check_keybind(keyval, mods, 'overview_new_tab'):
+            current_mode = self.mode
+            self.mypixels.new_tab()
+            self.hide()
+            self.show(mode=current_mode)
+            return True
+
+        # Select tab (plain Return) - check this AFTER overview_new_tab
+        if self._check_keybind(keyval, mods, 'overview_select'):
             self.notebook.set_current_page(self.selected)
             self.hide()
             return True
-        elif keyval == Gdk.KEY_Left:
-            if mods & Gdk.ModifierType.SHIFT_MASK:
-                # Shift+Left: Move tab left
-                if self.selected > 0:
-                    tab = self.notebook.get_nth_page(self.selected)
-                    self.notebook.reorder_child(tab, self.selected - 1)
-                    self.selected -= 1
-                    # Refresh overview
-                    self.hide()
-                    self.show(mode='standalone')
-            else:
-                # Left: Navigate left
-                if self.selected > 0:
-                    self.update_selection(self.selected - 1)
+
+        # Move tab left
+        if self._check_keybind(keyval, mods, 'overview_move_left'):
+            if self.selected > 0:
+                tab = self.notebook.get_nth_page(self.selected)
+                self.notebook.reorder_child(tab, self.selected - 1)
+                self.selected -= 1
+                self.hide()
+                self.show(mode='standalone')
             return True
-        elif keyval == Gdk.KEY_Right:
-            if mods & Gdk.ModifierType.SHIFT_MASK:
-                # Shift+Right: Move tab right
-                if self.selected < n_pages - 1:
-                    tab = self.notebook.get_nth_page(self.selected)
-                    self.notebook.reorder_child(tab, self.selected + 1)
-                    self.selected += 1
-                    # Refresh overview
-                    self.hide()
-                    self.show(mode='standalone')
-            else:
-                # Right: Navigate right
-                if self.selected < n_pages - 1:
-                    self.update_selection(self.selected + 1)
+
+        # Navigate left
+        if self._check_keybind(keyval, mods, 'overview_nav_left'):
+            if self.selected > 0:
+                self.update_selection(self.selected - 1)
             return True
-        elif keyval == Gdk.KEY_Up:
-            if mods & Gdk.ModifierType.SHIFT_MASK:
-                # Shift+Up: Move tab up (towards beginning)
-                if self.selected >= cols:
-                    tab = self.notebook.get_nth_page(self.selected)
-                    new_pos = self.selected - cols
-                    self.notebook.reorder_child(tab, new_pos)
-                    self.selected = new_pos
-                    # Refresh overview
-                    self.hide()
-                    self.show(mode='standalone')
-            else:
-                # Up: Navigate up
-                if self.selected >= cols:
-                    self.update_selection(self.selected - cols)
+
+        # Move tab right
+        if self._check_keybind(keyval, mods, 'overview_move_right'):
+            if self.selected < n_pages - 1:
+                tab = self.notebook.get_nth_page(self.selected)
+                self.notebook.reorder_child(tab, self.selected + 1)
+                self.selected += 1
+                self.hide()
+                self.show(mode='standalone')
             return True
-        elif keyval == Gdk.KEY_Down:
-            if mods & Gdk.ModifierType.SHIFT_MASK:
-                # Shift+Down: Move tab down (towards end)
-                if self.selected + cols < n_pages:
-                    tab = self.notebook.get_nth_page(self.selected)
-                    new_pos = self.selected + cols
-                    self.notebook.reorder_child(tab, new_pos)
-                    self.selected = new_pos
-                    # Refresh overview
-                    self.hide()
-                    self.show(mode='standalone')
-            else:
-                # Down: Navigate down
-                if self.selected + cols < n_pages:
-                    self.update_selection(self.selected + cols)
+
+        # Navigate right
+        if self._check_keybind(keyval, mods, 'overview_nav_right'):
+            if self.selected < n_pages - 1:
+                self.update_selection(self.selected + 1)
             return True
-        elif keyval == Gdk.KEY_Home:
+
+        # Move tab up
+        if self._check_keybind(keyval, mods, 'overview_move_up'):
+            if self.selected >= cols:
+                tab = self.notebook.get_nth_page(self.selected)
+                new_pos = self.selected - cols
+                self.notebook.reorder_child(tab, new_pos)
+                self.selected = new_pos
+                self.hide()
+                self.show(mode='standalone')
+            return True
+
+        # Navigate up
+        if self._check_keybind(keyval, mods, 'overview_nav_up'):
+            if self.selected >= cols:
+                self.update_selection(self.selected - cols)
+            return True
+
+        # Move tab down
+        if self._check_keybind(keyval, mods, 'overview_move_down'):
+            if self.selected + cols < n_pages:
+                tab = self.notebook.get_nth_page(self.selected)
+                new_pos = self.selected + cols
+                self.notebook.reorder_child(tab, new_pos)
+                self.selected = new_pos
+                self.hide()
+                self.show(mode='standalone')
+            return True
+
+        # Navigate down
+        if self._check_keybind(keyval, mods, 'overview_nav_down'):
+            if self.selected + cols < n_pages:
+                self.update_selection(self.selected + cols)
+            return True
+
+        # First tab
+        if self._check_keybind(keyval, mods, 'overview_first'):
             self.update_selection(0)
             return True
-        elif keyval == Gdk.KEY_End:
+
+        # Last tab
+        if self._check_keybind(keyval, mods, 'overview_last'):
             self.update_selection(n_pages - 1)
             return True
         elif keyval >= Gdk.KEY_1 and keyval <= Gdk.KEY_9:
@@ -957,6 +1116,441 @@ class TabOverview:
                 # Refresh overview
                 self.hide()
                 self.show(mode='standalone')
+
+
+class TabOverviewFull(TabOverview):
+    """Full tab overview showing all windows with extended functionality"""
+
+    def show(self, mode='standalone'):
+        """Override show to display tabs from all windows"""
+        # If already active, toggle off
+        if self.active:
+            self.hide()
+            return
+
+        # Collect all tabs from all windows
+        all_windows = self.app.windows if self.app else [self.mypixels]
+        total_tabs = sum(w.notebook.get_n_pages() for w in all_windows)
+
+        if total_tabs == 0:
+            return
+
+        # Capture fresh snapshot of active tab in current window before showing
+        current_page = self.notebook.get_current_page()
+        if current_page >= 0:
+            tab = self.notebook.get_nth_page(current_page)
+            pixbuf = self.capture_terminal_snapshot(tab)
+            if pixbuf:
+                self.snapshot_cache[tab] = pixbuf
+
+        self.active = True
+        self.mode = mode
+        self.selected_window = self.mypixels
+        self.selected = current_page
+
+        # Create main container
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        # Add mode indicator at the top
+        mode_label = Gtk.Label()
+        mode_label.set_use_markup(True)
+
+        # Get font from config
+        fontdesc = Pango.FontDescription(self.config["tablist_font"])
+        font_size_in_pt = fontdesc.get_size() / Pango.SCALE
+        font_family = fontdesc.get_family()
+
+        mode_text = f'<span font_family="{font_family}" size="{int(font_size_in_pt * 2)}pt" foreground="#4a9a9a"><b>FULL TAB OVERVIEW</b></span>\n<span font_family="{font_family}" size="{int(font_size_in_pt * 1.2)}pt" foreground="#888">ESC: exit | Enter: select | Alt+Return: new tab | Arrows: navigate | Ctrl+Alt+X: close | Ctrl+N: new window | Ctrl+M: move tab</span>'
+        mode_label.set_markup(mode_text)
+        mode_label.set_margin_bottom(10)
+        main_vbox.pack_start(mode_label, False, False, 0)
+
+        # Create scrolled window for overview
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+
+        # Create overview container
+        self.overview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        self.overview_box.set_margin_start(20)
+        self.overview_box.set_margin_end(20)
+        self.overview_box.set_margin_top(0)
+        self.overview_box.set_margin_bottom(20)
+        self.overview_box.set_halign(Gtk.Align.CENTER)
+        self.overview_box.set_valign(Gtk.Align.START)
+
+        scrolled.add(self.overview_box)
+        main_vbox.pack_start(scrolled, True, True, 0)
+
+        # Create event box for background
+        bg_box = Gtk.EventBox()
+        bg_box.set_name("overview-background")
+        bg_box.add(main_vbox)
+
+        # Make it focusable and capture all key events
+        bg_box.set_can_focus(True)
+        bg_box.set_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.KEY_RELEASE_MASK)
+        bg_box.connect("key-press-event", self.on_key_press)
+        bg_box.connect("key-release-event", self.on_key_release)
+
+        # Calculate thumbnail size
+        window_width = self.window.get_allocated_width()
+        window_height = self.window.get_allocated_height()
+        available_width = window_width - 100
+
+        # Use config values or defaults
+        max_thumb_width = self.config.get('tab_overview_thumb_width', 300)
+        max_thumb_height = self.config.get('tab_overview_thumb_height', 225)
+
+        thumb_width = min(max_thumb_width, available_width // 4 - 20)
+        thumb_height = min(max_thumb_height, int(thumb_width * 0.75))
+
+        # Store thumbnail dimensions
+        self.thumb_width = thumb_width
+        self.thumb_height = thumb_height
+
+        self.overview_tiles = []  # Store (window, tab_index, tile_box)
+
+        # Create sections for each window
+        for win_idx, window in enumerate(all_windows):
+            n_pages = window.notebook.get_n_pages()
+            if n_pages == 0:
+                continue
+
+            # Window section container
+            window_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+            # Window header
+            window_num = win_idx + 1
+            is_current_window = (window == self.mypixels)
+            window_header = Gtk.Label()
+            window_header.set_use_markup(True)
+            header_text = f'<span font_family="{font_family}" size="{int(font_size_in_pt * 1.3)}pt" foreground="#4a9a9a"><b>Window {window_num}</b></span>'
+            if is_current_window:
+                header_text += f' <span foreground="#888">(current)</span>'
+            window_header.set_markup(header_text)
+            window_header.set_halign(Gtk.Align.START)
+            window_section.pack_start(window_header, False, False, 0)
+
+            # Grid for tabs in this window
+            import math
+            cols = min(4, n_pages)  # Max 4 columns
+            rows = math.ceil(n_pages / cols)
+
+            tab_grid = Gtk.Grid()
+            tab_grid.set_row_spacing(10)
+            tab_grid.set_column_spacing(10)
+            tab_grid.set_halign(Gtk.Align.CENTER)
+
+            # Create tiles for each tab in this window
+            for idx in range(n_pages):
+                tab = window.notebook.get_nth_page(idx)
+                row = idx // cols
+                col = idx % cols
+
+                tile_box = Gtk.EventBox()
+                tile_box.set_name("overview-tile")
+                tile_box.set_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+                tile_box.connect("button-press-event", self.on_tile_clicked, window, idx)
+
+                tile_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+                tile_vbox.set_margin_start(10)
+                tile_vbox.set_margin_end(10)
+                tile_vbox.set_margin_top(10)
+                tile_vbox.set_margin_bottom(10)
+
+                # Get tab title from window's tabs dict
+                if tab in window.tabs:
+                    params = window.tabs[tab]
+                    title = params.get("name", params.get("title", ""))
+                else:
+                    title = ""
+
+                if not title:
+                    title = f"Tab {idx + 1}"
+
+                if len(title) > 30:
+                    title = title[:27] + "..."
+
+                # Create header with label
+                header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+                header_box.set_halign(Gtk.Align.CENTER)
+
+                # Color indicator
+                if tab in window.tabs and "group" in window.tabs[tab]:
+                    grp = window.tabs[tab]["group"]
+                    color_indicator = Gtk.Label()
+                    color_indicator.set_markup(f'<span foreground="{self.config["col_" + str(grp)]}">\u25cf</span>')
+                    header_box.pack_start(color_indicator, False, False, 0)
+
+                # Create label
+                label_text = f"<b>{idx + 1}</b>: {html.escape(title)}"
+                label = Gtk.Label()
+                label.set_use_markup(True)
+                label.set_markup(label_text)
+                label.set_line_wrap(True)
+                label.set_max_width_chars(30)
+                label.set_justify(Gtk.Justification.CENTER)
+
+                header_box.pack_start(label, True, True, 0)
+                tile_vbox.pack_start(header_box, False, False, 0)
+
+                # Terminal snapshot with overlay for close button
+                preview_overlay = Gtk.Overlay()
+
+                # Terminal snapshot
+                pixbuf = self.get_cached_or_capture(tab)
+                if pixbuf:
+                    scaled_pixbuf = pixbuf.scale_simple(
+                        self.thumb_width, self.thumb_height,
+                        GdkPixbuf.InterpType.BILINEAR
+                    )
+                    image = Gtk.Image.new_from_pixbuf(scaled_pixbuf)
+                    image.set_name(f"terminal-preview-{idx}")
+                    preview_overlay.add(image)
+                else:
+                    placeholder = Gtk.Label()
+                    placeholder.set_markup("<i>Preview unavailable</i>")
+                    placeholder.set_size_request(self.thumb_width, self.thumb_height)
+                    preview_overlay.add(placeholder)
+
+                # Add close button
+                close_button = Gtk.Button()
+                close_button.set_label("\u00d7")
+                close_button.set_name("overview-close-button")
+                close_button.set_relief(Gtk.ReliefStyle.NONE)
+                close_button.set_halign(Gtk.Align.END)
+                close_button.set_valign(Gtk.Align.START)
+                close_button.set_margin_top(5)
+                close_button.set_margin_end(5)
+                close_button.connect("clicked", self.on_close_button_clicked, window, idx)
+                preview_overlay.add_overlay(close_button)
+
+                tile_vbox.pack_start(preview_overlay, True, True, 0)
+
+                # Entangled indicator
+                if tab in window.entangled:
+                    entangled_label = Gtk.Label()
+                    entangled_label.set_markup(f'<span foreground="{self.config["tab_color_entangle"]}">*entangled*</span>')
+                    tile_vbox.pack_start(entangled_label, False, False, 0)
+
+                tile_box.add(tile_vbox)
+                tab_grid.attach(tile_box, col, row, 1, 1)
+                self.overview_tiles.append((window, idx, tile_box))
+
+            # Add the tab grid to the window section
+            window_section.pack_start(tab_grid, False, False, 0)
+
+            # Add separator between windows
+            if win_idx < len(all_windows) - 1:
+                separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+                separator.set_margin_top(10)
+                separator.set_margin_bottom(10)
+                window_section.pack_start(separator, False, False, 0)
+
+            # Add window section to main overview box
+            self.overview_box.pack_start(window_section, False, False, 0)
+
+        # Apply CSS
+        opacity = self.config.get('tab_overview_opacity', 0.85)
+        css = f"""
+        #overview-background {{
+            background-color: rgba(0, 0, 0, {opacity});
+        }}
+        #overview-tile {{
+            border: 2px solid #444;
+            border-radius: 5px;
+            background-color: rgba(26, 26, 26, 0.9);
+            min-width: 200px;
+            min-height: 100px;
+        }}
+        #overview-tile label {{
+            color: #ccc;
+        }}
+        #overview-tile-selected {{
+            background-color: rgba(42, 90, 90, 0.9);
+            border: 3px solid #4a9a9a;
+            border-radius: 5px;
+            min-width: 200px;
+            min-height: 100px;
+        }}
+        #overview-tile-selected label {{
+            color: #fff;
+        }}
+        #overview-close-button {{
+            background-color: rgba(40, 40, 40, 0.85);
+            color: #fff;
+            border: 1px solid rgba(180, 60, 60, 0.6);
+            border-radius: 4px;
+            font-size: 16px;
+            min-width: 24px;
+            min-height: 24px;
+            padding: 2px;
+            opacity: 0.7;
+        }}
+        #overview-close-button:hover {{
+            background-color: rgba(200, 60, 60, 0.95);
+            border-color: rgba(220, 80, 80, 1.0);
+            opacity: 1.0;
+        }}
+        """
+
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
+        )
+
+        self.overlay.add_overlay(bg_box)
+        bg_box.show_all()
+        self.overview_bg_box = bg_box
+
+        # Grab focus
+        bg_box.grab_focus()
+
+        self.update_selection()
+
+    def on_tile_clicked(self, widget, event, window, tab_index):
+        """Handle mouse click on tile"""
+        if event.button == 1:
+            # Switch to target window and tab
+            window.window.present()
+            window.notebook.set_current_page(tab_index)
+            self.hide()
+
+    def on_close_button_clicked(self, button, window, tab_index):
+        """Handle close button click"""
+        n_pages = window.notebook.get_n_pages()
+        if tab_index >= 0 and tab_index < n_pages:
+            window.notebook.remove_page(tab_index)
+            # Refresh the overview
+            self.hide()
+            # Check if any window still has tabs
+            all_windows = self.app.windows if self.app else [self.mypixels]
+            total_tabs = sum(w.notebook.get_n_pages() for w in all_windows)
+            if total_tabs > 0:
+                self.show()
+
+    def update_selection(self, new_index=None):
+        """Update visual indication of selected tile"""
+        if not self.active or not self.overview_tiles:
+            return
+
+        if new_index is not None:
+            self.selected = new_index
+
+        # Tiles are tuples: (window, tab_index, tile_box)
+        for window, tab_idx, tile_box in self.overview_tiles:
+            # Highlight tile if it matches current window and selected tab
+            if window == self.selected_window and tab_idx == self.selected:
+                tile_box.set_name("overview-tile-selected")
+            else:
+                tile_box.set_name("overview-tile")
+
+    def handle_key(self, event):
+        """Handle keyboard navigation for full overview"""
+        if not self.active:
+            return False
+
+        keyval = event.keyval
+        mods = event.state & Gtk.accelerator_get_default_mod_mask()
+
+        # ESC: exit
+        if self._check_keybind(keyval, mods, 'overview_exit'):
+            self.hide()
+            return True
+
+        # Alt+Return: Create new tab in current window - check this BEFORE overview_select
+        if self._check_keybind(keyval, mods, 'overview_new_tab'):
+            self.mypixels.new_tab()
+            # Refresh overview to show new tab
+            self.hide()
+            self.show()
+            return True
+
+        # Enter: select current tile
+        if self._check_keybind(keyval, mods, 'overview_select'):
+            # Plain Return: Select current tile
+            if self.overview_tiles:
+                window, tab_idx, _ = self.overview_tiles[self._get_linear_selected_index()]
+                window.window.present()
+                window.notebook.set_current_page(tab_idx)
+            self.hide()
+            return True
+
+        # Arrow key navigation across all tiles
+        if self._check_keybind(keyval, mods, 'overview_nav_left'):
+            self._navigate(-1)
+            return True
+        elif self._check_keybind(keyval, mods, 'overview_nav_right'):
+            self._navigate(1)
+            return True
+        elif self._check_keybind(keyval, mods, 'overview_nav_up'):
+            self._navigate(-4)  # Move up one row (4 cols per row)
+            return True
+        elif self._check_keybind(keyval, mods, 'overview_nav_down'):
+            self._navigate(4)  # Move down one row
+            return True
+
+        # Ctrl+N: new window
+        if self._check_keybind(keyval, mods, 'overview_new_window'):
+            self.mypixels.app.new_window()
+            self.hide()
+            self.show()
+            return True
+
+        # Ctrl+M: move current tab to another window
+        if self._check_keybind(keyval, mods, 'overview_move_tab'):
+            self.hide()
+            self.mypixels.send_tab_to_window()
+            return True
+
+        # Close tab
+        if self._check_keybind(keyval, mods, 'close_tab'):
+            if self.overview_tiles:
+                window, tab_idx, _ = self.overview_tiles[self._get_linear_selected_index()]
+                window.notebook.remove_page(tab_idx)
+                self.hide()
+                all_windows = self.app.windows if self.app else [self.mypixels]
+                total_tabs = sum(w.notebook.get_n_pages() for w in all_windows)
+                if total_tabs > 0:
+                    self.show()
+            return True
+
+        # New tab
+        if self._check_keybind(keyval, mods, 'new_tab'):
+            self.mypixels.new_tab()
+            self.hide()
+            self.show()
+            return True
+
+        return False
+
+    def _get_linear_selected_index(self):
+        """Get the linear index of the currently selected tile"""
+        for i, (window, tab_idx, _) in enumerate(self.overview_tiles):
+            if window == self.selected_window and tab_idx == self.selected:
+                return i
+        return 0
+
+    def _navigate(self, delta):
+        """Navigate by delta tiles (positive or negative)"""
+        if not self.overview_tiles:
+            return
+
+        current_idx = self._get_linear_selected_index()
+        new_idx = current_idx + delta
+
+        # Clamp to valid range
+        new_idx = max(0, min(new_idx, len(self.overview_tiles) - 1))
+
+        # Update selection
+        window, tab_idx, _ = self.overview_tiles[new_idx]
+        self.selected_window = window
+        self.selected = tab_idx
+        self.update_selection()
+
 
 def dialog_get_text(parent, message, default=''):
     """
@@ -1315,7 +1909,14 @@ class MypixelsWindow:
         self.hook_wal_reloads()
 
         # Tab overview instance (after tabs dict is created)
+        # Tab switcher (Alt+Tab) - shows only current window
         self.tab_overview = TabOverview(
+            self.window, self.overlay, self.notebook,
+            self.tabs, self.entangled, self.config, self
+        )
+
+        # Full tab overview (Ctrl+Shift+O) - shows all windows
+        self.tab_overview_full = TabOverviewFull(
             self.window, self.overlay, self.notebook,
             self.tabs, self.entangled, self.config, self
         )
@@ -1323,6 +1924,9 @@ class MypixelsWindow:
     def transform_keybinds(self):
         # transforms self.keymap ("function->binds") to self.keybinds
         for fn, bind in self.keymap.items():
+            # Skip overview-specific keybindings (handled in TabOverview classes)
+            if fn.startswith('overview_'):
+                continue
             func = self.funcmap[fn]
             if isinstance(bind, list) or isinstance(bind, tuple):
                 for b in bind:
@@ -1387,9 +1991,17 @@ class MypixelsWindow:
 
     def key_pressed(self, wnd, event):
         if event.type == Gdk.EventType.KEY_PRESS:
-            # If tab overview is active in standalone mode, handle navigation
-            if self.tab_overview.active and self.tab_overview.mode == 'standalone':
-                return self.tab_overview.handle_key(event)
+            # If full tab overview is active, handle navigation
+            if self.tab_overview_full.active:
+                handled = self.tab_overview_full.handle_key(event)
+                if handled:
+                    return True
+
+            # If tab switcher is active, handle navigation
+            if self.tab_overview.active:
+                handled = self.tab_overview.handle_key(event)
+                if handled:
+                    return True
 
             # skim through the bindings
             mods = event.state & Gtk.accelerator_get_default_mod_mask()
@@ -2086,8 +2698,8 @@ class MypixelsWindow:
         tab.search_set_gregex(regex, 0)
 
     def show_tab_overview(self, param=None):
-        """Show tab overview - delegates to TabOverview class"""
-        self.tab_overview.show(mode='standalone')
+        """Show full tab overview with all windows - delegates to TabOverviewFull class"""
+        self.tab_overview_full.show()
 
     def run(self):
         """Deprecated - kept for backward compatibility
