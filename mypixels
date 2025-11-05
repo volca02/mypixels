@@ -925,28 +925,43 @@ class TabOverview:
     def on_key_press(self, widget, event):
         """Capture key press events when overview is active
 
-        Returns True to stop propagation to terminals
+        Returns True to stop propagation if key was handled, False otherwise
         """
         if not self.active:
             return False
 
-        # Handle the key if in standalone mode
-        if self.mode == 'standalone':
-            self.handle_key(event)
+        # Try to handle the key
+        handled = self.handle_key(event)
+        if handled:
+            return True
 
-        # Always stop propagation when overview is active
-        return True
+        # If not handled, forward to current terminal
+        current_page = self.notebook.get_current_page()
+        if current_page >= 0:
+            terminal = self.notebook.get_nth_page(current_page)
+            if terminal:
+                terminal.emit("key-press-event", eventkey2gdkevent(event))
+                return True
+
+        return False
 
     def on_key_release(self, widget, event):
         """Capture key release events when overview is active
 
-        Returns True to stop propagation to terminals
+        Forward to terminal to ensure proper key handling
         """
         if not self.active:
             return False
 
-        # Always stop propagation when overview is active
-        return True
+        # Forward key release to current terminal
+        current_page = self.notebook.get_current_page()
+        if current_page >= 0:
+            terminal = self.notebook.get_nth_page(current_page)
+            if terminal:
+                terminal.emit("key-release-event", eventkey2gdkevent(event))
+                return True
+
+        return False
 
     def handle_key(self, event):
         """Handle keyboard navigation
@@ -1080,17 +1095,34 @@ class TabOverview:
         if self._check_keybind(keyval, mods, 'overview_last'):
             self.update_selection(n_pages - 1)
             return True
-        elif keyval >= Gdk.KEY_1 and keyval <= Gdk.KEY_9:
-            idx = keyval - Gdk.KEY_1
-            if idx < n_pages:
-                self.notebook.set_current_page(idx)
-                self.hide()
-            return True
-        elif keyval == Gdk.KEY_0:
-            if n_pages > 9:
-                self.notebook.set_current_page(9)
-                self.hide()
-            return True
+
+        # Number keys for quick tab switching
+        # Only handle if: standalone mode with no mods, or switcher mode with only Alt
+        expected_mods = Gdk.ModifierType.MOD1_MASK if self.mode == 'switcher' else 0
+        if mods == expected_mods:
+            if keyval >= Gdk.KEY_1 and keyval <= Gdk.KEY_9:
+                idx = keyval - Gdk.KEY_1
+                if idx < n_pages:
+                    self.notebook.set_current_page(idx)
+                    # In switcher mode, keep overview visible; in standalone mode, hide it
+                    if self.mode == 'standalone':
+                        self.hide()
+                    else:
+                        # Update selection to match the switched tab
+                        self.selected = idx
+                        self.update_selection()
+                return True
+            elif keyval == Gdk.KEY_0:
+                if n_pages > 9:
+                    self.notebook.set_current_page(9)
+                    # In switcher mode, keep overview visible; in standalone mode, hide it
+                    if self.mode == 'standalone':
+                        self.hide()
+                    else:
+                        # Update selection to match the switched tab
+                        self.selected = 9
+                        self.update_selection()
+                return True
 
         return False
 
@@ -1297,8 +1329,14 @@ class TabOverviewFull(TabOverview):
                 # Terminal snapshot with overlay for close button
                 preview_overlay = Gtk.Overlay()
 
-                # Terminal snapshot
-                pixbuf = self.get_cached_or_capture(tab)
+                # Terminal snapshot - try to get from the window's own tab overview cache
+                pixbuf = None
+                if hasattr(window, 'tab_overview') and tab in window.tab_overview.snapshot_cache:
+                    pixbuf = window.tab_overview.snapshot_cache[tab]
+                else:
+                    # Fall back to capturing directly
+                    pixbuf = self.capture_terminal_snapshot(tab)
+
                 if pixbuf:
                     scaled_pixbuf = pixbuf.scale_simple(
                         self.thumb_width, self.thumb_height,
@@ -1495,7 +1533,7 @@ class TabOverviewFull(TabOverview):
 
         # Ctrl+N: new window
         if self._check_keybind(keyval, mods, 'overview_new_window'):
-            self.mypixels.app.new_window()
+            self.mypixels.app.new_window(focus=False)
             self.hide()
             self.show()
             return True
@@ -2953,26 +2991,38 @@ class MypixelsApplication(Gtk.Application):
     Manages multiple windows, shared configuration, and D-Bus single-instance detection.
     """
 
-    def __init__(self):
+    def __init__(self, independent=False):
+        # Use unique app ID for independent instances
+        if independent:
+            import time
+            import random
+            # D-Bus app IDs must use alphanumeric and underscores only
+            unique_id = f"i{int(time.time())}{random.randint(0, 9999)}"
+            app_id = f"com.github.volca.mypixels.independent_{unique_id}"
+        else:
+            app_id = "com.github.volca.mypixels"
+
         super().__init__(
-            application_id="com.github.volca.mypixels",
+            application_id=app_id,
             flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
         )
         self.windows = []  # List of MypixelsWindow instances
         self.command_args = None
         self.config = config  # Shared config across all windows
         self.tab_counter = counter()  # Global tab ID generator
+        self.independent = independent
 
     def do_activate(self):
         """Called when application is activated (first launch or by remote instance)"""
         # Always create a new window
         self.new_window(self.command_args)
 
-    def new_window(self, command=None):
+    def new_window(self, command=None, focus=True):
         """Create a new window
 
         Args:
             command: Optional command to run in new tabs
+            focus: If True, focus the new window; if False, just show it
         """
         window = MypixelsWindow(self)
         self.windows.append(window)
@@ -2986,7 +3036,12 @@ class MypixelsApplication(Gtk.Application):
         window.new_tab()
 
         # Show window
-        window.window.present()
+        if focus:
+            window.window.present()
+        else:
+            window.window.show()
+
+        return window
 
     def remove_window(self, window):
         """Remove a window from the application
@@ -3017,8 +3072,22 @@ class MypixelsApplication(Gtk.Application):
 
 def main():
     """Main entry point for mypixels"""
-    app = MypixelsApplication()
-    exit_status = app.run(sys.argv)
+    import argparse
+
+    # Parse arguments before passing to GTK
+    parser = argparse.ArgumentParser(description='mypixels terminal emulator')
+    parser.add_argument('-i', '--independent', action='store_true',
+                        help='Run as independent instance (bypass single-instance)')
+    parser.add_argument('command', nargs='*', help='Command to run in terminal')
+
+    # Parse known args, let GTK handle the rest
+    args, unknown = parser.parse_known_args()
+
+    # Create application with independent flag
+    app = MypixelsApplication(independent=args.independent)
+
+    # Run with remaining args
+    exit_status = app.run([sys.argv[0]] + unknown + args.command)
     sys.exit(exit_status)
 
 if __name__ == '__main__':
