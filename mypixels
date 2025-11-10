@@ -87,6 +87,7 @@ config = {
 
     'tab_overview_on_alt': True,  # Show tab overview when Alt is held during tab switching
     'tab_overview_opacity': 0.3,  # Background opacity for tab overview (0.0 - 1.0)
+    'tab_overview_delay_ms': 500,  # Delay in milliseconds before showing tab overview (default: 500ms)
 
     'wal_palette': '~/.cache/wal/colors.yml',
 
@@ -114,6 +115,8 @@ config = {
 
         'prev_tab': ('MOD1+Left', 'MOD1+SHIFT+f'),
         'next_tab': ('MOD1+Right', 'MOD1+SHIFT+b'),
+        'prev_tab_row': 'MOD1+Up',
+        'next_tab_row': 'MOD1+Down',
         'first_tab': 'MOD1+Home',
         'last_tab': 'MOD1+End',
 
@@ -265,6 +268,7 @@ def validate_config(cfg: Dict[str, Any]) -> List[str]:
         'scrollback_lines': (0, 100000, "must be between 0 and 100000"),
         'term_opacity': (0.0, 1.0, "must be between 0.0 and 1.0"),
         'tab_overview_opacity': (0.0, 1.0, "must be between 0.0 and 1.0"),
+        'tab_overview_delay_ms': (0, 10000, "must be between 0 and 10000 milliseconds"),
         'default_width': (100, 10000, "must be between 100 and 10000"),
         'default_height': (100, 10000, "must be between 100 and 10000"),
         'tab_title_max_length': (-1, 1000, "must be between -1 (unlimited) and 1000"),
@@ -355,6 +359,7 @@ class TabOverview:
         self.active = False
         self.selected = 0
         self.mode = 'standalone'  # 'standalone' or 'switcher'
+        self.desired_column = 0  # Track desired column for up/down navigation
 
         self.overview_box = None
         self.overview_bg_box = None
@@ -598,6 +603,11 @@ class TabOverview:
         self.active = True
         self.mode = mode
         self.selected = current_page
+
+        # Calculate grid dimensions early to initialize desired_column
+        import math
+        cols = math.ceil(math.sqrt(n_pages * 1.5))
+        self.desired_column = self.selected % cols  # Initialize to current column
 
         # Create main container
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -857,13 +867,25 @@ class TabOverview:
             tab = self.notebook.get_nth_page(current_page)
             tab.grab_focus()
 
-    def update_selection(self, new_index=None):
-        """Update visual indication of selected tile"""
+    def update_selection(self, new_index=None, preserve_column=False):
+        """Update visual indication of selected tile
+
+        Args:
+            new_index: New selection index
+            preserve_column: If False, update desired_column from new_index
+        """
         if not self.active or not self.overview_tiles:
             return
 
         if new_index is not None:
             self.selected = new_index
+
+        # Update desired column unless we're preserving it (for vertical nav)
+        if not preserve_column:
+            n_pages = self.notebook.get_n_pages()
+            import math
+            cols = math.ceil(math.sqrt(n_pages * 1.5))
+            self.desired_column = self.selected % cols
 
         for idx, tile in enumerate(self.overview_tiles):
             if idx == self.selected:
@@ -1065,8 +1087,14 @@ class TabOverview:
 
         # Navigate up
         if self._check_keybind(keyval, mods, 'overview_nav_up'):
-            if self.selected >= cols:
-                self.update_selection(self.selected - cols)
+            current_row = self.selected // cols
+            if current_row > 0:  # Not on first row
+                # Try to move to same column in previous row
+                target_index = (current_row - 1) * cols + self.desired_column
+                # Clamp to valid range
+                target_index = min(target_index, n_pages - 1)
+                target_index = max(0, target_index)
+                self.update_selection(target_index, preserve_column=True)
             return True
 
         # Move tab down
@@ -1082,8 +1110,12 @@ class TabOverview:
 
         # Navigate down
         if self._check_keybind(keyval, mods, 'overview_nav_down'):
-            if self.selected + cols < n_pages:
-                self.update_selection(self.selected + cols)
+            current_row = self.selected // cols
+            # Try to move to same column in next row
+            target_index = (current_row + 1) * cols + self.desired_column
+            # Only move if target is valid and in next row
+            if target_index < n_pages and target_index // cols > current_row:
+                self.update_selection(target_index, preserve_column=True)
             return True
 
         # First tab
@@ -1109,8 +1141,7 @@ class TabOverview:
                         self.hide()
                     else:
                         # Update selection to match the switched tab
-                        self.selected = idx
-                        self.update_selection()
+                        self.update_selection(idx)
                 return True
             elif keyval == Gdk.KEY_0:
                 if n_pages > 9:
@@ -1120,8 +1151,7 @@ class TabOverview:
                         self.hide()
                     else:
                         # Update selection to match the switched tab
-                        self.selected = 9
-                        self.update_selection()
+                        self.update_selection(9)
                 return True
 
         return False
@@ -1845,6 +1875,7 @@ class MypixelsWindow:
         self.keybinds = []
         self.keymap = {}
         self.on_tabswitch = False
+        self.tab_overview_timer = None  # Timer for delayed tab overview display
 
         # default font size - zero is ignored
         self.fontsize = 0
@@ -1983,6 +2014,8 @@ class MypixelsWindow:
 
             'prev_tab': (self.prev_tab, None),
             'next_tab': (self.next_tab, None),
+            'prev_tab_row': (self.prev_tab_row, None),
+            'next_tab_row': (self.next_tab_row, None),
             'first_tab': (self.prev_tab, -1),
             'last_tab': (self.next_tab, -1),
 
@@ -2053,9 +2086,23 @@ class MypixelsWindow:
             if (keyval == self.on_tabswitch_key):
                 self.on_tabswitch = True
                 self.update_tablist()
-                # Show overview in switcher mode when Alt is pressed (if enabled)
+                # Show overview in switcher mode when Alt is held (if enabled)
                 if self.config['tab_overview_on_alt'] and not self.tab_overview.active:
-                    self.tab_overview.show(mode='switcher')
+                    # Cancel any existing timer
+                    if self.tab_overview_timer is not None:
+                        GLib.source_remove(self.tab_overview_timer)
+                        self.tab_overview_timer = None
+
+                    # Get configured delay (default 500ms)
+                    delay_ms = self.config.get('tab_overview_delay_ms', 500)
+
+                    # Start timer to show overview after delay
+                    def show_overview_delayed():
+                        self.tab_overview.show(mode='switcher')
+                        self.tab_overview_timer = None
+                        return False  # Don't repeat timer
+
+                    self.tab_overview_timer = GLib.timeout_add(delay_ms, show_overview_delayed)
 
         # tangled terminals? if so, propagate
         tabn = self.notebook.get_current_page()
@@ -2078,7 +2125,13 @@ class MypixelsWindow:
             if (keyval == self.on_tabswitch_key):
                 self.on_tabswitch = False
                 self.update_tablist()
-                # Hide overview when Alt is released (only if in switcher mode)
+
+                # Cancel pending timer if Alt is released before delay expires
+                if self.tab_overview_timer is not None:
+                    GLib.source_remove(self.tab_overview_timer)
+                    self.tab_overview_timer = None
+
+                # Hide overview when Alt is released (only if in switcher mode and already shown)
                 if self.tab_overview.active and self.tab_overview.mode == 'switcher':
                     self.tab_overview.hide()
 
@@ -2528,6 +2581,54 @@ class MypixelsWindow:
 
     def move_last_tab(self, arg=None):
         self.next_tab(-1, move=True)
+
+    def prev_tab_row(self, skip=None):
+        """Jump up one row in tab grid (if tab overview is active)"""
+        if self.tab_overview.active:
+            # Use the overview's column count to calculate row jump
+            n_pages = self.notebook.get_n_pages()
+            if n_pages <= 0:
+                return
+
+            import math
+            cols = math.ceil(math.sqrt(n_pages * 1.5))
+            current_page = self.notebook.get_current_page()
+            current_row = current_page // cols
+
+            if current_row > 0:
+                # Jump to same column in previous row
+                target_index = (current_row - 1) * cols + self.tab_overview.desired_column
+                target_index = min(target_index, n_pages - 1)
+                target_index = max(0, target_index)
+                self.notebook.set_current_page(target_index)
+                # Update overview selection if active
+                self.tab_overview.update_selection(target_index, preserve_column=True)
+        else:
+            # If overview not active, just go to previous tab
+            self.prev_tab()
+
+    def next_tab_row(self, skip=None):
+        """Jump down one row in tab grid (if tab overview is active)"""
+        if self.tab_overview.active:
+            # Use the overview's column count to calculate row jump
+            n_pages = self.notebook.get_n_pages()
+            if n_pages <= 0:
+                return
+
+            import math
+            cols = math.ceil(math.sqrt(n_pages * 1.5))
+            current_page = self.notebook.get_current_page()
+            current_row = current_page // cols
+
+            # Jump to same column in next row
+            target_index = (current_row + 1) * cols + self.tab_overview.desired_column
+            if target_index < n_pages and target_index // cols > current_row:
+                self.notebook.set_current_page(target_index)
+                # Update overview selection if active
+                self.tab_overview.update_selection(target_index, preserve_column=True)
+        else:
+            # If overview not active, just go to next tab
+            self.next_tab()
 
     def highlight_tabs(self, toggle):
         pass
@@ -3011,6 +3112,19 @@ class MypixelsApplication(Gtk.Application):
         self.config = config  # Shared config across all windows
         self.tab_counter = counter()  # Global tab ID generator
         self.independent = independent
+
+        # Set application icon
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(script_dir, 'icon.png')
+        if os.path.exists(icon_path):
+            try:
+                # Load icon and scale to multiple sizes for better display
+                pixbuf_16 = GdkPixbuf.Pixbuf.new_from_file(icon_path)
+                pixbuf_32 = pixbuf_16.scale_simple(32, 32, GdkPixbuf.InterpType.NEAREST)
+                pixbuf_48 = pixbuf_16.scale_simple(48, 48, GdkPixbuf.InterpType.NEAREST)
+                Gtk.Window.set_default_icon_list([pixbuf_16, pixbuf_32, pixbuf_48])
+            except Exception as e:
+                print(f"Failed to load application icon from {icon_path}: {e}")
 
     def do_activate(self):
         """Called when application is activated (first launch or by remote instance)"""
