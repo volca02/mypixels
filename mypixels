@@ -137,6 +137,7 @@ config = {
         'rename_tab': 'MOD1+SHIFT+n',
 
         'show_search': 'MOD1+SHIFT+s',
+        'show_search_all': 'MOD1+SHIFT+g',
 
         'search_prev': 'MOD1+SHIFT+a',
         'search_next': 'MOD1+SHIFT+d',
@@ -147,6 +148,7 @@ config = {
 
         'show_tab_overview': 'MOD1+o',
         'send_tab_to_window': 'MOD1+SHIFT+w',
+        'monitor_tab': 'MOD1+SHIFT+m',
 
         # Tab Overview/Switcher navigation
         'overview_exit': 'Escape',
@@ -1647,6 +1649,533 @@ def dialog_get_text(parent, message, default=''):
         return None
 
 
+class SearchPanel:
+    """Search panel for finding text across all tabs"""
+
+    def __init__(self, parent_window, overlay, notebook, tabs_dict, config, mypixels_instance):
+        self.window = parent_window
+        self.overlay = overlay
+        self.notebook = notebook
+        self.tabs = tabs_dict
+        self.config = config
+        self.mypixels = mypixels_instance
+
+        self.active = False
+        self.search_text = ""
+        self.case_sensitive = False
+
+        # UI components
+        self.main_box = None
+        self.search_entry = None
+        self.results_tree = None
+        self.tree_model = None
+        self.status_label = None
+
+        # Search results cache
+        self.current_results = []  # List of (tab, line_num, line_text, match_start, match_end)
+
+    def show(self):
+        """Show the search panel"""
+        if self.active:
+            return
+
+        self.active = True
+
+        # Create main container
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        main_vbox.set_size_request(-1, 400)  # Minimum height
+        main_vbox.set_can_focus(False)  # Prevent from stealing focus
+
+        # Search box at top
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        search_box.set_can_focus(False)  # Prevent from stealing focus
+        search_box.set_margin_start(10)
+        search_box.set_margin_end(10)
+        search_box.set_margin_top(10)
+        search_box.set_margin_bottom(5)
+
+        search_label = Gtk.Label(label="Search:")
+        search_box.pack_start(search_label, False, False, 0)
+
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_placeholder_text("Enter search term...")
+        self.search_entry.connect("changed", self.on_search_changed)
+        self.search_entry.connect("key-press-event", self.on_search_key_press)
+        search_box.pack_start(self.search_entry, True, True, 0)
+
+        # Case sensitive checkbox
+        case_check = Gtk.CheckButton(label="Case sensitive")
+        case_check.connect("toggled", self.on_case_toggled)
+        search_box.pack_start(case_check, False, False, 0)
+
+        # Close button
+        close_btn = Gtk.Button(label="✕")
+        close_btn.connect("clicked", lambda w: self.hide())
+        search_box.pack_start(close_btn, False, False, 0)
+
+        main_vbox.pack_start(search_box, False, False, 0)
+
+        # Status label
+        self.status_label = Gtk.Label()
+        self.status_label.set_markup('<i>Enter search term</i>')
+        self.status_label.set_halign(Gtk.Align.START)
+        self.status_label.set_margin_start(10)
+        self.status_label.set_margin_bottom(5)
+        main_vbox.pack_start(self.status_label, False, False, 0)
+
+        # Scrolled window for results
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+
+        # TreeView for results
+        # Columns: display_text, tab_widget (hidden), line_num, is_header (hidden), match_index (hidden)
+        self.tree_model = Gtk.TreeStore(str, object, int, bool, int)
+        self.results_tree = Gtk.TreeView(model=self.tree_model)
+        self.results_tree.set_headers_visible(False)
+
+        # Single text column
+        renderer = Gtk.CellRendererText()
+        renderer.set_property("font", "monospace")
+        column = Gtk.TreeViewColumn("Results", renderer, text=0)
+        self.results_tree.append_column(column)
+
+        # Connect selection signals
+        self.results_tree.connect("row-activated", self.on_result_activated)
+        self.results_tree.connect("key-press-event", self.on_tree_key_press)
+        # Also handle single click
+        self.results_tree.connect("cursor-changed", self.on_result_selected)
+
+        scrolled.add(self.results_tree)
+        main_vbox.pack_start(scrolled, True, True, 0)
+
+        # Event box for background
+        event_box = Gtk.EventBox()
+        event_box.set_name("search-panel-background")
+        event_box.set_can_focus(False)  # Prevent event box from stealing focus
+        event_box.add(main_vbox)
+
+        # Apply CSS styling
+        css = b"""
+        #search-panel-background {
+            background-color: rgba(30, 30, 30, 0.95);
+            border-top: 2px solid #4a9a9a;
+        }
+        """
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.main_box = event_box
+        self.main_box.set_valign(Gtk.Align.END)
+        self.main_box.set_vexpand(False)
+
+        self.overlay.add_overlay(self.main_box)
+        self.main_box.show_all()
+
+        # Focus search entry - use single delayed attempt
+        def grab_focus_delayed():
+            if self.active and self.search_entry:
+                self.search_entry.grab_focus()
+            return False  # Don't repeat
+
+        GLib.timeout_add(100, grab_focus_delayed)
+
+    def hide(self):
+        """Hide the search panel"""
+        if not self.active:
+            return
+
+        self.active = False
+
+        if self.main_box:
+            self.overlay.remove(self.main_box)
+            self.main_box.destroy()
+            self.main_box = None
+
+        # Clear references
+        self.search_entry = None
+        self.results_tree = None
+        self.tree_model = None
+        self.status_label = None
+        self.current_results = []
+
+        # Return focus to current tab
+        current_tab = self.mypixels.get_current_tab()
+        if current_tab:
+            current_tab.grab_focus()
+
+    def on_case_toggled(self, widget):
+        """Handle case sensitivity toggle"""
+        self.case_sensitive = widget.get_active()
+        # Re-run search with new setting
+        if self.search_text:
+            self.perform_search(self.search_text)
+
+    def on_search_changed(self, widget):
+        """Handle search text changes"""
+        text = widget.get_text()
+        self.search_text = text
+
+        if len(text) < 2:
+            self.tree_model.clear()
+            if len(text) == 0:
+                self.status_label.set_markup('<i>Enter search term</i>')
+            else:
+                self.status_label.set_markup('<i>Type at least 2 characters</i>')
+            return
+
+        self.perform_search(text)
+
+    def on_search_key_press(self, widget, event):
+        """Handle key presses in search entry"""
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        elif event.keyval == Gdk.KEY_Down:
+            # Move focus to results tree
+            if self.results_tree:
+                self.results_tree.grab_focus()
+            return True
+        return False
+
+    def on_tree_key_press(self, widget, event):
+        """Handle key presses in tree view"""
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        elif event.keyval == Gdk.KEY_Return:
+            # Activate selected row
+            selection = self.results_tree.get_selection()
+            model, tree_iter = selection.get_selected()
+            if tree_iter:
+                path = model.get_path(tree_iter)
+                self.on_result_activated(self.results_tree, path, None)
+            return True
+        return False
+
+    def perform_search(self, search_text):
+        """Search across all tabs"""
+        self.tree_model.clear()
+        self.current_results = []
+
+        if not search_text:
+            return
+
+        # Escape special regex characters if not using regex mode
+        import re
+        try:
+            if self.case_sensitive:
+                pattern = re.compile(search_text)
+            else:
+                pattern = re.compile(search_text, re.IGNORECASE)
+        except re.error as e:
+            self.status_label.set_markup(f'<span foreground="red">Invalid pattern: {html.escape(str(e))}</span>')
+            return
+
+        total_matches = 0
+        tabs_with_matches = 0
+        global_match_index = 0
+
+        # Search each tab
+        for i in range(self.notebook.get_n_pages()):
+            tab = self.notebook.get_nth_page(i)
+            if not tab:
+                continue
+
+            # Get tab title
+            tab_title = "Untitled"
+            if tab in self.tabs:
+                params = self.tabs[tab]
+                tab_title = params.get("name", params.get("title", "Untitled"))
+
+            # Extract text from terminal
+            matches = self.search_terminal(tab, pattern)
+
+            if matches:
+                tabs_with_matches += 1
+                match_count = len(matches)
+                total_matches += match_count
+
+                # Add tab header
+                header_text = f"▸ Tab {i+1}: {tab_title} ({match_count} matches)"
+                header_iter = self.tree_model.append(None, [header_text, tab, 0, True, -1])
+
+                # Add matches as children
+                for line_num, line_text, match_start, match_end in matches:
+                    global_match_index += 1
+                    # Create preview with context
+                    preview = self.create_match_preview(line_text, match_start, match_end)
+                    match_text = f"    line {line_num}: {preview}"
+                    self.tree_model.append(header_iter, [match_text, tab, line_num, False, global_match_index])
+                    self.current_results.append((tab, line_num, line_text, match_start, match_end))
+
+        # Update status
+        if total_matches == 0:
+            self.status_label.set_markup(f'<i>No matches found for "{html.escape(search_text)}"</i>')
+        else:
+            self.status_label.set_markup(
+                f'<b>{total_matches}</b> matches in <b>{tabs_with_matches}</b> tabs'
+            )
+
+        # Expand all by default
+        self.results_tree.expand_all()
+
+    def search_terminal(self, terminal, pattern):
+        """Search text in a terminal
+
+        Args:
+            terminal: VTE terminal widget
+            pattern: Compiled regex pattern (from re.compile)
+
+        Returns:
+            List of (line_num, line_text, match_start, match_end) tuples
+        """
+        matches = []
+
+        try:
+            # Use modern VTE API to get text
+            full_text = terminal.get_text_format(Vte.Format.TEXT)
+
+            if not full_text:
+                return matches
+
+            # Split into lines
+            lines = full_text.split('\n')
+
+            for line_num, line in enumerate(lines, 1):
+                # Find all matches in this line
+                for match in pattern.finditer(line):
+                    matches.append((line_num, line, match.start(), match.end()))
+
+        except Exception as e:
+            print(f"Error searching terminal: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return matches
+
+    def create_match_preview(self, line_text, match_start, match_end, context_chars=40):
+        """Create a preview of the match with context
+
+        Args:
+            line_text: Full line text
+            match_start: Start position of match
+            match_end: End position of match
+            context_chars: Number of context characters on each side
+
+        Returns:
+            Formatted preview string with the match highlighted
+        """
+        # Strip the line first to avoid excessive whitespace
+        stripped = line_text.strip()
+        if not stripped:
+            return line_text[:80]  # Return first 80 chars if empty
+
+        # Calculate positions in stripped text
+        # For simplicity, just show the line with ellipsis if too long
+        max_len = 100
+        if len(stripped) > max_len:
+            # Try to center on match
+            if match_start < len(stripped):
+                start_pos = max(0, match_start - context_chars)
+                end_pos = min(len(stripped), match_end + context_chars)
+                preview = stripped[start_pos:end_pos]
+                if start_pos > 0:
+                    preview = "..." + preview
+                if end_pos < len(stripped):
+                    preview = preview + "..."
+                return html.escape(preview)
+            else:
+                return html.escape(stripped[:max_len] + "...")
+        else:
+            return html.escape(stripped)
+
+    def on_result_selected(self, tree_view):
+        """Handle single click on result - highlight but don't close panel"""
+        selection = tree_view.get_selection()
+        model, tree_iter = selection.get_selected()
+
+        if not tree_iter:
+            return
+
+        # Get data from row
+        is_header = model.get_value(tree_iter, 3)
+
+        if is_header:
+            # Don't do anything for headers on single click
+            return
+
+        # Highlight the match without closing panel
+        self.highlight_match(tree_view, tree_iter, close_panel=False)
+
+    def highlight_match(self, tree_view, tree_iter, close_panel=True):
+        """Navigate to a match in the terminal
+
+        Args:
+            tree_view: The tree view widget
+            tree_iter: The tree iterator for the selected row
+            close_panel: Whether to close the panel after navigation
+        """
+        model = tree_view.get_model()
+
+        # Get data from row
+        is_header = model.get_value(tree_iter, 3)
+        tab_widget = model.get_value(tree_iter, 1)
+
+        if is_header:
+            return
+
+        # Match clicked - navigate to tab
+        if tab_widget:
+            # Find tab index
+            for i in range(self.notebook.get_n_pages()):
+                if self.notebook.get_nth_page(i) == tab_widget:
+                    # Switch to tab
+                    self.notebook.set_current_page(i)
+
+                    # Manage focus
+                    if close_panel:
+                        # Closing panel - give focus to terminal
+                        tab_widget.grab_focus()
+                    else:
+                        # Keeping panel open - return focus to search entry
+                        GLib.idle_add(lambda: self.search_entry.grab_focus() if self.active else False)
+                    break
+
+            # Hide panel if requested
+            if close_panel:
+                self.hide()
+
+    def on_result_activated(self, tree_view, path, column):
+        """Handle double-click on result"""
+        model = tree_view.get_model()
+        tree_iter = model.get_iter(path)
+
+        if not tree_iter:
+            return
+
+        # Get data from row
+        is_header = model.get_value(tree_iter, 3)
+
+        if is_header:
+            # Header clicked - toggle expansion
+            if tree_view.row_expanded(path):
+                tree_view.collapse_row(path)
+            else:
+                tree_view.expand_row(path, False)
+            return
+
+        # Double click - highlight and close panel
+        self.highlight_match(tree_view, tree_iter, close_panel=True)
+
+
+class TabMonitor(Gtk.Window):
+    """Floating window showing live preview of a terminal tab"""
+
+    def __init__(self, source_terminal, source_tab_name, config, app):
+        super().__init__(title=f"Monitor: {source_tab_name}")
+
+        self.source_terminal = source_terminal
+        self.config = config
+        self.update_interval = 200  # Update every 200ms
+
+        # Setup window properties for floating in niri/Wayland compositors
+        self.set_default_size(800, 600)  # Larger default size for better readability
+        self.set_decorated(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)  # DIALOG is better recognized as floating
+        self.set_resizable(True)
+        self.set_role("mypixels-monitor")  # Set role for compositor matching
+
+        # Try to set startup notification ID to influence app_id on Wayland
+        self.set_startup_id("mypixels-monitor")
+
+        # Display area for terminal snapshot
+        # Use DrawingArea instead of Image for better resize control
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.connect('draw', self.on_draw)
+        self.add(self.drawing_area)
+
+        # Store the current pixbuf
+        self.current_pixbuf = None
+
+        # Start update loop
+        self.timeout_id = GLib.timeout_add(self.update_interval, self.update_snapshot)
+
+        self.connect('delete-event', self.on_close)
+        self.show_all()
+
+        # Grab focus to prevent Alt-hold issues with tab switcher
+        self.present()
+
+    def capture_terminal_snapshot(self, terminal):
+        """Capture a snapshot of the terminal widget"""
+        alloc = terminal.get_allocation()
+        width = alloc.width
+        height = alloc.height
+
+        if width <= 0 or height <= 0:
+            return None
+
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        context = cairo.Context(surface)
+        terminal.draw(context)
+        pixbuf = Gdk.pixbuf_get_from_surface(surface, 0, 0, width, height)
+
+        return pixbuf
+
+    def on_draw(self, widget, context):
+        """Draw the scaled terminal snapshot"""
+        if self.current_pixbuf is None:
+            return False
+
+        # Get current drawing area size
+        alloc = widget.get_allocation()
+        width = alloc.width
+        height = alloc.height
+
+        if width <= 0 or height <= 0:
+            return False
+
+        # Scale pixbuf to fit
+        scaled = self.current_pixbuf.scale_simple(
+            width,
+            height,
+            GdkPixbuf.InterpType.BILINEAR
+        )
+
+        # Draw the scaled pixbuf
+        Gdk.cairo_set_source_pixbuf(context, scaled, 0, 0)
+        context.paint()
+
+        return False
+
+    def update_snapshot(self):
+        """Capture and display current terminal state"""
+        # Check if source terminal still exists
+        if not self.source_terminal.get_parent():  # Tab closed
+            self.destroy()
+            return False
+
+        pixbuf = self.capture_terminal_snapshot(self.source_terminal)
+        if pixbuf:
+            self.current_pixbuf = pixbuf
+            self.drawing_area.queue_draw()
+
+        return True  # Continue updates
+
+    def on_close(self, widget, event):
+        """Clean up when window is closed"""
+        if self.timeout_id:
+            GLib.source_remove(self.timeout_id)
+            self.timeout_id = None
+        return False
+
+
 class TabList:
     """Manages the tab list/bar display"""
 
@@ -1990,6 +2519,12 @@ class MypixelsWindow:
             self.tabs, self.entangled, self.config, self
         )
 
+        # Search panel for cross-tab search
+        self.search_panel = SearchPanel(
+            self.window, self.overlay, self.notebook,
+            self.tabs, self.config, self
+        )
+
     def transform_keybinds(self):
         # transforms self.keymap ("function->binds") to self.keybinds
         for fn, bind in self.keymap.items():
@@ -2035,6 +2570,7 @@ class MypixelsWindow:
             'rename_tab': (self.rename_tab, None),
 
             'show_search': (self.show_search, None),
+            'show_search_all': (self.show_search_all, None),
 
             'search_prev': (self.search_advance, False),
             'search_next': (self.search_advance, True),
@@ -2046,7 +2582,8 @@ class MypixelsWindow:
             'show_tab_overview': (self.show_tab_overview, None),
 
             'new_window': (self.new_window, None),
-            'send_tab_to_window': (self.send_tab_to_window, None)
+            'send_tab_to_window': (self.send_tab_to_window, None),
+            'monitor_tab': (self.monitor_tab, None)
         }
 
         for i in range(0, 10):
@@ -2788,6 +3325,10 @@ class MypixelsWindow:
     def hide_search(self, param=None):
         self.search_entry.hide()
 
+    def show_search_all(self, param=None):
+        """Show the cross-tab search panel"""
+        self.search_panel.show()
+
     def search_advance(self, forward=True):
         tab = self.get_current_tab()
         if (forward):
@@ -2839,6 +3380,32 @@ class MypixelsWindow:
     def show_tab_overview(self, param=None):
         """Show full tab overview with all windows - delegates to TabOverviewFull class"""
         self.tab_overview_full.show()
+
+    def monitor_tab(self, param=None):
+        """Open a monitor window for the current tab"""
+        # Cancel any pending tab overview timer to prevent Alt-hold issues
+        if self.tab_overview_timer is not None:
+            GLib.source_remove(self.tab_overview_timer)
+            self.tab_overview_timer = None
+
+        # Hide tab overview if active
+        if self.tab_overview.active:
+            self.tab_overview.hide()
+
+        current_page = self.notebook.get_current_page()
+        if current_page < 0:
+            return
+
+        terminal = self.notebook.get_nth_page(current_page)
+        if terminal in self.tabs:
+            tab_info = self.tabs[terminal]
+            tab_name = tab_info.get('tname', 'Unknown')
+        else:
+            tab_name = "Tab"
+
+        # Create monitor window in same process (can't have different app_id on Wayland)
+        # For niri floating, user must match on: app-id="mypixels" AND title regex "^Monitor: "
+        monitor = TabMonitor(terminal, tab_name, self.config, self.app)
 
     def run(self):
         """Deprecated - kept for backward compatibility
