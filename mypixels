@@ -23,12 +23,8 @@
 # TODO: Tagging of consoles - and grouping via those tags (partially done with tab coloring)
 
 import gi
-from gi import pygtkcompat
 gi.require_version('Vte', '2.91')
 gi.require_version('GdkPixbuf', '2.0')
-# pygtkcompat.enable()
-# pygtkcompat.enable_gtk(version='3.0')
-import gobject
 from gi.repository import Vte, GLib, Gtk, Gdk, Pango, Gio, GdkPixbuf
 #import vte
 #import pango
@@ -3668,7 +3664,14 @@ class MypixelsApplication(Gtk.Application):
             unique_id = f"i{int(time.time())}{random.randint(0, 9999)}"
             app_id = f"com.github.volca.mypixels.independent_{unique_id}"
         else:
-            app_id = "com.github.volca.mypixels"
+            # Make the application single-instance per display, not per user session.
+            # This avoids handing activation to an instance on a different DISPLAY.
+            disp = os.environ.get('WAYLAND_DISPLAY') or os.environ.get('DISPLAY') or ''
+            # Sanitize to valid D-Bus element (letters/digits/underscore only)
+            safe = ''.join(c if (c.isalnum() or c == '_') else '_' for c in disp)
+            if not safe or not safe[0].isalpha():
+                safe = f'd_{safe}'
+            app_id = f"com.github.volca.mypixels.{safe}"
 
         super().__init__(
             application_id=app_id,
