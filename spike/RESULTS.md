@@ -117,11 +117,15 @@ redraw storm at single-digit CPU. The port is validated.
   term_font (Terminus->Cascadia) and background_color live re-rendered
   correctly and the shell kept working. `$SPIKE_CONFIG` overrides the config
   path for testing.
+- Font size (enlarge/shrink, `zoom_term`): 1pt steps, unbounded up, floor of
+  1pt down (matches the Python zoom()). Mutates the live `term_pt`, rebuilds
+  the term glyph pool + re-measures the cell + resizes the grid. Config
+  reload resets `term_pt` to the config value. Verified on Xvfb: 9->12 over
+  three enlarges, then down to the 1pt floor (no 0pt).
 
-Not yet ported: search panel (deprioritized), tab overview, rename_tab,
-font size (enlarge/shrink). Scrollback view, selection, IME, copy/paste
-still not implemented (spike is a rendering/emulation perf + config test,
-not a full terminal yet).
+Not yet ported: search panel (deprioritized), tab overview, rename_tab.
+Scrollback view, selection, IME, copy/paste still not implemented (spike is
+a rendering/emulation perf + config test, not a full terminal yet).
 
 ## Remaining validation (manual)
 

@@ -191,6 +191,10 @@ struct App {
     font_system: FontSystem,
     mono_attrs: Attrs<'static>,
     tab_attrs: Attrs<'static>,
+    /// Runtime terminal font state. `term_pt` is the live size (enlarge/
+    /// shrink font mutates it); a config reload resets it to the config value.
+    term_family: &'static str,
+    term_pt: f32,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -301,6 +305,8 @@ impl App {
             font_system,
             mono_attrs,
             tab_attrs,
+            term_family,
+            term_pt,
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -420,21 +426,14 @@ impl App {
         }
     }
 
-    /// Recompute font-derived metrics and rebuild the glyph pools. The base
-    /// Metrics (line height / scale) are baked into each pooled Buffer at
-    /// creation, so a size or family change requires new buffers.
-    fn apply_fonts(&mut self) {
-        let (term_family, term_pt) = config::parse_font(&self.config.term_font);
-        let (tab_family, tab_pt) = config::parse_font(&self.config.tablist_font);
-        let font_px = term_pt * 96.0 / 72.0;
-        let tab_font_px = tab_pt * 96.0 / 72.0;
+    /// Rebuild the terminal font from the live state (`term_family` +
+    /// `term_pt`): attrs, cell metrics, the term glyph pool, and the grid.
+    /// The base Metrics are baked into each pooled Buffer, so a change needs
+    /// new buffers.
+    fn rebuild_term_font(&mut self) {
+        let font_px = self.term_pt * 96.0 / 72.0;
+        self.mono_attrs = Attrs::new().family(Family::Name(self.term_family));
 
-        let term_family: &'static str = Box::leak(term_family.into_boxed_str());
-        let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
-        self.mono_attrs = Attrs::new().family(Family::Name(term_family));
-        self.tab_attrs = Attrs::new().family(Family::Name(tab_family));
-
-        // Measure the terminal cell from the new font.
         let mut measure =
             Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3));
         measure.set_size(Some(800.0), None);
@@ -449,8 +448,30 @@ impl App {
         }
         let cell_w = (total / 4.0).max(1.0);
         let cell_h = font_px * 1.3;
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
 
-        // Measure the tablist character width.
+        if let Some(gpu) = &mut self.gpu {
+            gpu.pool = (0..MAX_RUNS)
+                .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3)))
+                .collect();
+        }
+        // Cell size changed -> the grid that fits the surface changes.
+        self.sync_term_size();
+        log::info!(
+            "term font: {} {:.0}pt; cell = {:.2} x {:.2}",
+            self.term_family, self.term_pt, cell_w, cell_h
+        );
+    }
+
+    /// Rebuild the tablist font from config (family + size): attrs, tab
+    /// metrics, and the tab glyph pool.
+    fn rebuild_tab_font(&mut self) {
+        let (tab_family, tab_pt) = config::parse_font(&self.config.tablist_font);
+        let tab_font_px = tab_pt * 96.0 / 72.0;
+        let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
+        self.tab_attrs = Attrs::new().family(Family::Name(tab_family));
+
         let mut tmeasure =
             Buffer::new(&mut self.font_system, Metrics::new(tab_font_px, tab_font_px * 1.3));
         tmeasure.set_size(Some(800.0), None);
@@ -464,19 +485,11 @@ impl App {
             }
         }
         let tab_char_w = (ttotal / 4.0).max(1.0);
-        let tab_h = tab_font_px * 1.3 + 6.0;
-
-        self.cell_w = cell_w;
-        self.cell_h = cell_h;
         self.tab_char_w = tab_char_w;
-        self.tab_h = tab_h;
+        self.tab_h = tab_font_px * 1.3 + 6.0;
         self.tab_text_h = tab_font_px * 1.3;
 
-        // Rebuild the glyph pools with the new base metrics.
         if let Some(gpu) = &mut self.gpu {
-            gpu.pool = (0..MAX_RUNS)
-                .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3)))
-                .collect();
             gpu.tab_pool = (0..16)
                 .map(|_| {
                     Buffer::new(
@@ -486,13 +499,30 @@ impl App {
                 })
                 .collect();
         }
-
-        // Cell size changed -> the terminal grid that fits the surface changes.
         self.sync_term_size();
+    }
 
-        log::info!(
-            "reload fonts: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}"
-        );
+    /// Full font re-apply from config (used by config_reload). Resets the live
+    /// term size to the config value, then rebuilds both fonts.
+    fn apply_fonts(&mut self) {
+        let (term_family, term_pt) = config::parse_font(&self.config.term_font);
+        self.term_family = Box::leak(term_family.into_boxed_str());
+        self.term_pt = term_pt;
+        self.rebuild_term_font();
+        self.rebuild_tab_font();
+    }
+
+    /// enlarge_font / shrink_font: 1pt steps, unbounded up, floor of 1pt down
+    /// (matching the Python zoom()).
+    fn zoom_term(&mut self, zoom_in: bool) {
+        if zoom_in {
+            self.term_pt += 1.0;
+        } else if self.term_pt > 1.0 {
+            self.term_pt -= 1.0;
+        } else {
+            return;
+        }
+        self.rebuild_term_font();
     }
 
     fn build_frame(&self, tab: &Tab) -> FrameData {
@@ -918,9 +948,11 @@ impl App {
                     self.active = target;
                 }
             },
+            "enlarge_font" => self.zoom_term(true),
+            "shrink_font" => self.zoom_term(false),
             // Not yet ported
             "show_search" | "show_search_all" | "search_prev" | "search_next"
-            | "show_tab_overview" | "rename_tab" | "shrink_font" | "enlarge_font" => {
+            | "show_tab_overview" | "rename_tab" => {
                 log::debug!("unported action: {action}");
             },
             _ => {},
@@ -1053,6 +1085,8 @@ fn parse_key_spec(spec: &str) -> Option<(ModifiersState, Key)> {
         "left" => Key::Named(NamedKey::ArrowLeft),
         "right" => Key::Named(NamedKey::ArrowRight),
         "space" => Key::Named(NamedKey::Space),
+        // "+" can't be written literally (it's the modifier separator).
+        "plus" => Key::Character("+".into()),
         "braceleft" => Key::Character("{".into()),
         "braceright" => Key::Character("}".into()),
         "f1" => Key::Named(NamedKey::F1),
