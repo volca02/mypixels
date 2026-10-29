@@ -93,6 +93,7 @@ impl Tab {
         program: String,
         args: Vec<String>,
         shared: &SpikeListener,
+        history: usize,
     ) -> Tab {
         let listener = SpikeListener {
             wake: Arc::clone(&shared.wake),
@@ -103,7 +104,10 @@ impl Tab {
         };
 
         let term = Arc::new(FairMutex::new(Term::new(
-            TermConfig::default(),
+            TermConfig {
+                scrolling_history: history,
+                ..Default::default()
+            },
             dims,
             listener.clone(),
         )));

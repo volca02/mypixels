@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use glyphon::{Buffer, Cache, FontSystem, Metrics, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport};
+use glyphon::{Buffer, Cache, ColorMode, FontSystem, Metrics, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport};
 use winit::window::Window;
 
-use crate::{FONT_PX, MAX_RUNS, TAB_FONT_PX};
+use crate::MAX_RUNS;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -76,6 +76,8 @@ impl Gpu {
         event_loop: &winit::event_loop::ActiveEventLoop,
         window: &Arc<Window>,
         font_system: &mut FontSystem,
+        font_px: f32,
+        tab_font_px: f32,
     ) -> Gpu {
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
@@ -124,7 +126,11 @@ impl Gpu {
         surface.configure(&device, &config);
 
         let cache = Cache::new(&device);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+        // ColorMode::Web passes the text color through as-is. Accurate would
+        // apply an sRGB->linear conversion in the shader, which would mismatch
+        // our as-is non-sRGB surface and our display-referred sRGB colors.
+        let mut atlas =
+            TextAtlas::with_color_mode(&device, &queue, &cache, format, ColorMode::Web);
         let swash_cache = SwashCache::new();
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
@@ -191,10 +197,10 @@ impl Gpu {
         });
 
         let pool: Vec<Buffer> = (0..MAX_RUNS)
-            .map(|_| Buffer::new(font_system, Metrics::new(FONT_PX, FONT_PX * 1.3)))
+            .map(|_| Buffer::new(font_system, Metrics::new(font_px, font_px * 1.3)))
             .collect();
         let tab_pool: Vec<Buffer> = (0..16)
-            .map(|_| Buffer::new(font_system, Metrics::new(TAB_FONT_PX, TAB_FONT_PX * 1.3)))
+            .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_px * 1.3)))
             .collect();
 
         Gpu {

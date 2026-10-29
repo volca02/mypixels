@@ -30,10 +30,8 @@ use config::Config;
 use gpu::Gpu;
 use tab::{SpikeListener, Tab};
 
-const FONT_PX: f32 = 15.0;
 const HISTORY: usize = 10_000;
 const MAX_RUNS: usize = 4096;
-const TAB_FONT_PX: f32 = 12.0;
 const TAB_PAD: f32 = 6.0;
 
 const PALETTE: [[f32; 3]; 16] = [
@@ -73,10 +71,16 @@ impl Dimensions for Dims {
 #[derive(Clone)]
 struct Palette {
     colors: Box<[Option<[f32; 3]>]>,
+    /// 16-color palette from the config; used when the terminal itself has
+    /// not overridden a slot at runtime (OSC 4).
+    cfg16: Option<[[f32; 3]; 16]>,
 }
 
 impl Palette {
-    fn from_colors(colors: &alacritty_terminal::term::color::Colors) -> Self {
+    fn from_colors(
+        colors: &alacritty_terminal::term::color::Colors,
+        cfg16: &Option<[config::Rgb; 16]>,
+    ) -> Self {
         let mut v = Vec::with_capacity(269);
         for i in 0..269 {
             v.push(match &colors[i] {
@@ -84,7 +88,8 @@ impl Palette {
                 None => None,
             });
         }
-        Self { colors: v.into() }
+        let cfg16 = cfg16.as_ref().map(|p| p.iter().map(|c| c.to_f32()).collect::<Vec<_>>().try_into().unwrap());
+        Self { colors: v.into(), cfg16 }
     }
 
     // Resolve a cell color; fg/bg supplied from config for the default
@@ -101,7 +106,10 @@ impl Palette {
                     }
                 }
                 if i < 16 {
-                    PALETTE[i]
+                    match &self.cfg16 {
+                        Some(p) => p[i],
+                        None => PALETTE[i],
+                    }
                 } else if i == NamedColor::Foreground as usize {
                     fg
                 } else if i == NamedColor::Background as usize {
@@ -120,7 +128,10 @@ impl Palette {
                     }
                 }
                 if *i < 16 {
-                    PALETTE[*i as usize]
+                    match &self.cfg16 {
+                        Some(p) => p[*i as usize],
+                        None => PALETTE[*i as usize],
+                    }
                 } else if (16..232).contains(i) {
                     cube_color(*i)
                 } else {
@@ -168,6 +179,7 @@ struct App {
     cell_h: f32,
     tab_char_w: f32,
     tab_h: f32,
+    tab_text_h: f32,
     tablist_hidden: bool,
     fg: [f32; 3],
     bg: [f32; 3],
@@ -190,10 +202,20 @@ struct App {
 impl App {
     fn new() -> Self {
         let mut font_system = FontSystem::new();
-        let mono_attrs = Attrs::new().family(Family::Monospace);
-        let tab_attrs = Attrs::new().family(Family::Monospace);
+        let config = Config::load();
+        // Pango sizes are points; cosmic-text wants pixels (@96 dpi).
+        let (term_family, term_pt) = config::parse_font(&config.term_font);
+        let (tab_family, tab_pt) = config::parse_font(&config.tablist_font);
+        let font_px = term_pt * 96.0 / 72.0;
+        let tab_font_px = tab_pt * 96.0 / 72.0;
+        // Font size comes from the Buffer Metrics (see Gpu::init), not Attrs.
+        // mono_attrs/tab_attrs are 'static, so the family names must be too.
+        let term_family: &'static str = Box::leak(term_family.into_boxed_str());
+        let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
+        let mono_attrs = Attrs::new().family(Family::Name(term_family));
+        let tab_attrs = Attrs::new().family(Family::Name(tab_family));
 
-        let mut measure = Buffer::new(&mut font_system, Metrics::new(FONT_PX, FONT_PX * 1.3));
+        let mut measure = Buffer::new(&mut font_system, Metrics::new(font_px, font_px * 1.3));
         measure.set_size(Some(800.0), None);
         measure.set_text("MMMM", &mono_attrs, Shaping::Basic, None);
         measure.shape_until_scroll(&mut font_system, false);
@@ -201,13 +223,14 @@ impl App {
         let mut total = 0.0;
         for span in &shaped.spans {
             for word in &span.words {
-                total += word.width(FONT_PX);
+                total += word.width(font_px);
             }
         }
         let cell_w = (total / 4.0).max(1.0);
-        let cell_h = FONT_PX * 1.3;
+        let cell_h = font_px * 1.3;
 
-        let mut tmeasure = Buffer::new(&mut font_system, Metrics::new(TAB_FONT_PX, TAB_FONT_PX * 1.3));
+        let mut tmeasure =
+            Buffer::new(&mut font_system, Metrics::new(tab_font_px, tab_font_px * 1.3));
         tmeasure.set_size(Some(800.0), None);
         tmeasure.set_text("MMMM", &tab_attrs, Shaping::Basic, None);
         tmeasure.shape_until_scroll(&mut font_system, false);
@@ -215,15 +238,16 @@ impl App {
         let mut ttotal = 0.0;
         for span in &tshaped.spans {
             for word in &span.words {
-                ttotal += word.width(TAB_FONT_PX);
+                ttotal += word.width(tab_font_px);
             }
         }
         let tab_char_w = (ttotal / 4.0).max(1.0);
-        let tab_h = TAB_FONT_PX * 1.3 + 6.0;
+        let tab_h = tab_font_px * 1.3 + 6.0;
 
-        log::info!("cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}");
+        log::info!(
+            "font: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}"
+        );
 
-        let config = Config::default();
         let fg = config.foreground_color.to_f32();
         let bg = config.background_color.to_f32();
 
@@ -246,9 +270,12 @@ impl App {
         let wake = Arc::clone(&shared.wake);
         let exited = Arc::clone(&shared.exited);
 
-        let cols = 100;
-        let rows = 30;
+        // Initial grid from the configured window size; the Resized handler
+        // adjusts it once the surface exists.
+        let cols = ((config.default_width as f32 / cell_w) as usize).clamp(20, 512);
+        let rows = (((config.default_height as f32 - tab_h) / cell_h) as usize).clamp(10, 400);
         let dims = Dims { cols, rows };
+        let tablist_hidden = config.tablist_hide;
 
         App {
             config,
@@ -262,7 +289,8 @@ impl App {
             cell_h,
             tab_char_w,
             tab_h,
-            tablist_hidden: false,
+            tab_text_h: tab_font_px * 1.3,
+            tablist_hidden,
             fg,
             bg,
             wake,
@@ -281,7 +309,15 @@ impl App {
     }
 
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
-        self.gpu = Some(Gpu::init(event_loop, window, &mut self.font_system));
+        let (_, term_pt) = config::parse_font(&self.config.term_font);
+        let (_, tab_pt) = config::parse_font(&self.config.tablist_font);
+        self.gpu = Some(Gpu::init(
+            event_loop,
+            window,
+            &mut self.font_system,
+            term_pt * 96.0 / 72.0,
+            tab_pt * 96.0 / 72.0,
+        ));
     }
 
     fn add_tab(&mut self) {
@@ -300,6 +336,7 @@ impl App {
             self.program.clone(),
             self.args.clone(),
             &self.listener(),
+            self.config.scrollback_lines,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -332,6 +369,12 @@ impl App {
         }
     }
 
+    /// Whether the tab strip is currently shown (manual hide flag and
+    /// `hide_single_tab` both apply).
+    fn show_tab_strip(&self) -> bool {
+        !self.tablist_hidden && !(self.config.hide_single_tab && self.tabs.len() <= 1)
+    }
+
     /// Resize terminal grid of all tabs to fit the current surface size.
     fn sync_term_size(&mut self) {
         let (w, h) = match self.gpu.as_ref() {
@@ -341,7 +384,7 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
-        let strip_h = if self.tablist_hidden { 0.0 } else { self.tab_h };
+        let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
         let term_h = (h as f32 - strip_h) as usize;
         let (ncols, nrows) =
             ((w as f32 / self.cell_w) as usize, (term_h as f32 / self.cell_h) as usize);
@@ -367,7 +410,7 @@ impl App {
     fn build_frame(&self, tab: &Tab) -> FrameData {
         let term = tab.term.lock();
         let content = term.renderable_content();
-        let palette = Palette::from_colors(content.colors);
+        let palette = Palette::from_colors(content.colors, &self.config.palette);
         let rows = self.rows;
         let cols = self.cols;
 
@@ -441,7 +484,14 @@ impl App {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        // The active tab is "focused" iff the window has input focus
+        // (covers tab switching, which produces no Focused event).
+        {
+            let active = &self.tabs[self.active];
+            active.term.lock().is_focused = window.has_focus();
+        }
         let frame = self.build_frame(tab);
+        let show_strip = self.show_tab_strip();
         let gpu: &mut Gpu = match self.gpu.as_mut() {
             Some(g) => g,
             None => return,
@@ -453,7 +503,7 @@ impl App {
         let wf = w as f32;
         let hf = h as f32;
 
-        let strip_h = if self.tablist_hidden { 0.0 } else { self.tab_h };
+        let strip_h = if show_strip { self.tab_h } else { 0.0 };
 
         gpu.rects.clear();
         // Convert pixel coords to clip space. Clip is -1..1 on both axes with
@@ -481,7 +531,7 @@ impl App {
         // --- Tab strip ---
         let mut x = 0.0f32;
         let tab_y = 0.0f32;
-        if !self.tablist_hidden {
+        if show_strip {
             let bg4: [f32; 4] = [self.bg[0], self.bg[1], self.bg[2], 1.0];
             push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, self.tab_h, bg4);
             // SAFETY: same pool reasoning as for terminal runs below.
@@ -520,7 +570,7 @@ impl App {
                     let tw = text.chars().count() as f32 * self.tab_char_w + marker_w + TAB_PAD * 2.0;
                     let tbg = if selected { bgc } else { self.config.tab_color_bg.to_f32() };
                     push_rect(&mut gpu.rects, x, tab_y, tw, self.tab_h, [tbg[0], tbg[1], tbg[2], 1.0]);
-                    let ty = tab_y + (self.tab_h - TAB_FONT_PX * 1.3) / 2.0;
+                    let ty = tab_y + (self.tab_h - self.tab_text_h) / 2.0;
                     if t.entangled {
                         push_tab_label(tpool, marker_slot, fs, attrs, "*", x + TAB_PAD, ty, self.config.tab_color_entangle.to_f32(), &mut areas, self.tab_char_w, bounds);
                     }
@@ -533,7 +583,7 @@ impl App {
                 let c = self.config.add_button_color.to_f32();
                 push_rect(&mut gpu.rects, x, tab_y, bw, self.tab_h, [c[0] * 0.3, c[1] * 0.3, c[2] * 0.3, 1.0]);
                 if slot < tpool.len() {
-                    push_tab_label(tpool, slot, fs, attrs, "[+]", x + TAB_PAD, tab_y + (self.tab_h - TAB_FONT_PX * 1.3) / 2.0, c, &mut areas, self.tab_char_w, bounds);
+                    push_tab_label(tpool, slot, fs, attrs, "[+]", x + TAB_PAD, tab_y + (self.tab_h - self.tab_text_h) / 2.0, c, &mut areas, self.tab_char_w, bounds);
                 }
             }
         }
@@ -1031,10 +1081,26 @@ impl ApplicationHandler for App {
                     .create_window(
                         Window::default_attributes()
                             .with_inner_size(size)
+                            .with_maximized(self.config.default_maximize)
                             .with_title("mypixels"),
                     )
                     .expect("window"),
             );
+            // Never keep a window larger than its monitor (the configured
+            // size is usually the whole screen; nested/test displays are
+            // smaller).
+            if !self.config.default_maximize {
+                if let Some(monitor) = window.current_monitor() {
+                    let ms = monitor.size();
+                    let ws = window.inner_size();
+                    if ws.width > ms.width || ws.height > ms.height {
+                        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                            ws.width.min(ms.width),
+                            ws.height.min(ms.height),
+                        ));
+                    }
+                }
+            }
             self.init_gpu(event_loop, &window);
             *self.window_slot.lock().unwrap() = Some(Arc::clone(&window));
             self.window = Some(window);

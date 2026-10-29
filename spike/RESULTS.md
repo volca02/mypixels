@@ -68,6 +68,16 @@ backpressure, no dropped frames on the emulation side.
    colors as linear (double conversion, washed-out colors: #505020 showed
    as (152,152,99) instead of (80,80,32)). Fix: use non-sRGB
    `Bgra8Unorm` so display-referred colors write as-is.
+7. glyphon's `TextAtlas::new` defaults to `ColorMode::Accurate`, which runs
+   an sRGB->linear conversion on the *text* color in its shader. Against our
+   as-is non-sRGB surface that made text too dark (badwolf red #ff2c4b
+   rendered as (255,6,18), its linear encoding, while the matching rect
+   background rendered correctly as (255,44,75)). Fix: build the atlas with
+   `TextAtlas::with_color_mode(.., ColorMode::Web)` so the text color passes
+   through unchanged, matching the rect pipeline and our display-referred
+   sRGB colors. (Note: SGR 30-37/90-97 map to `Color::Named(..)`, not
+   `Indexed(..)`; the 16-color palette override had to apply to the Named
+   branch too, not just Indexed.)
 
 ## Offscreen visual testing (no desktop interference)
 
@@ -90,15 +100,33 @@ write with `timeout 3 sh -c '... > fifo'` in case the reader is down.
 GPU text rendering + alacritty_terminal emulation handles the agentic
 redraw storm at single-digit CPU. The port is validated.
 
+## Ported so far (beyond the rendering spike)
+
+- `config.rs` — loads `~/.mypixels` (YAML, `!!python/tuple` + duplicate-key
+  tolerant) into a `Config` with all visual/behavior defaults from the Python
+  version; keybinding parse ("MOD1+SHIFT+Left", "CONTROL+ALT+x", "MOD1+_1",
+  "SHIFT+KP_Add") and first-match `find_action` dispatch.
+- `main.rs` — real fonts from config (term + tablist, pt->px at 96dpi),
+  default window size from config (clamped to monitor), 16-color palette from
+  config (Named+Indexed branches), config fg/bg/cursor, all tab colors.
+- `tab.rs` — per-tab scrollback from config `scrollback_lines`.
+
+Not yet ported: search panel, tab overview, rename_tab, font size,
+config_reload (live reload) — see the plan. Scrollback view, selection,
+IME, copy/paste still not implemented (spike is a rendering/emulation perf
++ config test, not a full terminal yet).
+
 ## Remaining validation (manual)
 
 Run a real agentic session inside `target/release/spike` and confirm the
-feel (scrollback, selection, IME, copy/paste are NOT implemented in the
-spike — it is a rendering/emulation perf test only).
+feel under load on the real (non-Xvfb) GPU.
 
 ## Files
 
-- `spike/src/main.rs` — the spike (winit 0.30 + wgpu 30 + glyphon 0.12
-  + alacritty_terminal 0.26)
+- `spike/src/main.rs` — app, rendering, key dispatch (winit 0.30 + wgpu 30
+  + glyphon 0.12 + alacritty_terminal 0.26)
+- `spike/src/config.rs` — `~/.mypixels` loading + keybindings
+- `spike/src/tab.rs` — pty + alacritty Terminal per tab
+- `spike/src/gpu.rs` — wgpu surface, rect + glyphon text pipelines
 - `spike/stress.py` — the stress test
 - `spike/cpusample.sh` — CPU sampler (not used in final protocol)
