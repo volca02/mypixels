@@ -59,6 +59,31 @@ backpressure, no dropped frames on the emulation side.
 4. glyphon pool of cosmic_text Buffers: per-run `&mut pool[i]` with
    long-lived shared refs needs a documented raw-pointer cast
    (disjoint indices, stable vec).
+5. Custom rect vertex shader used pixel coords straight as clip space
+   (`vec4(pos,0,1)`). A rect at pixel (0,0) lands at clip center, so the
+   selected-tab background flooded the whole visible clip quadrant (a huge
+   tan block). Fix: convert pixel->clip in the CPU, flipping y (clip +y is
+   up, screen y is down): `cx=(px/w)*2-1, cy=1-(py/h)*2`.
+6. Surface format was `Bgra8UnormSrgb`; wgpu re-encoded our already-sRGB
+   colors as linear (double conversion, washed-out colors: #505020 showed
+   as (152,152,99) instead of (80,80,32)). Fix: use non-sRGB
+   `Bgra8Unorm` so display-referred colors write as-is.
+
+## Offscreen visual testing (no desktop interference)
+
+Run the spike under an Xvfb X server and capture the root with ImageMagick
+`import`. No Wayland compositor, no focus stealing, fully scriptable.
+
+```sh
+Xvfb :99 -screen 0 1280x720x24 &
+mkfifo /tmp/spikekeys
+env -u WAYLAND_DISPLAY DISPLAY=:99 SPIKE_KEYS=/tmp/spikekeys \
+  ./target/debug/spike sh &
+DISPLAY=:99 import -window root /tmp/cap.png
+```
+
+`SPIKE_KEYS` FIFO feeds key specs (and `spy` to dump state). Guard each
+write with `timeout 3 sh -c '... > fifo'` in case the reader is down.
 
 ## Verdict
 

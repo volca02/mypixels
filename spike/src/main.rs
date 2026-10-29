@@ -1,42 +1,40 @@
-//! Spike: alacritty_terminal (emulation + pty + reader event loop) rendered
-//! with glyphon (cosmic_text) on wgpu in a winit window.
+//! mypixels (Rust port): tabbed terminal.
+//! alacritty_terminal (emulation + pty) rendered with glyphon (cosmic_text)
+//! on wgpu in a winit window.
 //!
-//! Goal: measure redraw performance under agentic-style full-screen redraw
-//! storms compared to VTE (mypixels), alacritty, and ghostty.
-//!
-//! Usage: spike [command [args...]]   (defaults to bash)
+//! Usage: mypixels-rs [command [args...]]   (defaults to $SHELL or bash)
 
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::OnceLock;
+mod config;
+mod gpu;
+mod tab;
 
-static TRACE_T0: OnceLock<std::time::Instant> = OnceLock::new();
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
-use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoopSender, Msg};
+use alacritty_terminal::event::WindowSize;
+use alacritty_terminal::event_loop::Msg;
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::tty::{self, Options, Shell};
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Family, FontSystem, Metrics, Resolution, Shaping, TextArea, TextBounds,
 };
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
+
+use config::Config;
+use gpu::Gpu;
+use tab::{SpikeListener, Tab};
 
 const FONT_PX: f32 = 15.0;
 const HISTORY: usize = 10_000;
 const MAX_RUNS: usize = 4096;
+const TAB_FONT_PX: f32 = 12.0;
+const TAB_PAD: f32 = 6.0;
 
 const PALETTE: [[f32; 3]; 16] = [
     [0.0, 0.0, 0.0], [0.8, 0.2, 0.2], [0.2, 0.6, 0.2], [0.6, 0.6, 0.2],
@@ -45,9 +43,7 @@ const PALETTE: [[f32; 3]; 16] = [
     [0.4, 0.4, 1.0], [1.0, 0.4, 1.0], [0.4, 1.0, 1.0], [1.0, 1.0, 1.0],
 ];
 
-const DEFAULT_FG: [f32; 3] = [0.85, 0.85, 0.85];
-const DEFAULT_BG: [f32; 3] = [0.12, 0.12, 0.14];
-const CURSOR_COLOR: [f32; 3] = [0.55, 0.55, 0.6];
+static TRACE_T0: OnceLock<Instant> = OnceLock::new();
 
 fn cube_color(i: u8) -> [f32; 3] {
     let i = (i - 16) as usize;
@@ -56,13 +52,31 @@ fn cube_color(i: u8) -> [f32; 3] {
     [c(r), c(g), c(b)]
 }
 
+#[derive(Clone, Copy)]
+struct Dims {
+    cols: usize,
+    rows: usize,
+}
+
+impl Dimensions for Dims {
+    fn total_lines(&self) -> usize {
+        self.rows + HISTORY
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
 #[derive(Clone)]
 struct Palette {
     colors: Box<[Option<[f32; 3]>]>,
 }
 
 impl Palette {
-    fn from_colors(colors: &Colors) -> Self {
+    fn from_colors(colors: &alacritty_terminal::term::color::Colors) -> Self {
         let mut v = Vec::with_capacity(269);
         for i in 0..269 {
             v.push(match &colors[i] {
@@ -73,7 +87,10 @@ impl Palette {
         Self { colors: v.into() }
     }
 
-    fn resolve(&self, c: &Color) -> [f32; 3] {
+    // Resolve a cell color; fg/bg supplied from config for the default
+    // foreground/background/cursor named colors.
+    fn resolve_with(&self, c: &alacritty_terminal::vte::ansi::Color, fg: [f32; 3], bg: [f32; 3]) -> [f32; 3] {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
         match c {
             Color::Spec(rgb) => [rgb.r as f32 / 255.0, rgb.g as f32 / 255.0, rgb.b as f32 / 255.0],
             Color::Named(n) => {
@@ -86,9 +103,9 @@ impl Palette {
                 if i < 16 {
                     PALETTE[i]
                 } else if i == NamedColor::Foreground as usize {
-                    DEFAULT_FG
+                    fg
                 } else if i == NamedColor::Background as usize {
-                    DEFAULT_BG
+                    bg
                 } else if i == NamedColor::Cursor as usize {
                     CURSOR_COLOR
                 } else {
@@ -115,65 +132,7 @@ impl Palette {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dimensions
-// ---------------------------------------------------------------------------
-
-struct Dims {
-    cols: usize,
-    rows: usize,
-}
-
-impl Dimensions for Dims {
-    fn total_lines(&self) -> usize {
-        self.rows + HISTORY
-    }
-    fn screen_lines(&self) -> usize {
-        self.rows
-    }
-    fn columns(&self) -> usize {
-        self.cols
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Event listener (runs on the terminal event loop thread)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct SpikeListener {
-    wake: Arc<AtomicBool>,
-    quit: Arc<AtomicBool>,
-    window: Arc<Mutex<Option<Arc<Window>>>>,
-}
-
-impl SpikeListener {
-    fn notify_window(&self) {
-        if let Some(w) = self.window.lock().unwrap().as_ref() {
-            w.request_redraw();
-        }
-    }
-}
-
-impl EventListener for SpikeListener {
-    fn send_event(&self, event: Event) {
-        match event {
-            Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {
-                self.wake.store(true, Ordering::SeqCst);
-                self.notify_window();
-            },
-            Event::Title(t) => {
-                log::info!("title: {t}");
-            },
-            Event::Exit | Event::ChildExit(_) => {
-                self.quit.store(true, Ordering::SeqCst);
-                self.wake.store(true, Ordering::SeqCst);
-                self.notify_window();
-            },
-            _ => {},
-        }
-    }
-}
+const CURSOR_COLOR: [f32; 3] = [0.55, 0.55, 0.6];
 
 // ---------------------------------------------------------------------------
 // Draw list (owned data copied out of the terminal under the lock)
@@ -194,101 +153,47 @@ struct FrameData {
 }
 
 // ---------------------------------------------------------------------------
-// GPU state
-// ---------------------------------------------------------------------------
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct RectVertex {
-    pos: [f32; 2],
-    color: [f32; 4],
-}
-
-const RECT_VS_WGSL: &str = r#"
-struct VSOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
-};
-@vertex
-fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> VSOut {
-    return VSOut(vec4<f32>(pos, 0.0, 1.0), color);
-}
-"#;
-
-const RECT_FS_WGSL: &str = r#"
-@fragment
-fn fs(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
-    return color;
-}
-"#;
-
-struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    rect_pipeline: wgpu::RenderPipeline,
-    rect_buffer: wgpu::Buffer,
-    viewport: Viewport,
-    atlas: TextAtlas,
-    swash_cache: SwashCache,
-    text_renderer: TextRenderer,
-    rects: Vec<RectVertex>,
-    pool: Vec<Buffer>,
-}
-
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn raw_waker() -> RawWaker {
-        fn noop(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            raw_waker()
-        }
-        RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone, noop, noop, noop))
-    }
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = Box::pin(fut);
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
 struct App {
-    term: Arc<FairMutex<Term<SpikeListener>>>,
-    sender: EventLoopSender,
+    config: Config,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_id: usize,
+    dims: Dims,
+    cols: usize,
+    rows: usize,
+    cell_w: f32,
+    cell_h: f32,
+    tab_char_w: f32,
+    tab_h: f32,
+    tablist_hidden: bool,
+    fg: [f32; 3],
+    bg: [f32; 3],
     wake: Arc<AtomicBool>,
-    quit: Arc<AtomicBool>,
-    term_loop: std::thread::JoinHandle<(
-        alacritty_terminal::event_loop::EventLoop<alacritty_terminal::tty::Pty, SpikeListener>,
-        alacritty_terminal::event_loop::State,
-    )>,
+    exited: Arc<Mutex<Vec<usize>>>,
     window_slot: Arc<Mutex<Option<Arc<Window>>>>,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     font_system: FontSystem,
     mono_attrs: Attrs<'static>,
-    modifiers: winit::keyboard::ModifiersState,
-    cell_w: f32,
-    cell_h: f32,
-    cols: usize,
-    rows: usize,
+    tab_attrs: Attrs<'static>,
+    modifiers: ModifiersState,
+    program: String,
+    args: Vec<String>,
+    /// Test hook: receiver of key specs fed from the $SPIKE_KEYS FIFO by a
+    /// reader thread (about_to_wait is rarely called on Wayland).
+    key_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl App {
     fn new() -> Self {
         let mut font_system = FontSystem::new();
         let mono_attrs = Attrs::new().family(Family::Monospace);
+        let tab_attrs = Attrs::new().family(Family::Monospace);
 
-        let mut measure =
-            Buffer::new(&mut font_system, Metrics::new(FONT_PX, FONT_PX * 1.3));
+        let mut measure = Buffer::new(&mut font_system, Metrics::new(FONT_PX, FONT_PX * 1.3));
         measure.set_size(Some(800.0), None);
         measure.set_text("MMMM", &mono_attrs, Shaping::Basic, None);
         measure.shape_until_scroll(&mut font_system, false);
@@ -301,81 +206,133 @@ impl App {
         }
         let cell_w = (total / 4.0).max(1.0);
         let cell_h = FONT_PX * 1.3;
-        log::info!("cell = {cell_w:.2} x {cell_h:.2} @ {FONT_PX}px monospace");
+
+        let mut tmeasure = Buffer::new(&mut font_system, Metrics::new(TAB_FONT_PX, TAB_FONT_PX * 1.3));
+        tmeasure.set_size(Some(800.0), None);
+        tmeasure.set_text("MMMM", &tab_attrs, Shaping::Basic, None);
+        tmeasure.shape_until_scroll(&mut font_system, false);
+        let tshaped = tmeasure.lines[0].shape(&mut font_system, 8);
+        let mut ttotal = 0.0;
+        for span in &tshaped.spans {
+            for word in &span.words {
+                ttotal += word.width(TAB_FONT_PX);
+            }
+        }
+        let tab_char_w = (ttotal / 4.0).max(1.0);
+        let tab_h = TAB_FONT_PX * 1.3 + 6.0;
+
+        log::info!("cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}");
+
+        let config = Config::default();
+        let fg = config.foreground_color.to_f32();
+        let bg = config.background_color.to_f32();
+
+        let args: Vec<String> = std::env::args().collect();
+        let (program, args) = if args.len() > 1 {
+            (args[1].clone(), args[2..].to_vec())
+        } else {
+            (std::env::var("SHELL").unwrap_or_else(|_| "bash".into()), vec![])
+        };
+
+        let window_slot = Arc::new(Mutex::new(None));
+        let key_rx = spawn_key_reader(Arc::clone(&window_slot));
+        let shared = SpikeListener {
+            wake: Arc::new(AtomicBool::new(false)),
+            window: Arc::clone(&window_slot),
+            tab_id: 0,
+            title: Arc::new(Mutex::new(String::new())),
+            exited: Arc::new(Mutex::new(Vec::new())),
+        };
+        let wake = Arc::clone(&shared.wake);
+        let exited = Arc::clone(&shared.exited);
 
         let cols = 100;
         let rows = 30;
-        let window_slot = Arc::new(Mutex::new(None));
-        let listener = SpikeListener {
-            wake: Arc::new(AtomicBool::new(false)),
-            quit: Arc::new(AtomicBool::new(false)),
-            window: Arc::clone(&window_slot),
-        };
-        let wake = Arc::clone(&listener.wake);
-        let quit = Arc::clone(&listener.quit);
-
-        let term = Arc::new(FairMutex::new(Term::new(
-            TermConfig::default(),
-            &Dims { cols, rows },
-            listener.clone(),
-        )));
-
-        let args: Vec<String> = std::env::args().collect();
-        let (program, program_args) = if args.len() > 1 {
-            (args[1].clone(), args[2..].to_vec())
-        } else {
-            ("bash".to_string(), vec![])
-        };
-
-        tty::setup_env();
-        let pty = tty::new(
-            &Options {
-                shell: Some(Shell::new(program, program_args)),
-                working_directory: None,
-                drain_on_exit: false,
-                env: HashMap::new(),
-            },
-            WindowSize {
-                num_lines: rows as u16,
-                num_cols: cols as u16,
-                cell_width: cell_w as u16,
-                cell_height: cell_h as u16,
-            },
-            0,
-        )
-        .expect("failed to open pty");
-
-        let loop_ = alacritty_terminal::event_loop::EventLoop::new(
-            Arc::clone(&term),
-            listener.clone(),
-            pty,
-            false,
-            false,
-        )
-        .expect("terminal event loop");
-        let sender = loop_.channel();
-        let term_loop = loop_.spawn();
+        let dims = Dims { cols, rows };
 
         App {
-            term,
-            sender,
+            config,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 0,
+            dims,
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            tab_char_w,
+            tab_h,
+            tablist_hidden: false,
+            fg,
+            bg,
             wake,
-            quit,
-            term_loop,
+            exited,
             window_slot,
             window: None,
             gpu: None,
             font_system,
             mono_attrs,
-            modifiers: winit::keyboard::ModifiersState::empty(),
-            cell_w,
-            cell_h,
-            cols,
-            rows,
+            tab_attrs,
+            modifiers: ModifiersState::empty(),
+            program,
+            args,
+            key_rx,
         }
     }
 
-    /// Resize the terminal grid (and pty) to match the current surface size.
+    fn init_gpu(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
+        self.gpu = Some(Gpu::init(event_loop, window, &mut self.font_system));
+    }
+
+    fn add_tab(&mut self) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let window_size = WindowSize {
+            num_lines: self.rows as u16,
+            num_cols: self.cols as u16,
+            cell_width: self.cell_w as u16,
+            cell_height: self.cell_h as u16,
+        };
+        let tab = Tab::new(
+            id,
+            &self.dims,
+            window_size,
+            self.program.clone(),
+            self.args.clone(),
+            &self.listener(),
+        );
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+    }
+
+    fn listener(&self) -> SpikeListener {
+        SpikeListener {
+            wake: Arc::clone(&self.wake),
+            window: Arc::clone(&self.window_slot),
+            tab_id: 0,
+            title: Arc::new(Mutex::new(String::new())),
+            exited: Arc::clone(&self.exited),
+        }
+    }
+
+    fn close_tab_at(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        // Stable ids: find the id of the tab being removed
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+    }
+
+    /// Resize terminal grid of all tabs to fit the current surface size.
     fn sync_term_size(&mut self) {
         let (w, h) = match self.gpu.as_ref() {
             Some(g) => (g.config.width, g.config.height),
@@ -384,141 +341,31 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
-        let (ncols, nrows) = ((w as f32 / self.cell_w) as usize, (h as f32 / self.cell_h) as usize);
+        let strip_h = if self.tablist_hidden { 0.0 } else { self.tab_h };
+        let term_h = (h as f32 - strip_h) as usize;
+        let (ncols, nrows) =
+            ((w as f32 / self.cell_w) as usize, (term_h as f32 / self.cell_h) as usize);
         if (ncols, nrows) != (self.cols, self.rows) {
             eprintln!("term resize: {}x{} -> {}x{}", self.cols, self.rows, ncols, nrows);
             self.cols = ncols;
             self.rows = nrows;
-            let dims = Dims { cols: ncols, rows: nrows };
-            self.term.lock().resize(dims);
-            let _ = self.sender.send(Msg::Resize(WindowSize {
+            self.dims.cols = ncols;
+            self.dims.rows = nrows;
+            let window_size = WindowSize {
                 num_lines: nrows as u16,
                 num_cols: ncols as u16,
                 cell_width: self.cell_w as u16,
                 cell_height: self.cell_h as u16,
-            }));
+            };
+            for tab in &self.tabs {
+                tab.term.lock().resize(self.dims);
+                let _ = tab.sender.send(Msg::Resize(window_size));
+            }
         }
     }
 
-    fn init_gpu(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
-            Box::new(event_loop.owned_display_handle()),
-        ));
-        let surface = instance.create_surface(window.clone()).expect("surface");
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            ..Default::default()
-        }))
-        .expect("no adapter");
-        log::info!("adapter: {}", adapter.get_info().name);
-        let (device, queue) =
-            block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("no device");
-
-        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let (width, height) = (window.inner_size().width.max(1), window.inner_size().height.max(1));
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Mailbox,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-        };
-        surface.configure(&device, &config);
-
-        let cache = Cache::new(&device);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let swash_cache = SwashCache::new();
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let mut viewport = Viewport::new(&device, &cache);
-        viewport.update(&queue, Resolution { width, height });
-
-        let rect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rects"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor::default())),
-            vertex: wgpu::VertexState {
-                module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rect.vs"),
-                    source: wgpu::ShaderSource::Wgsl(RECT_VS_WGSL.into()),
-                }),
-                compilation_options: Default::default(),
-                entry_point: Some("vs"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<RectVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x4,
-                        },
-                    ],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rect.fs"),
-                    source: wgpu::ShaderSource::Wgsl(RECT_FS_WGSL.into()),
-                }),
-                compilation_options: Default::default(),
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let rect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rects"),
-            size: (1024 * 24) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pool: Vec<Buffer> = (0..MAX_RUNS)
-            .map(|_| Buffer::new(&mut self.font_system, Metrics::new(FONT_PX, self.cell_h)))
-            .collect();
-
-        self.gpu = Some(Gpu {
-            device,
-            queue,
-            surface,
-            config,
-            rect_pipeline,
-            rect_buffer,
-            viewport,
-            atlas,
-            swash_cache,
-            text_renderer,
-            rects: Vec::with_capacity(1024),
-            pool,
-        });
-    }
-
-    // Copy visible terminal content into an owned draw list.
-    fn build_frame(&self) -> FrameData {
-        let term = self.term.lock();
+    fn build_frame(&self, tab: &Tab) -> FrameData {
+        let term = tab.term.lock();
         let content = term.renderable_content();
         let palette = Palette::from_colors(content.colors);
         let rows = self.rows;
@@ -547,8 +394,8 @@ impl App {
                 glyph.extend(zw.iter());
             }
 
-            let fg = palette.resolve(&cell.fg);
-            let bg = palette.resolve(&cell.bg);
+            let fg = palette.resolve_with(&cell.fg, self.fg, self.bg);
+            let bg = palette.resolve_with(&cell.bg, self.fg, self.bg);
 
             match cur.as_mut() {
                 Some(r)
@@ -591,75 +438,148 @@ impl App {
     }
 
     fn draw(&mut self, window: &Window) {
-        let frame = self.build_frame();
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let frame = self.build_frame(tab);
         let gpu: &mut Gpu = match self.gpu.as_mut() {
             Some(g) => g,
             None => return,
         };
-        // Render to the surface's actual size so the full background always
-        // covers the presented texture (no gray gap if inner_size lags).
         let (w, h) = (gpu.config.width, gpu.config.height);
         if w == 0 || h == 0 {
             return;
         }
-        let (win_w, win_h) = (window.inner_size().width, window.inner_size().height);
-        if (win_w, win_h) != (w, h) {
-            eprintln!("draw size mismatch: window {}x{} vs surface {}x{}", win_w, win_h, w, h);
+        let wf = w as f32;
+        let hf = h as f32;
+
+        let strip_h = if self.tablist_hidden { 0.0 } else { self.tab_h };
+
+        gpu.rects.clear();
+        // Convert pixel coords to clip space. Clip is -1..1 on both axes with
+        // +y pointing up, screen pixels have y pointing down, so flip y.
+        let push_rect =
+            |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
+                let clip = |px: f32, py: f32| -> [f32; 2] {
+                    [(px / wf) * 2.0 - 1.0, 1.0 - (py / hf) * 2.0]
+                };
+                v.push(gpu::RectVertex { pos: clip(x, y), color: c });
+                v.push(gpu::RectVertex { pos: clip(x + rw, y), color: c });
+                v.push(gpu::RectVertex { pos: clip(x, y + rh), color: c });
+                v.push(gpu::RectVertex { pos: clip(x, y + rh), color: c });
+                v.push(gpu::RectVertex { pos: clip(x + rw, y), color: c });
+                v.push(gpu::RectVertex { pos: clip(x + rw, y + rh), color: c });
+            };
+
+        // Window background
+        push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, h as f32, [self.bg[0], self.bg[1], self.bg[2], 1.0]);
+
+        // --- Text areas (tab labels + terminal runs), one prepare() per frame ---
+        let mut areas: Vec<TextArea> = Vec::new();
+        let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+
+        // --- Tab strip ---
+        let mut x = 0.0f32;
+        let tab_y = 0.0f32;
+        if !self.tablist_hidden {
+            let bg4: [f32; 4] = [self.bg[0], self.bg[1], self.bg[2], 1.0];
+            push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, self.tab_h, bg4);
+            // SAFETY: same pool reasoning as for terminal runs below.
+            {
+                let fs = &mut self.font_system;
+                let attrs = &self.tab_attrs;
+                let tpool = &mut gpu.tab_pool;
+                // Each label needs its own pool slot. An entangled tab takes a
+                // second slot for the red * marker (two areas sharing one
+                // Buffer would both draw the buffer's current contents).
+                let usable = tpool.len() - 1; // reserve the last slot for [+]
+                let mut slot = 0usize;
+                for (i, t) in self.tabs.iter().enumerate() {
+                    let need = if t.entangled { 2 } else { 1 };
+                    if slot + need > usable {
+                        break;
+                    }
+                    let marker_slot = slot;
+                    let label_slot = slot + (if t.entangled { 1 } else { 0 });
+                    let selected = i == self.active;
+                    let (fgc, bgc) = if selected {
+                        (self.config.tab_color_fg_selected.to_f32(), self.config.tab_color_bg_selected.to_f32())
+                    } else {
+                        (self.config.tab_color_fg.to_f32(), self.config.tab_color_bg.to_f32())
+                    };
+                    let fgc = if t.group < 8 { self.config.col[t.group].to_f32() } else { fgc };
+                    let text = tab_label(
+                        t,
+                        i,
+                        selected,
+                        self.config.tab_title_max_length,
+                        self.config.tab_title_short_current,
+                        &self.config.tab_shorten_str,
+                    );
+                    let marker_w = if t.entangled { self.tab_char_w } else { 0.0 };
+                    let tw = text.chars().count() as f32 * self.tab_char_w + marker_w + TAB_PAD * 2.0;
+                    let tbg = if selected { bgc } else { self.config.tab_color_bg.to_f32() };
+                    push_rect(&mut gpu.rects, x, tab_y, tw, self.tab_h, [tbg[0], tbg[1], tbg[2], 1.0]);
+                    let ty = tab_y + (self.tab_h - TAB_FONT_PX * 1.3) / 2.0;
+                    if t.entangled {
+                        push_tab_label(tpool, marker_slot, fs, attrs, "*", x + TAB_PAD, ty, self.config.tab_color_entangle.to_f32(), &mut areas, self.tab_char_w, bounds);
+                    }
+                    push_tab_label(tpool, label_slot, fs, attrs, &text, x + TAB_PAD + marker_w, ty, fgc, &mut areas, self.tab_char_w, bounds);
+                    slot += need;
+                    x += tw;
+                }
+                // [+] add button
+                let bw = 2.0 * self.tab_char_w + TAB_PAD * 2.0;
+                let c = self.config.add_button_color.to_f32();
+                push_rect(&mut gpu.rects, x, tab_y, bw, self.tab_h, [c[0] * 0.3, c[1] * 0.3, c[2] * 0.3, 1.0]);
+                if slot < tpool.len() {
+                    push_tab_label(tpool, slot, fs, attrs, "[+]", x + TAB_PAD, tab_y + (self.tab_h - TAB_FONT_PX * 1.3) / 2.0, c, &mut areas, self.tab_char_w, bounds);
+                }
+            }
         }
 
-        // --- Rects: full background, cell backgrounds, cursor ---
-        gpu.rects.clear();
-        let mut push_rect = |v: &mut Vec<RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
-            v.push(RectVertex { pos: [x, y], color: c });
-            v.push(RectVertex { pos: [x + rw, y], color: c });
-            v.push(RectVertex { pos: [x, y + rh], color: c });
-            v.push(RectVertex { pos: [x, y + rh], color: c });
-            v.push(RectVertex { pos: [x + rw, y], color: c });
-            v.push(RectVertex { pos: [x + rw, y + rh], color: c });
-        };
-        let bg4: [f32; 4] = [DEFAULT_BG[0], DEFAULT_BG[1], DEFAULT_BG[2], 1.0];
-        push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, h as f32, bg4);
-
+        // --- Terminal: cell backgrounds ---
         for run in &frame.runs {
-            let same_bg = (run.bg[0] - DEFAULT_BG[0]).abs() < 0.004
-                && (run.bg[1] - DEFAULT_BG[1]).abs() < 0.004
-                && (run.bg[2] - DEFAULT_BG[2]).abs() < 0.004;
+            let same_bg = (run.bg[0] - self.bg[0]).abs() < 0.004
+                && (run.bg[1] - self.bg[1]).abs() < 0.004
+                && (run.bg[2] - self.bg[2]).abs() < 0.004;
             if !same_bg {
                 push_rect(
                     &mut gpu.rects,
                     run.col as f32 * self.cell_w,
-                    run.row as f32 * self.cell_h,
+                    strip_h + run.row as f32 * self.cell_h,
                     run.width as f32 * self.cell_w,
                     self.cell_h,
                     [run.bg[0], run.bg[1], run.bg[2], 1.0],
                 );
             }
         }
-
+        // Cursor
         if let Some((cx, cy)) = frame.cursor {
             push_rect(
                 &mut gpu.rects,
                 cx as f32 * self.cell_w,
-                cy as f32 * self.cell_h,
+                strip_h + cy as f32 * self.cell_h,
                 self.cell_w,
                 self.cell_h,
                 [CURSOR_COLOR[0], CURSOR_COLOR[1], CURSOR_COLOR[2], 0.35],
             );
         }
 
-        // --- Text: one pooled buffer per run ---
-        // SAFETY: pool indices are disjoint (run index < MAX_RUNS, no aliasing),
-        // the pool Vec never reallocates after init, and the derived shared
-        // references are only used this frame, before any further pool writes.
-        let mut areas: Vec<TextArea> = Vec::new();
+        // --- Terminal text ---
+        // SAFETY: pool indices are disjoint (run index < MAX_RUNS), the pool
+        // never reallocates after init, and the derived shared references are
+        // only used this frame, before any further pool writes.
         {
             let fs = &mut self.font_system;
             let attrs = &self.mono_attrs;
             let pool = &mut gpu.pool;
             for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
                 let blank = run.text.chars().all(|c| c == ' ');
-                let default_fg = (run.fg[0] - DEFAULT_FG[0]).abs() + (run.fg[1] - DEFAULT_FG[1]).abs()
-                    + (run.fg[2] - DEFAULT_FG[2]).abs() < 0.01;
+                let default_fg =
+                    (run.fg[0] - self.fg[0]).abs() + (run.fg[1] - self.fg[1]).abs()
+                        + (run.fg[2] - self.fg[2]).abs()
+                        < 0.01;
                 if blank && default_fg {
                     continue;
                 }
@@ -673,15 +593,10 @@ impl App {
                 areas.push(TextArea {
                     buffer: buf,
                     left: run.col as f32 * self.cell_w,
-                    top: run.row as f32 * self.cell_h,
+                    top: strip_h + run.row as f32 * self.cell_h,
                     scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: w as i32,
-                        bottom: h as i32,
-                    },
-                    default_color: GColor::rgb(
+                    bounds,
+                    default_color: glyphon::Color::rgb(
                         (run.fg[0] * 255.0) as u8,
                         (run.fg[1] * 255.0) as u8,
                         (run.fg[2] * 255.0) as u8,
@@ -691,8 +606,10 @@ impl App {
             }
         }
 
-        // Debug: log a hash of what we drew each frame (set SPIKE_TRACE to enable)
+        gpu.render_frame(&mut self.font_system, areas, window);
+
         if std::env::var("SPIKE_TRACE").is_ok() {
+            let t0 = *TRACE_T0.get_or_init(Instant::now);
             let mut h: u64 = 0xcbf29ce484222325;
             for run in &frame.runs {
                 for b in run.text.as_bytes() {
@@ -700,99 +617,325 @@ impl App {
                     h = h.wrapping_mul(0x100000001b3);
                 }
             }
-            let t0 = *TRACE_T0.get_or_init(std::time::Instant::now);
-            eprintln!("{:?} {} {:?}", std::time::Instant::now().duration_since(t0), h, frame.cursor);
+            eprintln!("{:?} {} {:?}", Instant::now().duration_since(t0), h, frame.cursor);
         }
-
-        // --- Render ---
-        let frame_tex = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                // Texture is still usable. Present it; Resized handler will
-                // reconfigure the surface if the window actually changed size.
-                f
-            },
-            other => {
-                // No texture right now (compositor busy / occluded). Try again.
-                if matches!(other, wgpu::CurrentSurfaceTexture::Timeout) {
-                    log::debug!("surface timeout, will retry");
-                }
-                window.request_redraw();
-                return;
-            },
-        };
-        let view = frame_tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder =
-            gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frame"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            pass.set_pipeline(&gpu.rect_pipeline);
-            if gpu.rects.len() * 24 > gpu.rect_buffer.size() as usize {
-                gpu.rect_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("rects"),
-                    size: (gpu.rects.len() * 48) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            }
-            gpu.queue
-                .write_buffer(&gpu.rect_buffer, 0, bytemuck::cast_slice(&gpu.rects));
-            pass.set_vertex_buffer(0, gpu.rect_buffer.slice(..));
-            pass.draw(0..gpu.rects.len() as u32, 0..1);
-
-            gpu.text_renderer
-                .prepare(
-                    &gpu.device,
-                    &gpu.queue,
-                    &mut self.font_system,
-                    &mut gpu.atlas,
-                    &gpu.viewport,
-                    areas,
-                    &mut gpu.swash_cache,
-                )
-                .expect("prepare");
-            gpu.text_renderer
-                .render(&gpu.atlas, &gpu.viewport, &mut pass)
-                .expect("render");
-        }
-        gpu.queue.submit(Some(encoder.finish()));
-        gpu.queue.present(frame_tex);
     }
 
-    fn write_pty(&self, bytes: &[u8]) {
-        let _ = self.sender.send(Msg::Input(Cow::Owned(bytes.to_vec())));
+    // -----------------------------------------------------------------------
+    // Actions
+    // -----------------------------------------------------------------------
+
+    /// Test hook: drain key specs from the $SPIKE_KEYS reader thread and feed
+    /// them through the same path as real key events.
+    fn drain_test_keys(&mut self, event_loop: &ActiveEventLoop) {
+        let rx = match self.key_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+        let mut specs = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            specs.push(line);
+        }
+        if specs.is_empty() {
+            return;
+        }
+        for line in &specs {
+            if line == "spy" {
+                // Test hook: dump tab state
+                let state: Vec<String> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let title = t.display_title().chars().take(30).collect::<String>();
+                        format!("{i}[:{}](g{}e{}){}", t.id, t.group, if t.entangled { 1 } else { 0 }, title)
+                    })
+                    .collect();
+                let cursor = match self.tabs.get(self.active) {
+                    Some(t) => {
+                        let c = t.term.lock().renderable_content().cursor;
+                        let focus = t.term.lock().is_focused;
+                        format!("shape={:?} point=({},{}) focus={}", c.shape, c.point.column.0, c.point.line.0, focus)
+                    },
+                    None => "-".to_string(),
+                };
+                let surf = match self.gpu.as_ref() {
+                    Some(g) => format!("{}x{}", g.config.width, g.config.height),
+                    None => "-".to_string(),
+                };
+                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}]", self.active, surf, cursor, state.join(","));
+                continue;
+            }
+            if let Some((mods, key)) = parse_key_spec(line) {
+                self.modifiers = mods;
+                self.handle_key(&key, event_loop);
+            }
+        }
+        if let Some(window) = self.window.as_ref() {
+            self.wake.store(true, Ordering::SeqCst);
+            window.request_redraw();
+        }
+    }
+
+    fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+        // 1. Configured bindings
+        let overview_active = false; // overview not ported yet
+        if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
+            self.do_action(&action, event_loop);
+            return;
+        }
+        // 2. Everything else goes to the active terminal
+        if let Some(bytes) = key_bytes(key, self.modifiers) {
+            if let Some(tab) = self.tabs.get(self.active) {
+                // Entanglement: type into all entangled tabs
+                if self.tabs[self.active].entangled {
+                    for t in &self.tabs {
+                        if t.entangled {
+                            t.write(&bytes);
+                        }
+                    }
+                } else {
+                    tab.write(&bytes);
+                }
+            }
+        }
+    }
+
+    fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
+        let n = self.tabs.len();
+        match action {
+            "new_tab" => self.add_tab(),
+            "close_tab" => self.close_tab_at(self.active, event_loop),
+            "prev_tab" | "prev_tab_row" => {
+                if n > 1 {
+                    self.active = (self.active + n - 1) % n;
+                }
+            },
+            "next_tab" | "next_tab_row" => {
+                if n > 1 {
+                    self.active = (self.active + 1) % n;
+                }
+            },
+            "first_tab" => self.active = 0,
+            "last_tab" => self.active = n.saturating_sub(1),
+            "move_prev_tab" => {
+                if n > 1 && self.active > 0 {
+                    self.tabs.swap(self.active, self.active - 1);
+                    self.active -= 1;
+                }
+            },
+            "move_next_tab" => {
+                if n > 1 && self.active < n - 1 {
+                    self.tabs.swap(self.active, self.active + 1);
+                    self.active += 1;
+                }
+            },
+            "move_first_tab" => {
+                if n > 1 && self.active > 0 {
+                    let t = self.tabs.remove(self.active);
+                    self.tabs.insert(0, t);
+                    self.active = 0;
+                }
+            },
+            "move_last_tab" => {
+                if n > 1 && self.active < n - 1 {
+                    let t = self.tabs.remove(self.active);
+                    self.tabs.push(t);
+                    self.active = n - 1;
+                }
+            },
+            "toggle_entangle" => {
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    t.entangled = !t.entangled;
+                }
+            },
+            "next_color" => {
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    t.group = if t.group >= 8 { 0 } else { t.group + 1 };
+                }
+            },
+            "prev_color" => {
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    t.group = if t.group <= 0 || t.group >= 8 { 7 } else { t.group - 1 };
+                }
+            },
+            "toggle_hide_tabs" => {
+                self.tablist_hidden = !self.tablist_hidden;
+                self.sync_term_size();
+            },
+            "config_reload" => log::info!("config reload (not implemented in port yet)"),
+            "goto_tab_0" | "goto_tab_1" | "goto_tab_2" | "goto_tab_3" | "goto_tab_4"
+            | "goto_tab_5" | "goto_tab_6" | "goto_tab_7" | "goto_tab_8" | "goto_tab_9" => {
+                let i = action.chars().last().unwrap().to_digit(10).unwrap() as usize;
+                let target = if i == 0 { n.saturating_sub(1) } else { i - 1 };
+                if target < n {
+                    self.active = target;
+                }
+            },
+            // Not yet ported
+            "show_search" | "show_search_all" | "search_prev" | "search_next"
+            | "show_tab_overview" | "rename_tab" | "shrink_font" | "enlarge_font" => {
+                log::debug!("unported action: {action}");
+            },
+            _ => {},
+        }
+        self.wake.store(true, Ordering::SeqCst);
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 }
 
-fn key_bytes(k: &winit::event::KeyEvent, mods: winit::keyboard::ModifiersState) -> Option<Vec<u8>> {
-    if k.state != winit::event::ElementState::Pressed {
-        return None;
+/// Build the tab strip label text, mimicking the Python tab_format.
+fn tab_label(
+    t: &Tab,
+    idx: usize,
+    selected: bool,
+    max_len: usize,
+    cur_len: usize,
+    shorten: &str,
+) -> String {
+    let mut name = t.display_title();
+    let limit = if selected { cur_len } else { max_len };
+    if limit > 0 && name.chars().count() > limit {
+        name = name.chars().take(limit).collect::<String>() + shorten;
     }
-    use winit::keyboard::ModifiersState;
-    let ctrl = mods.contains(ModifiersState::CONTROL);
-    let alt = mods.contains(ModifiersState::ALT);
+    let marker = if t.entangled { "*" } else { "" };
+    let _ = idx;
+    format!("[{marker}{name}]")
+}
+/// Shape a short tab-strip label into a TextArea using the tab pool.
+/// SAFETY: pool indices are unique per call (caller passes distinct slots);
+/// the pool never reallocates after init; the derived shared reference is
+/// only used this frame.
+fn push_tab_label(
+    tpool: &mut [Buffer],
+    slot: usize,
+    fs: &mut FontSystem,
+    attrs: &Attrs,
+    text: &str,
+    x: f32,
+    y: f32,
+    color: [f32; 3],
+    areas: &mut Vec<TextArea>,
+    char_w: f32,
+    bounds: TextBounds,
+) {
+    let b = &mut tpool[slot];
+    b.set_size(None, None);
+    b.set_text(text, attrs, Shaping::Basic, None);
+    b.set_monospace_width(Some(char_w));
+    b.shape_until_scroll(fs, false);
+    let buf: &Buffer = unsafe { &*(b as *const Buffer) };
+    areas.push(TextArea {
+        buffer: buf,
+        left: x,
+        top: y,
+        scale: 1.0,
+        bounds,
+        default_color: glyphon::Color::rgb(
+            (color[0] * 255.0) as u8,
+            (color[1] * 255.0) as u8,
+            (color[2] * 255.0) as u8,
+        ),
+        custom_glyphs: &[],
+    });
+}
+/// Parse a test key spec like "alt+shift+t", "ctrl+c", "esc", "f5".
+/// Test hook: read key specs from the $SPIKE_KEYS FIFO in a background
+/// thread and forward them over a channel. Returns None when unset.
+fn spawn_key_reader(
+    window_slot: Arc<Mutex<Option<Arc<Window>>>>,
+) -> Option<std::sync::mpsc::Receiver<String>> {
+    let path = std::env::var("SPIKE_KEYS").ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        // A FIFO returns EOF when every writer closes. Our test harness opens
+        // and closes the FIFO per line, so reopen after each EOF and keep the
+        // reader alive (File::open blocks until the next writer attaches).
+        loop {
+            let Ok(file) = std::fs::File::open(&path) else {
+                return;
+            };
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else {
+                    break; // EOF: reopen below
+                };
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                if tx.send(line).is_err() {
+                    return;
+                }
+                // Wake the UI thread so the spec is processed promptly.
+                if let Some(window) = window_slot.lock().unwrap().as_ref() {
+                    window.request_redraw();
+                }
+            }
+        }
+    });
+    Some(rx)
+}
+
+fn parse_key_spec(spec: &str) -> Option<(ModifiersState, Key)> {
+    let mut mods = ModifiersState::empty();
+    let mut keypart = "";
+    for part in spec.split('+') {
+        match part {
+            "alt" => mods |= ModifiersState::ALT,
+            "ctrl" | "control" => mods |= ModifiersState::CONTROL,
+            "shift" => mods |= ModifiersState::SHIFT,
+            "super" => mods |= ModifiersState::SUPER,
+            other => keypart = other,
+        }
+    }
+    let key = match keypart {
+        "" => return None,
+        "esc" | "escape" => Key::Named(NamedKey::Escape),
+        "return" | "enter" => Key::Named(NamedKey::Enter),
+        "tab" => Key::Named(NamedKey::Tab),
+        "backspace" => Key::Named(NamedKey::Backspace),
+        "delete" | "del" => Key::Named(NamedKey::Delete),
+        "home" => Key::Named(NamedKey::Home),
+        "end" => Key::Named(NamedKey::End),
+        "pgup" => Key::Named(NamedKey::PageUp),
+        "pgdn" | "pagedown" => Key::Named(NamedKey::PageDown),
+        "up" => Key::Named(NamedKey::ArrowUp),
+        "down" => Key::Named(NamedKey::ArrowDown),
+        "left" => Key::Named(NamedKey::ArrowLeft),
+        "right" => Key::Named(NamedKey::ArrowRight),
+        "space" => Key::Named(NamedKey::Space),
+        "braceleft" => Key::Character("{".into()),
+        "braceright" => Key::Character("}".into()),
+        "f1" => Key::Named(NamedKey::F1),
+        "f2" => Key::Named(NamedKey::F2),
+        "f3" => Key::Named(NamedKey::F3),
+        "f4" => Key::Named(NamedKey::F4),
+        "f5" => Key::Named(NamedKey::F5),
+        "f6" => Key::Named(NamedKey::F6),
+        "f7" => Key::Named(NamedKey::F7),
+        "f8" => Key::Named(NamedKey::F8),
+        "f9" => Key::Named(NamedKey::F9),
+        "f10" => Key::Named(NamedKey::F10),
+        "f11" => Key::Named(NamedKey::F11),
+        "f12" => Key::Named(NamedKey::F12),
+        c if c.chars().count() == 1 => Key::Character(c.into()),
+        _ => return None,
+    };
+    Some((mods, key))
+}
+
+fn key_bytes(k: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
+    let ctrl = mods.control_key();
+    let alt = mods.alt_key();
     let esc_seq = |body: &[u8]| -> Vec<u8> {
         let mut v = vec![0x1b];
         v.extend_from_slice(body);
         v
     };
-    match &k.logical_key {
+    match k {
         Key::Character(c) => {
             if ctrl {
                 Some(match c.as_str() {
@@ -881,25 +1024,30 @@ impl ApplicationHandler for App {
         if self.window.is_none() {
             let size = winit::dpi::PhysicalSize::new(
                 (self.cols as f32 * self.cell_w) as u32,
-                (self.rows as f32 * self.cell_h) as u32,
+                (self.rows as f32 * self.cell_h + self.tab_h) as u32,
             );
             let window = Arc::new(
                 event_loop
                     .create_window(
                         Window::default_attributes()
                             .with_inner_size(size)
-                            .with_title("spike"),
+                            .with_title("mypixels"),
                     )
                     .expect("window"),
             );
             self.init_gpu(event_loop, &window);
             *self.window_slot.lock().unwrap() = Some(Arc::clone(&window));
             self.window = Some(window);
-            // The window may already be at its final (tiled) size; the
-            // terminal was created at the initial guess. Sync now so the
-            // first Resized event doesn't find size == config and skip.
             self.sync_term_size();
+            if self.tabs.is_empty() {
+                self.add_tab();
+            }
         }
+        let _ = event_loop;
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.drain_test_keys(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -911,28 +1059,46 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             },
             WindowEvent::RedrawRequested => {
+                self.drain_test_keys(event_loop);
+                // Drain tabs whose child exited
+                let mut to_close: Vec<usize> = Vec::new();
+                {
+                    let mut exited = self.exited.lock().unwrap();
+                    if !exited.is_empty() {
+                        to_close = exited.drain(..).collect();
+                    }
+                }
+                if !to_close.is_empty() {
+                    // map stable ids back to current indices (ids are stable)
+                    for id in to_close.iter().rev() {
+                        if let Some(pos) = self.tabs.iter().position(|t| t.id == *id) {
+                            self.close_tab_at(pos, event_loop);
+                        }
+                    }
+                    if self.tabs.is_empty() {
+                        return;
+                    }
+                }
                 if self.wake.swap(false, Ordering::SeqCst) {
                     self.draw(&window);
                 }
-                if self.quit.load(Ordering::SeqCst) {
-                    event_loop.exit();
-                }
             },
             WindowEvent::KeyboardInput { event: key, .. } => {
-                if let Some(bytes) = key_bytes(&key, self.modifiers) {
-                    self.write_pty(&bytes);
+                if key.state == ElementState::Pressed && !key.repeat {
+                    self.handle_key(&key.logical_key, event_loop);
                 }
             },
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
             },
             WindowEvent::Focused(focused) => {
-                self.term.lock().is_focused = focused;
+                if let Some(tab) = self.tabs.get(self.active) {
+                    tab.term.lock().is_focused = focused;
+                }
                 self.wake.store(true, Ordering::SeqCst);
                 window.request_redraw();
             },
             WindowEvent::Resized(size) => {
-                eprintln!("resized: {}x{}", size.width, size.height);
                 if let Some(gpu) = self.gpu.as_mut() {
                     if size.width > 0
                         && size.height > 0
@@ -954,7 +1120,9 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        let _ = self.sender.send(Msg::Shutdown);
+        for tab in self.tabs.iter() {
+            let _ = tab.sender.send(Msg::Shutdown);
+        }
     }
 }
 
