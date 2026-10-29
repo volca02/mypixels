@@ -110,11 +110,18 @@ redraw storm at single-digit CPU. The port is validated.
   default window size from config (clamped to monitor), 16-color palette from
   config (Named+Indexed branches), config fg/bg/cursor, all tab colors.
 - `tab.rs` — per-tab scrollback from config `scrollback_lines`.
+- Live `config_reload` (Ctrl+Shift+R): re-reads the file and re-applies what
+  can be re-applied. Colors/palette/tab colors/bindings are read at draw time
+  (so swapping the struct covers them); a font change rebuilds the glyph pools
+  + re-measures the cell + resizes the grid. Verified on Xvfb: changing
+  term_font (Terminus->Cascadia) and background_color live re-rendered
+  correctly and the shell kept working. `$SPIKE_CONFIG` overrides the config
+  path for testing.
 
-Not yet ported: search panel, tab overview, rename_tab, font size,
-config_reload (live reload) — see the plan. Scrollback view, selection,
-IME, copy/paste still not implemented (spike is a rendering/emulation perf
-+ config test, not a full terminal yet).
+Not yet ported: search panel (deprioritized), tab overview, rename_tab,
+font size (enlarge/shrink). Scrollback view, selection, IME, copy/paste
+still not implemented (spike is a rendering/emulation perf + config test,
+not a full terminal yet).
 
 ## Remaining validation (manual)
 

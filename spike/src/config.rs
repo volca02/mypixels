@@ -222,10 +222,17 @@ impl Config {
     /// every other key replaces the default when present in the file.
     pub fn load() -> Config {
         let mut cfg = Config::default();
-        let Some(home) = dirs::home_dir() else {
-            return cfg;
+        // $SPIKE_CONFIG overrides the path (used for testing reloads without
+        // touching the real ~/.mypixels).
+        let path = match std::env::var("SPIKE_CONFIG") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let Some(home) = dirs::home_dir() else {
+                    return cfg;
+                };
+                home.join(".mypixels")
+            }
         };
-        let path = home.join(".mypixels");
         let Ok(text) = std::fs::read_to_string(&path) else {
             eprintln!("no config file at {}, using defaults", path.display());
             return cfg;

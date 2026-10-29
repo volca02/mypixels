@@ -407,6 +407,94 @@ impl App {
         }
     }
 
+    /// Re-apply everything a config reload can change. Colors, palette, tab
+    /// colors, bindings and tablist visibility are read from `self.config` at
+    /// draw time, so swapping the struct (done by the caller) covers them. We
+    /// only need to recompute the values copied into App at startup: fg/bg and,
+    /// when the font changed, the cell metrics + glyph pools.
+    fn apply_config(&mut self, font_changed: bool) {
+        self.fg = self.config.foreground_color.to_f32();
+        self.bg = self.config.background_color.to_f32();
+        if font_changed {
+            self.apply_fonts();
+        }
+    }
+
+    /// Recompute font-derived metrics and rebuild the glyph pools. The base
+    /// Metrics (line height / scale) are baked into each pooled Buffer at
+    /// creation, so a size or family change requires new buffers.
+    fn apply_fonts(&mut self) {
+        let (term_family, term_pt) = config::parse_font(&self.config.term_font);
+        let (tab_family, tab_pt) = config::parse_font(&self.config.tablist_font);
+        let font_px = term_pt * 96.0 / 72.0;
+        let tab_font_px = tab_pt * 96.0 / 72.0;
+
+        let term_family: &'static str = Box::leak(term_family.into_boxed_str());
+        let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
+        self.mono_attrs = Attrs::new().family(Family::Name(term_family));
+        self.tab_attrs = Attrs::new().family(Family::Name(tab_family));
+
+        // Measure the terminal cell from the new font.
+        let mut measure =
+            Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3));
+        measure.set_size(Some(800.0), None);
+        measure.set_text("MMMM", &self.mono_attrs, Shaping::Basic, None);
+        measure.shape_until_scroll(&mut self.font_system, false);
+        let shaped = measure.lines[0].shape(&mut self.font_system, 8);
+        let mut total = 0.0;
+        for span in &shaped.spans {
+            for word in &span.words {
+                total += word.width(font_px);
+            }
+        }
+        let cell_w = (total / 4.0).max(1.0);
+        let cell_h = font_px * 1.3;
+
+        // Measure the tablist character width.
+        let mut tmeasure =
+            Buffer::new(&mut self.font_system, Metrics::new(tab_font_px, tab_font_px * 1.3));
+        tmeasure.set_size(Some(800.0), None);
+        tmeasure.set_text("MMMM", &self.tab_attrs, Shaping::Basic, None);
+        tmeasure.shape_until_scroll(&mut self.font_system, false);
+        let tshaped = tmeasure.lines[0].shape(&mut self.font_system, 8);
+        let mut ttotal = 0.0;
+        for span in &tshaped.spans {
+            for word in &span.words {
+                ttotal += word.width(tab_font_px);
+            }
+        }
+        let tab_char_w = (ttotal / 4.0).max(1.0);
+        let tab_h = tab_font_px * 1.3 + 6.0;
+
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        self.tab_char_w = tab_char_w;
+        self.tab_h = tab_h;
+        self.tab_text_h = tab_font_px * 1.3;
+
+        // Rebuild the glyph pools with the new base metrics.
+        if let Some(gpu) = &mut self.gpu {
+            gpu.pool = (0..MAX_RUNS)
+                .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3)))
+                .collect();
+            gpu.tab_pool = (0..16)
+                .map(|_| {
+                    Buffer::new(
+                        &mut self.font_system,
+                        Metrics::new(tab_font_px, tab_font_px * 1.3),
+                    )
+                })
+                .collect();
+        }
+
+        // Cell size changed -> the terminal grid that fits the surface changes.
+        self.sync_term_size();
+
+        log::info!(
+            "reload fonts: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}"
+        );
+    }
+
     fn build_frame(&self, tab: &Tab) -> FrameData {
         let term = tab.term.lock();
         let content = term.renderable_content();
@@ -813,7 +901,15 @@ impl App {
                 self.tablist_hidden = !self.tablist_hidden;
                 self.sync_term_size();
             },
-            "config_reload" => log::info!("config reload (not implemented in port yet)"),
+            "config_reload" => {
+                let old_term = self.config.term_font.clone();
+                let old_tab = self.config.tablist_font.clone();
+                self.config = Config::load();
+                let font_changed =
+                    old_term != self.config.term_font || old_tab != self.config.tablist_font;
+                self.apply_config(font_changed);
+                log::info!("config reloaded");
+            },
             "goto_tab_0" | "goto_tab_1" | "goto_tab_2" | "goto_tab_3" | "goto_tab_4"
             | "goto_tab_5" | "goto_tab_6" | "goto_tab_7" | "goto_tab_8" | "goto_tab_9" => {
                 let i = action.chars().last().unwrap().to_digit(10).unwrap() as usize;
