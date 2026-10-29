@@ -375,6 +375,31 @@ impl App {
         }
     }
 
+    /// Resize the terminal grid (and pty) to match the current surface size.
+    fn sync_term_size(&mut self) {
+        let (w, h) = match self.gpu.as_ref() {
+            Some(g) => (g.config.width, g.config.height),
+            None => return,
+        };
+        if w == 0 || h == 0 {
+            return;
+        }
+        let (ncols, nrows) = ((w as f32 / self.cell_w) as usize, (h as f32 / self.cell_h) as usize);
+        if (ncols, nrows) != (self.cols, self.rows) {
+            eprintln!("term resize: {}x{} -> {}x{}", self.cols, self.rows, ncols, nrows);
+            self.cols = ncols;
+            self.rows = nrows;
+            let dims = Dims { cols: ncols, rows: nrows };
+            self.term.lock().resize(dims);
+            let _ = self.sender.send(Msg::Resize(WindowSize {
+                num_lines: nrows as u16,
+                num_cols: ncols as u16,
+                cell_width: self.cell_w as u16,
+                cell_height: self.cell_h as u16,
+            }));
+        }
+    }
+
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(event_loop.owned_display_handle()),
@@ -471,7 +496,7 @@ impl App {
             mapped_at_creation: false,
         });
 
-        let pool = (0..MAX_RUNS)
+        let pool: Vec<Buffer> = (0..MAX_RUNS)
             .map(|_| Buffer::new(&mut self.font_system, Metrics::new(FONT_PX, self.cell_h)))
             .collect();
 
@@ -567,34 +592,19 @@ impl App {
 
     fn draw(&mut self, window: &Window) {
         let frame = self.build_frame();
-        let gpu = match self.gpu.as_mut() {
+        let gpu: &mut Gpu = match self.gpu.as_mut() {
             Some(g) => g,
             None => return,
         };
-        let (w, h) = (window.inner_size().width, window.inner_size().height);
+        // Render to the surface's actual size so the full background always
+        // covers the presented texture (no gray gap if inner_size lags).
+        let (w, h) = (gpu.config.width, gpu.config.height);
         if w == 0 || h == 0 {
             return;
         }
-
-        if w != gpu.config.width || h != gpu.config.height {
-            gpu.config.width = w;
-            gpu.config.height = h;
-            gpu.surface.configure(&gpu.device, &gpu.config);
-            gpu.viewport.update(&gpu.queue, Resolution { width: w, height: h });
-
-            let (ncols, nrows) = ((w as f32 / self.cell_w) as usize, (h as f32 / self.cell_h) as usize);
-            if (ncols, nrows) != (self.cols, self.rows) {
-                self.cols = ncols;
-                self.rows = nrows;
-                let dims = Dims { cols: ncols, rows: nrows };
-                self.term.lock().resize(dims);
-                let _ = self.sender.send(Msg::Resize(WindowSize {
-                    num_lines: nrows as u16,
-                    num_cols: ncols as u16,
-                    cell_width: self.cell_w as u16,
-                    cell_height: self.cell_h as u16,
-                }));
-            }
+        let (win_w, win_h) = (window.inner_size().width, window.inner_size().height);
+        if (win_w, win_h) != (w, h) {
+            eprintln!("draw size mismatch: window {}x{} vs surface {}x{}", win_w, win_h, w, h);
         }
 
         // --- Rects: full background, cell backgrounds, cursor ---
@@ -829,6 +839,7 @@ fn key_bytes(k: &winit::event::KeyEvent, mods: winit::keyboard::ModifiersState) 
             }
         },
         Key::Named(n) => Some(match n {
+            NamedKey::Space => vec![0x20],
             NamedKey::Enter => vec![0x0d],
             NamedKey::Backspace => vec![0x7f],
             NamedKey::Tab => vec![0x09],
@@ -884,6 +895,10 @@ impl ApplicationHandler for App {
             self.init_gpu(event_loop, &window);
             *self.window_slot.lock().unwrap() = Some(Arc::clone(&window));
             self.window = Some(window);
+            // The window may already be at its final (tiled) size; the
+            // terminal was created at the initial guess. Sync now so the
+            // first Resized event doesn't find size == config and skip.
+            self.sync_term_size();
         }
     }
 
@@ -917,6 +932,7 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             },
             WindowEvent::Resized(size) => {
+                eprintln!("resized: {}x{}", size.width, size.height);
                 if let Some(gpu) = self.gpu.as_mut() {
                     if size.width > 0
                         && size.height > 0
@@ -927,24 +943,9 @@ impl ApplicationHandler for App {
                         gpu.surface.configure(&gpu.device, &gpu.config);
                         gpu.viewport
                             .update(&gpu.queue, Resolution { width: size.width, height: size.height });
-
-                        let (ncols, nrows) =
-                            ((size.width as f32 / self.cell_w) as usize,
-                             (size.height as f32 / self.cell_h) as usize);
-                        if (ncols, nrows) != (self.cols, self.rows) {
-                            self.cols = ncols;
-                            self.rows = nrows;
-                            let dims = Dims { cols: ncols, rows: nrows };
-                            self.term.lock().resize(dims);
-                            let _ = self.sender.send(Msg::Resize(WindowSize {
-                                num_lines: nrows as u16,
-                                num_cols: ncols as u16,
-                                cell_width: self.cell_w as u16,
-                                cell_height: self.cell_h as u16,
-                            }));
-                        }
                     }
                 }
+                self.sync_term_size();
                 self.wake.store(true, Ordering::SeqCst);
                 window.request_redraw();
             },
