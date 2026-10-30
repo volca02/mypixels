@@ -68,7 +68,26 @@ their notes: the causes were rarely where the symptom pointed.
 - The reference app runs offscreen with `HOME=/tmp/pyhome`, whose `.zshrc` prints a
   ruler; that is how the 7x15 cell and 21px strip were measured.
 
-## Switcher previews are colour blocks, not a downscale (open)
+## Switcher previews: real downscaled frames, one tile per frame (mostly done)
+
+Shipped: the selected tab's tile samples a real render. Its screen is shaped into
+a `Buffer` of its own -- one line per terminal row, gaps padded with spaces so
+columns land on the grid -- drawn into an offscreen texture at window size, and
+sampled back into the tile by a new pipeline with a 4x4 box filter. The other
+tiles still draw the tinted colour blocks, and that is the right fallback: only
+one tab per frame is affordable (see the budget note below).
+
+What is left:
+
+- Only the selected tile is real. Round-robin one more tab per frame, skipping
+  tabs whose `frame_sig` is unchanged, so a grid of eight fills in over a second.
+- A faithful downscale of a mostly-black terminal is mostly black: the real tile
+  reads dimmer than the bright blocks next to it. If that is annoying, lift it in
+  the sampling shader rather than in the offscreen render.
+- The same pass now makes a true see-through switcher possible: the offscreen
+  target already holds a complete frame per tab.
+
+Old notes, kept because the causes were not obvious:
 
 `draw_overview` paints one tinted block per non-blank run (the run's own
 foreground at 0.62 alpha). It reads as "where is the text" and nothing else. The
@@ -100,18 +119,24 @@ no blending.
 active tab's runs are deliberately never shaped (`if self.overview.is_some() {
 break }` in the text loop), because glyphon draws all text after all rects and
 terminal text would bleed through the tiles. So the offscreen pass cannot share
-the main pass's areas -- it needs its own shaping, about 25ms for a full grid in
-release. That is affordable because the switcher refreshes on a 150ms cadence and
-only the selected tile has to be real every refresh; the rest can come round-robin
-one tab per frame, invalidated on damage. Rendering all tabs every frame is
-40-250ms and dead on arrival.
+the main pass's areas -- it shapes its own. That is cheaper than it sounds once
+the padding is trimmed (below): about 4ms for a 545x150 screen in release, and
+the overview frame as a whole costs 7ms against 30ms for a plain frame, because
+the terminal's own text is suppressed while the overlay is up.
 
 **Landmine 2: `gpu.pool` is not free either.** `draw_overview` takes slots from
 the same pool for tile headers and index chips, in the same frame, so preview
-areas cannot use those slots. Either reserve a slice of the pool for previews, or
-put a whole screen into a single `Buffer` -- monospace, one row per `shape_once`,
-lines padded with spaces so columns land where they belong -- which needs one
-buffer per preview instead of thousands of shared slots.
+areas cannot use those slots. Solved by the single-buffer route: `prev_bufs` is
+one `Buffer` per tab, holding a whole screen as `set_rich_text` spans (`\n` inside
+a span starts a new line), with `set_metrics(cell_w, cell_h)` so rows advance one
+cell. It needs one buffer per preview instead of thousands of shared slots, and
+`frame_sig` means an unchanged screen is redrawn but never re-shaped.
+
+**Landmine 3, found while measuring: end-of-line padding.** Runs carry their
+trailing spaces out to the end of the line. Invisible, and fatal: 545 of them per
+row is 80k glyphs a refresh, and the overview took seconds to draw one frame.
+`preview_spans` trims them and drops all-padding runs, which is most of the
+difference between unusable and 4ms.
 
 The same pass also closes the see-through switcher: the reason the tiles are
 opaque today is that overlay text and terminal text share one pass.

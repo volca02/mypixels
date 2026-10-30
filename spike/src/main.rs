@@ -1237,6 +1237,55 @@ impl App {
         }
 
         let t_text = t_start.elapsed();
+        // One tab per frame gets a real render: the tile you are pointing at. Its
+        // screen is shaped into a buffer of its own -- the shared pool is spent on
+        // tile headers in this same frame -- then drawn into an offscreen target by
+        // `render_frame` and sampled back into the tile, filtered.
+        let mut jobs: Vec<gpu::PreviewJob> = Vec::new();
+        let mut previewed: Option<usize> = None;
+        if let Some(ov) = &self.overview {
+            let sel = ov.selected.min(self.tabs.len().saturating_sub(1));
+            if let Some(fd) = ov_frames.get(sel) {
+                gpu.ensure_previews(self.tabs.len(), (w, h), &mut self.font_system);
+                let sig = frame_sig(fd, self.cell_w);
+                if gpu.prev_sigs.get(sel).copied().unwrap_or(0) != sig {
+                    if let Some(b) = gpu.prev_bufs.get_mut(sel) {
+                        b.set_metrics(glyphon::Metrics::new(self.cell_w, self.cell_h));
+                        b.set_size(Some(self.cols as f32 * self.cell_w), None);
+                        b.set_monospace_width(Some(self.cell_w));
+                        b.set_rich_text(
+                            preview_spans(fd, self.rows, &self.mono_attrs)
+                                .iter()
+                                .map(|(s, a)| (s.as_str(), a.clone())),
+                            &self.mono_attrs,
+                            Shaping::Basic,
+                            None,
+                        );
+                        b.shape_until_scroll(&mut self.font_system, false);
+                    }
+                    gpu.set_prev_sig(sel, sig);
+                }
+                jobs.push(gpu::PreviewJob {
+                    idx: sel,
+                    top: strip_h,
+                    bounds,
+                    default_fg: self.fg,
+                    rects: preview_rects(
+                        fd,
+                        &self.bg,
+                        &self.config.tablist_background.to_f32(),
+                        &self.fg,
+                        self.cell_w,
+                        self.cell_h,
+                        strip_h,
+                        self.rows,
+                        w,
+                        h,
+                    ),
+                });
+                previewed = Some(sel);
+            }
+        }
         if let Some(ov) = &self.overview {
             draw_overview(
                 &mut gpu,
@@ -1245,6 +1294,7 @@ impl App {
                 &ov_frames,
                 ov.mode,
                 ov.selected,
+                previewed,
                 &self.config,
                 &self.tab_attrs,
                 self.tab_text_h,
@@ -1261,7 +1311,7 @@ impl App {
             // cached signature is stale once the overview has drawn.
             gpu.slot_sig.fill(0);
         }
-        gpu.render_frame(&mut self.font_system, areas, window);
+        gpu.render_frame(&mut self.font_system, areas, jobs, window);
         self.gpu = Some(gpu);
 
         if std::env::var("SPIKE_TRACE").is_ok() {
@@ -1911,6 +1961,139 @@ fn push_ov_text(
 /// Render the standalone tab overview: a dark backdrop, a two-line banner, and
 /// a centred grid of tiles. Each tile shows the tab's group colour, its title,
 /// and a scaled thumbnail of the terminal content (built from `frames`).
+/// Signature of a whole frame, so a preview buffer is only re-shaped when its
+/// tab actually changed. Same idea as `run_sig`, folded over the frame.
+fn frame_sig(fd: &FrameData, cell_w: f32) -> u64 {
+    fn mix(h: &mut u64, v: u64) {
+        *h ^= v;
+        *h = h.wrapping_mul(0x100000001b3);
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    mix(
+        &mut h,
+        fd.cursor
+            .map(|c| (c.0 as u64) << 32 | c.1 as u64)
+            .unwrap_or(u64::MAX),
+    );
+    mix(&mut h, fd.runs.len() as u64);
+    for run in &fd.runs {
+        mix(&mut h, run.row as u64);
+        mix(&mut h, run.col as u64);
+        mix(&mut h, run.width as u64);
+        for b in run.text.as_bytes() {
+            mix(&mut h, *b as u64);
+        }
+        for c in run.fg.iter().chain(run.bg.iter()) {
+            mix(&mut h, (c.clamp(0.0, 1.0) * 255.0).round() as u64);
+        }
+    }
+    mix(&mut h, (cell_w * 1000.0).round() as u64);
+    h
+}
+
+/// One whole screen as spans for a single multi-line `Buffer`: a line per
+/// terminal row, gaps padded with spaces so columns land on the grid, and a
+/// newline ending every row. An empty row still gets a space, because a line
+/// with no glyphs may not advance by a full line height.
+fn preview_spans(
+    fd: &FrameData,
+    rows: usize,
+    default: &Attrs<'static>,
+) -> Vec<(String, Attrs<'static>)> {
+    let mut spans: Vec<(String, Attrs<'static>)> = Vec::with_capacity(fd.runs.len() + rows);
+    let mut idx = 0usize;
+    for r in 0..rows as u32 {
+        let mut col = 0u32;
+        let mut any = false;
+        while idx < fd.runs.len() && fd.runs[idx].row == r {
+            let run = &fd.runs[idx];
+            // Runs arrive in row order. Anything out of order (a wild redraw) is
+            // skipped rather than double-drawn in the wrong column.
+            //
+            // Runs also carry the padding spaces out to the end of the line. They
+            // are invisible in a thumbnail too, but shaping 545 of them per row --
+            // 80k glyphs a refresh at full size -- cost seconds, so they are
+            // dropped here along with runs that are nothing but padding. Leading
+            // gaps stay: they are what puts text in the right column.
+            let body = run.text.trim_end();
+            if !body.is_empty() && run.col >= col {
+                if run.col > col {
+                    spans.push((" ".repeat((run.col - col) as usize), default.clone()));
+                }
+                spans.push((body.to_string(), (*run.attrs).clone()));
+                col = run.col.saturating_add(body.chars().count() as u32);
+                any = true;
+            }
+            idx += 1;
+        }
+        spans.push((
+            if any {
+                "\n".to_string()
+            } else {
+                " \n".to_string()
+            },
+            default.clone(),
+        ));
+    }
+    spans
+}
+
+/// Rects for an offscreen frame: window background, tab strip, cell backgrounds
+/// that differ from them, and the cursor. The live `gpu.rects` cannot be reused
+/// -- it belongs to the active tab and carries the overlay.
+#[allow(clippy::too_many_arguments)]
+fn preview_rects(
+    fd: &FrameData,
+    bg: &[f32; 3],
+    bar: &[f32; 3],
+    fg: &[f32; 3],
+    cell_w: f32,
+    cell_h: f32,
+    strip_h: f32,
+    rows: usize,
+    w: u32,
+    h: u32,
+) -> Vec<gpu::RectVertex> {
+    let wf = w as f32;
+    let hf = h as f32;
+    let mut v: Vec<gpu::RectVertex> = Vec::with_capacity((fd.runs.len() + 3) * 6);
+    let mut push = |x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
+        v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, 0.0, wf, hf))
+    };
+    // Opaque: the offscreen is a picture of the window, not a see-through one.
+    push(0.0, 0.0, wf, hf, [bg[0], bg[1], bg[2], 1.0]);
+    if strip_h > 0.0 {
+        push(0.0, 0.0, wf, strip_h, [bar[0], bar[1], bar[2], 1.0]);
+    }
+    for run in &fd.runs {
+        if (run.row as usize) >= rows {
+            continue;
+        }
+        let same = (run.bg[0] - bg[0]).abs() < 0.004
+            && (run.bg[1] - bg[1]).abs() < 0.004
+            && (run.bg[2] - bg[2]).abs() < 0.004;
+        if !same {
+            push(
+                run.col as f32 * cell_w,
+                strip_h + run.row as f32 * cell_h,
+                run.width as f32 * cell_w,
+                cell_h,
+                [run.bg[0], run.bg[1], run.bg[2], 1.0],
+            );
+        }
+    }
+    if let Some((cx, cy)) = fd.cursor {
+        push(
+            cx as f32 * cell_w,
+            strip_h + cy as f32 * cell_h,
+            cell_w,
+            cell_h,
+            [fg[0], fg[1], fg[2], 0.85],
+        );
+    }
+    v
+}
+
 fn draw_overview(
     gpu: &mut Gpu,
     fs: &mut FontSystem,
@@ -1918,6 +2101,9 @@ fn draw_overview(
     frames: &[FrameData],
     mode: OverviewMode,
     selected: usize,
+    // Tab whose tile samples a real rendered frame instead of drawing colour
+    // blocks. One per frame is the budget (see `gpu::PreviewJob`).
+    previewed: Option<usize>,
     config: &Config,
     tab_attrs: &Attrs,
     tab_text_h: f32,
@@ -2019,6 +2205,9 @@ fn draw_overview(
     let scale = (thumb_w / full_w).min(thumb_h / full_h);
     let radius = 8.0f32;
     let chip = tab_text_h.max(14.0);
+    // Tiles that sample a real frame, collected during the loop and pushed to
+    // `gpu` afterwards: the tile text holds `gpu` borrowed as `&mut gpu.pool`.
+    let mut tile_previews: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
 
     for (idx, t) in tabs.iter().enumerate() {
         let frame = &frames[idx];
@@ -2094,11 +2283,24 @@ fn draw_overview(
             &mut gpu.rects, thx - 1.0, thy - 1.0, thumb_w + 2.0, thumb_h + 2.0,
             [0.03, 0.03, 0.03, 1.0], 4.0,
         );
-        // Preview: one block per non-blank run, tinted with the run's own text
-        // colour. Shaped glyphs at this scale are one or two pixels tall and read
-        // as noise; blocks read as a picture -- where text sits, how dense it is,
-        // whether the prompt is still waiting at the bottom. It costs no glyph
-        // pool slots either, which matters when eight tiles draw at once.
+        // Preview: either a real render of the tab, sampled down, or one tinted
+        // block per non-blank run. Blocks are the fallback for tiles with no
+        // texture this frame; they read as "where is the text" and cost nothing.
+        if previewed == Some(idx) {
+            // Fit the whole window into the thumb, aspect intact, so the tile is
+            // a picture of the window -- the tab strip comes with it. The quad is
+            // pushed after the loop: `pool` holds `gpu` borrowed until then.
+            let s = (thumb_w / wf).min(thumb_h / hf);
+            let fw = wf * s;
+            let fh = hf * s;
+            tile_previews.push((
+                idx,
+                thx + (thumb_w - fw) / 2.0,
+                thy + (thumb_h - fh) / 2.0,
+                fw,
+                fh,
+            ));
+        } else {
         for run in &frame.runs {
             if (run.row as usize) >= term_rows || (run.col as usize) >= term_cols {
                 continue;
@@ -2128,6 +2330,7 @@ fn draw_overview(
                 [run.fg[0], run.fg[1], run.fg[2], 0.62],
             );
         }
+        }
         // Entangled marker.
         if t.entangled {
             push_ov_text(
@@ -2137,6 +2340,12 @@ fn draw_overview(
             );
             slot += 1;
         }
+    }
+
+    // Deferred until here: `push_preview_quad` needs `gpu`, and the tile text
+    // held it borrowed as `&mut gpu.pool` through the loop above.
+    for (tab, x, y, fw, fh) in tile_previews {
+        gpu.push_preview_quad(tab, x, y, fw, fh, wf, hf);
     }
 }
 
@@ -2631,4 +2840,61 @@ fn main() {
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("run");
     log::info!("exited");
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    fn run(row: u32, col: u32, text: &str) -> Run {
+        Run {
+            row,
+            col,
+            width: text.len() as u32,
+            fg: [1.0, 1.0, 1.0],
+            bg: [0.0, 0.0, 0.0],
+            text: text.into(),
+            attrs: Box::leak(Box::new(Attrs::new())),
+        }
+    }
+
+    fn joined(spans: &[(String, Attrs<'static>)]) -> String {
+        spans.iter().map(|(s, _)| s.as_str()).collect()
+    }
+
+    #[test]
+    fn one_line_per_row_with_gaps_holding_the_columns() {
+        let fd = FrameData {
+            runs: vec![run(0, 0, "ab   "), run(2, 4, "cd")],
+            cursor: None,
+        };
+        // Trailing padding is invisible in a thumbnail and expensive to shape, so
+        // it is gone; leading spaces stay because they place the text.
+        assert_eq!(joined(&preview_spans(&fd, 4, &Attrs::new())), "ab\n \n    cd\n \n");
+    }
+
+    #[test]
+    fn an_empty_row_still_advances_a_line() {
+        let fd = FrameData {
+            runs: vec![],
+            cursor: None,
+        };
+        assert_eq!(joined(&preview_spans(&fd, 3, &Attrs::new())), " \n \n \n");
+    }
+
+    #[test]
+    fn signatures_see_text_and_cursor_but_nothing_else() {
+        let mut fd = FrameData {
+            runs: vec![run(0, 0, "x")],
+            cursor: None,
+        };
+        let base = frame_sig(&fd, 7.0);
+        fd.cursor = Some((1, 0));
+        assert_ne!(base, frame_sig(&fd, 7.0), "the cursor is part of the frame");
+        fd.cursor = None;
+        fd.runs[0].text = "y".into();
+        assert_ne!(base, frame_sig(&fd, 7.0), "so is the text");
+        let again = frame_sig(&fd, 7.0);
+        assert_eq!(again, frame_sig(&fd, 7.0), "same input, same signature");
+    }
 }
