@@ -67,3 +67,16 @@ their notes: the causes were rarely where the symptom pointed.
   overlap on the same display.
 - The reference app runs offscreen with `HOME=/tmp/pyhome`, whose `.zshrc` prints a
   ruler; that is how the 7x15 cell and 21px strip were measured.
+
+## Switcher previews are a density map, not a downscale (open)
+
+The tile previews sample *ink per terminal cell* and paint one block per cell at
+tile scale, so the terminal grid is the resolution ceiling: ~200 columns of one
+sample each, and it reads as pixel-per-character mush rather than a small
+terminal.
+
+Real fix: render the tab's own frame into a texture at normal scale and sample
+that down (proper filtering, or supersampled text at a reduced glyph size), so a
+tile looks like a shrunken window instead of a bitmap of cells. Needs a second
+render pass into an offscreen target and probably a second TextRenderer; the same
+pass would also give the true see-through switcher.

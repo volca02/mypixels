@@ -944,7 +944,16 @@ impl App {
             };
 
         // Window background
-        push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, h as f32, [self.bg[0], self.bg[1], self.bg[2], 1.0]);
+        // The terminal background is the only translucent layer, matching the
+        // original: it sets VTE's background to alpha = 1 - term_opacity and
+        // leaves the tab strip opaque. `term_opacity` is therefore an amount of
+        // *transparency*, not of opacity -- 0.1 means 10% see-through.
+        let bg_a = if gpu.alpha_ok && self.config.term_opacity > 0.0 {
+            1.0 - self.config.term_opacity
+        } else {
+            1.0
+        };
+        push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, h as f32, [self.bg[0], self.bg[1], self.bg[2], bg_a]);
 
         // --- Text areas (tab labels + terminal runs), one prepare() per frame ---
         let mut areas: Vec<TextArea> = Vec::new();
@@ -2319,6 +2328,9 @@ impl ApplicationHandler for App {
                         Window::default_attributes()
                             .with_inner_size(size)
                             .with_maximized(self.config.default_maximize)
+                            // Only worth requesting when we will use it: an
+                            // ARGB visual costs the compositor a second blend.
+                            .with_transparent(self.config.term_opacity > 0.0)
                             .with_title("mypixels"),
                     )
                     .expect("window"),

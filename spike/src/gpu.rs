@@ -97,6 +97,10 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
+    /// True when the compositor will blend our alpha with whatever is behind the
+    /// window, which is the only situation where a translucent terminal
+    /// background is possible at all.
+    pub alpha_ok: bool,
     pub rect_pipeline: wgpu::RenderPipeline,
     pub rect_buffer: wgpu::Buffer,
     pub viewport: Viewport,
@@ -179,13 +183,32 @@ impl Gpu {
         let format = wgpu::TextureFormat::Bgra8Unorm;
         let (width, height) =
             (window.inner_size().width.max(1), window.inner_size().height.max(1));
+        // A translucent background needs the compositor to blend our alpha with
+        // what is behind the window, so ask for premultiplied compositing when
+        // the surface offers it. Nothing else has to change to produce it: both
+        // the rect and the glyph pipelines blend with SRC_ALPHA/ONE_MINUS_SRC_ALPHA,
+        // which writes a correctly premultiplied framebuffer, and the pass has
+        // always cleared to TRANSPARENT -- the alpha channel was simply ignored
+        // while the surface was Opaque.
+        let alpha_ok = caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied);
+        let alpha_mode = if alpha_ok {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else {
+            log::warn!(
+                "surface offers no premultiplied alpha ({:?}); terminal background stays opaque",
+                caps.alpha_modes
+            );
+            wgpu::CompositeAlphaMode::Auto
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width,
             height,
             present_mode,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
             color_space: wgpu::SurfaceColorSpace::Auto,
@@ -295,6 +318,7 @@ impl Gpu {
             rects: Vec::with_capacity(1024),
             pool,
             slot_sig: vec![0u64; MAX_RUNS],
+            alpha_ok,
             tab_pool,
             prompt_buf,
         }
