@@ -166,8 +166,21 @@ struct FrameData {
 /// Tab overview navigation state (mirrors the Python TabOverview, standalone
 /// mode). `selected` is the highlighted tile; `desired_column` is remembered
 /// so up/down navigation stays in a column even when rows have fewer tabs.
+/// Which overview variant is on screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverviewMode {
+    /// Full control grid (Alt+o / `show_tab_overview`): nav, move, new, close.
+    Standalone,
+    /// Alt-held popup: follows the active tab, dismissed on Alt release.
+    Switcher,
+}
+
+/// Overview navigation state. For `Standalone`, `selected`/`desired_column`
+/// are the highlighted tile. For `Switcher`, the selection is the active tab
+/// (`selected` mirrors it) and `desired_column` is kept for vertical nav.
 #[derive(Clone, Copy)]
 struct OverviewState {
+    mode: OverviewMode,
     selected: usize,
     desired_column: usize,
 }
@@ -222,6 +235,15 @@ struct App {
     /// terminal. `selected` is the highlighted tab; `desired_column` is kept
     /// for vertical navigation (like the original TabOverview).
     overview: Option<OverviewState>,
+    /// Alt-held tab switcher timing, shared with a background clock thread.
+    /// `switcher_alt_at` is when Alt went down (None when released); the clock
+    /// opens the switcher after the configured delay (`tab_overview_delay_ms`)
+    /// and, while it's open, nudges a redraw on a fixed cadence so every
+    /// thumbnail stays live. `switcher_show_req` is the clock's "show now"
+    /// signal; `switcher_open` mirrors the open state for the clock.
+    switcher_alt_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    switcher_show_req: Arc<AtomicBool>,
+    switcher_open: Arc<AtomicBool>,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -301,6 +323,42 @@ impl App {
         let wake = Arc::clone(&shared.wake);
         let exited = Arc::clone(&shared.exited);
 
+        // Alt-held switcher clock. Shared with the event-loop thread.
+        let switcher_alt_at = Arc::new(Mutex::new(None));
+        let switcher_show_req = Arc::new(AtomicBool::new(false));
+        let switcher_open = Arc::new(AtomicBool::new(false));
+        {
+            let ws = Arc::clone(&window_slot);
+            let alt_at = Arc::clone(&switcher_alt_at);
+            let show_req = Arc::clone(&switcher_show_req);
+            let open = Arc::clone(&switcher_open);
+            let wakec = Arc::clone(&wake);
+            let delay_ms = config.tab_overview_delay_ms;
+            let refresh_ms = 150u32; // thumbnail refresh cadence while open
+            std::thread::spawn(move || {
+                let mut last_refresh = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    let now = std::time::Instant::now();
+                    if !open.load(Ordering::SeqCst) {
+                        // Open after the configured Alt hold delay.
+                        if let Some(at) = *alt_at.lock().unwrap() {
+                            if now.duration_since(at).as_millis() >= delay_ms as u128 {
+                                show_req.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    } else if now.duration_since(last_refresh).as_millis() >= refresh_ms as u128 {
+                        // Keep every preview live while the switcher is open.
+                        last_refresh = now;
+                        wakec.store(true, Ordering::SeqCst);
+                        if let Some(w) = ws.lock().unwrap().as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                }
+            });
+        }
+
         // Initial grid from the configured window size; the Resized handler
         // adjusts it once the surface exists.
         let cols = ((config.default_width as f32 / cell_w) as usize).clamp(20, 512);
@@ -337,6 +395,9 @@ impl App {
             renaming: false,
             rename_draft: String::new(),
             overview: None,
+            switcher_alt_at,
+            switcher_show_req,
+            switcher_open,
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -653,7 +714,8 @@ impl App {
             &mut self.font_system,
             &self.tabs,
             &frames,
-            ov,
+            ov.mode,
+            ov.selected,
             &self.config,
             &self.mono_attrs,
             &self.tab_attrs,
@@ -957,6 +1019,30 @@ impl App {
                 log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {}", self.active, surf, cursor, state.join(","), ren);
                 continue;
             }
+            if line == "switcher" {
+                // Test hook: open the Alt-held switcher directly (bypass the
+                // hold delay, which needs real ModifiersChanged events).
+                if self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
+                    && !self.tabs.is_empty()
+                {
+                    let cols = grid_cols(self.tabs.len());
+                    self.overview = Some(OverviewState {
+                        mode: OverviewMode::Switcher,
+                        selected: self.active,
+                        desired_column: self.active % cols,
+                    });
+                    self.switcher_open.store(true, Ordering::SeqCst);
+                }
+                continue;
+            }
+            if line == "alt_up" {
+                // Test hook: simulate Alt release (dismiss the switcher).
+                *self.switcher_alt_at.lock().unwrap() = None;
+                if self.switcher_open.load(Ordering::SeqCst) {
+                    self.close_switcher();
+                }
+                continue;
+            }
             if let Some((mods, key)) = parse_key_spec(line) {
                 self.modifiers = mods;
                 self.handle_key(&key, event_loop);
@@ -975,10 +1061,13 @@ impl App {
             self.handle_rename_key(key);
             return;
         }
-        // 1. Overview mode is modal: keys navigate/select/move tabs. Only
-        //    keys the overview doesn't claim fall through to the terminal.
-        if self.overview.is_some() {
-            self.handle_overview_key(key, event_loop);
+        // 1. Overview/switcher is modal: keys navigate/select tabs. Only keys
+        //    the overview doesn't claim fall through to the terminal.
+        if let Some(ov) = &self.overview {
+            match ov.mode {
+                OverviewMode::Switcher => self.handle_switcher_key(key),
+                OverviewMode::Standalone => self.handle_overview_key(key, event_loop),
+            }
             return;
         }
         // 2. Configured bindings
@@ -1053,9 +1142,11 @@ impl App {
             Some("overview_new_tab") | Some("new_tab") => {
                 self.add_tab();
                 let newn = self.tabs.len();
+                let mode = self.overview.map(|o| o.mode).unwrap_or(OverviewMode::Standalone);
                 let ov = self.overview.get_or_insert(OverviewState {
                     selected: 0,
                     desired_column: 0,
+                    mode,
                 });
                 ov.selected = newn - 1;
                 ov.desired_column = (newn - 1) % grid_cols(newn);
@@ -1177,6 +1268,93 @@ impl App {
         }
     }
 
+    /// Dismiss the Alt-held switcher (only if that variant is open).
+    fn close_switcher(&mut self) {
+        if self.overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
+            self.overview = None;
+            self.switcher_open.store(false, Ordering::SeqCst);
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Keys while the Alt-held switcher is open. Alt is held during navigation,
+    /// so match on the logical key (arrows, Home/End, digits) regardless of the
+    /// Alt modifier. Navigation changes the active tab live, so the preview and
+    /// the eventual commit are the same tab; Alt release just dismisses the
+    /// popup. Unhandled keys are dropped (the switcher is modal while held).
+    fn handle_switcher_key(&mut self, key: &Key) {
+        use winit::keyboard::NamedKey;
+        let n = self.tabs.len();
+        if n == 0 {
+            self.close_switcher();
+            return;
+        }
+        let cols = grid_cols(n);
+        let handled = match key {
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.active = (self.active + n - 1) % n;
+                true
+            },
+            Key::Named(NamedKey::ArrowRight) => {
+                self.active = (self.active + 1) % n;
+                true
+            },
+            Key::Named(NamedKey::ArrowUp) => {
+                let r = self.active / cols;
+                if r > 0 {
+                    let dc = self.active % cols;
+                    self.active = ((r - 1) * cols + dc).min(n - 1);
+                }
+                true
+            },
+            Key::Named(NamedKey::ArrowDown) => {
+                let r = self.active / cols;
+                let t = (r + 1) * cols + (self.active % cols);
+                if t < n && t / cols > r {
+                    self.active = t;
+                }
+                true
+            },
+            Key::Named(NamedKey::Home) => {
+                self.active = 0;
+                true
+            },
+            Key::Named(NamedKey::End) => {
+                self.active = n - 1;
+                true
+            },
+            Key::Named(NamedKey::Escape) => {
+                self.close_switcher();
+                true
+            },
+            Key::Character(c) => {
+                // Alt+digit: jump to that tab (Alt is held in the switcher).
+                match c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    Some(d) => {
+                        let idx = if d == 0 { 9 } else { (d - 1) as usize };
+                        if idx < n {
+                            self.active = idx;
+                        }
+                        true
+                    },
+                    None => false,
+                }
+            },
+            _ => false,
+        };
+        // Keep the highlighted tile in sync with the active tab.
+        if let Some(ov) = self.overview.as_mut() {
+            ov.selected = self.active;
+        }
+        if handled {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
+
     fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
         let n = self.tabs.len();
         match action {
@@ -1201,6 +1379,7 @@ impl App {
                 } else if !self.tabs.is_empty() {
                     let cols = grid_cols(self.tabs.len());
                     self.overview = Some(OverviewState {
+                        mode: OverviewMode::Standalone,
                         selected: self.active,
                         desired_column: self.active % cols,
                     });
@@ -1397,7 +1576,8 @@ fn draw_overview(
     fs: &mut FontSystem,
     tabs: &[Tab],
     frames: &[FrameData],
-    ov: &OverviewState,
+    mode: OverviewMode,
+    selected: usize,
     config: &Config,
     mono_attrs: &Attrs,
     tab_attrs: &Attrs,
@@ -1437,19 +1617,22 @@ fn draw_overview(
     let cols = grid_cols(n);
     let rows = (n + cols - 1) / cols;
 
-    // Banner (two lines), using the tab (larger) font.
-    let banner = "TAB OVERVIEW MODE";
-    let hints =
-        "ESC exit | Enter select | Alt+Return new | Arrows move | Shift+Arrows reorder | Ctrl+Alt+X close";
-    push_ov_text(pool, slot, fs, tab_attrs, banner, 16.0, 12.0, 1.0, [1.0, 1.0, 1.0], None, None, areas, bounds);
-    slot += 1;
-    push_ov_text(pool, slot, fs, tab_attrs, hints, 16.0, 34.0, 1.0, [0.7, 0.7, 0.7], None, None, areas, bounds);
-    slot += 1;
+    // Banner, using the tab (larger) font. Standalone gets a two-line header
+    // with the key hints; the Alt-held switcher gets a single quiet label.
+    if mode == OverviewMode::Standalone {
+        push_ov_text(pool, slot, fs, tab_attrs, "TAB OVERVIEW MODE", 16.0, 12.0, 1.0, [1.0, 1.0, 1.0], None, None, areas, bounds);
+        slot += 1;
+        push_ov_text(pool, slot, fs, tab_attrs, "ESC exit | Enter select | Alt+Return new | Arrows move | Shift+Arrows reorder | Ctrl+Alt+X close", 16.0, 34.0, 1.0, [0.7, 0.7, 0.7], None, None, areas, bounds);
+        slot += 1;
+    } else {
+        push_ov_text(pool, slot, fs, tab_attrs, "Tab Switcher", 16.0, 12.0, 1.0, [0.36, 0.75, 0.75], None, None, areas, bounds);
+        slot += 1;
+    }
 
     // Grid geometry.
     let pad = 10.0;
     let spacing = 12.0;
-    let banner_h = 58.0;
+    let banner_h = if mode == OverviewMode::Standalone { 58.0 } else { 40.0 };
     let thumb_w = (config.tab_overview_thumb_width as f32)
         .min((wf - 100.0) / 4.0 - 20.0)
         .max(60.0);
@@ -1475,7 +1658,7 @@ fn draw_overview(
         let col = idx % cols;
         let tx = grid_x + col as f32 * (tile_w + spacing);
         let ty = grid_y + row as f32 * (tile_h + spacing);
-        let selected = idx == ov.selected;
+        let selected = idx == selected;
 
         let (border, bgc, bw) = if selected {
             ([0.29, 0.60, 0.60, 0.95], [0.13, 0.30, 0.30, 0.95], 3.0)
@@ -1779,6 +1962,21 @@ impl ApplicationHandler for App {
             },
             WindowEvent::RedrawRequested => {
                 self.drain_test_keys(event_loop);
+                // Open the Alt-held switcher if the clock asked and Alt is
+                // still held (guards against the press/release race).
+                if self.switcher_show_req.swap(false, Ordering::SeqCst)
+                    && self.switcher_alt_at.lock().unwrap().is_some()
+                    && !self.tabs.is_empty()
+                    && self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
+                {
+                    let cols = grid_cols(self.tabs.len());
+                    self.overview = Some(OverviewState {
+                        mode: OverviewMode::Switcher,
+                        selected: self.active,
+                        desired_column: self.active % cols,
+                    });
+                    self.switcher_open.store(true, Ordering::SeqCst);
+                }
                 // Drain tabs whose child exited
                 let mut to_close: Vec<usize> = Vec::new();
                 {
@@ -1808,7 +2006,25 @@ impl ApplicationHandler for App {
                 }
             },
             WindowEvent::ModifiersChanged(m) => {
-                self.modifiers = m.state();
+                let new = m.state();
+                let alt_up = new.alt_key() && !self.modifiers.alt_key();
+                let alt_down = !new.alt_key() && self.modifiers.alt_key();
+                self.modifiers = new;
+                if alt_up {
+                    // Alt pressed: start the switcher hold timer.
+                    *self.switcher_alt_at.lock().unwrap() = Some(std::time::Instant::now());
+                    self.switcher_show_req.store(false, Ordering::SeqCst);
+                } else if alt_down {
+                    // Alt released: commit (active tab is already the pick) and
+                    // dismiss the switcher if it's the Alt-held variant.
+                    *self.switcher_alt_at.lock().unwrap() = None;
+                    self.switcher_show_req.store(false, Ordering::SeqCst);
+                    if self.switcher_open.load(Ordering::SeqCst) {
+                        self.close_switcher();
+                    }
+                }
+                self.wake.store(true, Ordering::SeqCst);
+                window.request_redraw();
             },
             WindowEvent::Focused(focused) => {
                 if let Some(tab) = self.tabs.get(self.active) {

@@ -151,9 +151,21 @@ redraw storm at single-digit CPU. The port is validated.
   gated on `overview_active` in `find_action`, and `handle_overview_key` is
   modal (only unclaimed keys fall through). Verified on Xvfb: open, navigate,
   select, close, new, reorder, exit all correct.
+- `Tab switcher` (Alt-held popup, the primary switcher per user): a background
+  clock thread opens it `tab_overview_delay_ms` after Alt goes down and, while
+  open, nudges a redraw every ~150ms so **every thumbnail stays live**
+  (verified on Xvfb: a tab's preview grew as a `seq` burst printed while the
+  switcher was up). It reuses the overview tile grid with a quiet "Tab
+  Switcher" header and a shorter banner. The highlighted tile **is the active
+  tab**: arrow/Home/End/Alt+digit nav switches the tab live, so the preview and
+  the eventual commit are the same tab; releasing Alt (or Esc) dismisses and
+  keeps the pick. Alt down/up is detected in `ModifiersChanged`; the clock
+  thread and the event loop coordinate through `Arc` flags (`switcher_alt_at` /
+  `show_req` / `open`), with the show guarded by "Alt still held" to dodge the
+  press/release race. (The test FIFO can't emit `ModifiersChanged`, so
+  `switcher` / `alt_up` key specs open/dismiss it for offscreen tests.)
 
-Not yet ported: search panel (deprioritized), switcher-mode overview (Alt
-hold, periodic thumbnail refresh).
+Not yet ported: search panel (deprioritized).
 Scrollback view, selection, IME, copy/paste still not implemented (spike is
 a rendering/emulation perf + config test, not a full terminal yet).
 
