@@ -106,6 +106,10 @@ pub struct Gpu {
     pub rects: Vec<RectVertex>,
     /// Pooled cosmic_text buffers for terminal runs (stable addresses).
     pub pool: Vec<Buffer>,
+    /// Per-slot signature of what each pooled buffer currently holds. Lets an
+    /// unchanged run skip shaping, which is the single most expensive thing a
+    /// frame does (see `run_sig`).
+    pub slot_sig: Vec<u64>,
     /// Pooled buffers for tab-strip labels.
     pub tab_pool: Vec<Buffer>,
     /// Single buffer for the inline rename prompt (terminal font metrics).
@@ -290,6 +294,7 @@ impl Gpu {
             text_renderer,
             rects: Vec::with_capacity(1024),
             pool,
+            slot_sig: vec![0u64; MAX_RUNS],
             tab_pool,
             prompt_buf,
         }

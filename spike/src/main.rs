@@ -11,7 +11,7 @@ mod tab;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use alacritty_terminal::event::WindowSize;
@@ -156,6 +156,37 @@ const CURSOR_COLOR: [f32; 3] = [0.55, 0.55, 0.6];
 // ---------------------------------------------------------------------------
 // Draw list (owned data copied out of the terminal under the lock)
 // ---------------------------------------------------------------------------
+
+/// What a run's shaped form depends on: the text, both colours, the font it is
+/// drawn with, and the width its buffer was sized to. Equal signatures mean the
+/// pooled glyph buffer is still exactly right, so shaping can be skipped -- and
+/// shaping is by far the most expensive part of a frame here.
+fn run_sig(run: &Run, cell_w: f32) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    for b in run.text.as_bytes() {
+        mix(*b as u64);
+    }
+    // Colour is part of the identity: a TUI repaints the same text in different
+    // colours, and a stale colour is a visible bug.
+    for c in run.fg.iter().chain(run.bg.iter()) {
+        mix((c.clamp(0.0, 1.0) * 255.0).round() as u64);
+    }
+    mix((cell_w * 1000.0).round() as u64);
+    mix(run.width as u64);
+    mix(run.attrs as *const Attrs<'static> as u64);
+    h
+}
+
+/// Escape hatch to A/B the shaping cache against re-shaping everything
+/// (`SPIKE_NOCACHE=1`).
+fn shaping_cache_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPIKE_NOCACHE").is_none())
+}
 
 /// Append a run, dropping the ones that could never draw anything: padding in
 /// the default colours. A mostly-empty 4K grid is 80k cells, and this is the
@@ -648,6 +679,8 @@ impl App {
                 .collect();
             gpu.prompt_buf =
                 Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh));
+            // New buffers hold nothing, so every cached signature is a lie.
+            gpu.slot_sig = vec![0u64; gpu.pool.len()];
         }
         // Cell size changed -> the grid that fits the surface changes.
         self.sync_term_size();
@@ -1062,6 +1095,7 @@ impl App {
         // never reallocates after init, and the derived shared references are
         // only used this frame, before any further pool writes.
         {
+            let cache = shaping_cache_enabled();
             let fs = &mut self.font_system;
             let pool = &mut gpu.pool;
             for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
@@ -1084,13 +1118,16 @@ impl App {
                 if blank && default_fg {
                     continue;
                 }
-                let b = &mut pool[i];
-                b.set_size(Some(run.width as f32 * self.cell_w), None);
-                b.set_text(&run.text, run.attrs, Shaping::Basic, None);
-                b.set_monospace_width(Some(self.cell_w));
-                b.shape_until_scroll(fs, false);
-                let ptr: *const Buffer = b;
-                let buf: &Buffer = unsafe { &*ptr };
+                let sig = run_sig(run, self.cell_w);
+                if !(cache && gpu.slot_sig.get(i) == Some(&sig)) {
+                    gpu.slot_sig[i] = sig;
+                    let b = &mut pool[i];
+                    b.set_size(Some(run.width as f32 * self.cell_w), None);
+                    b.set_text(&run.text, run.attrs, Shaping::Basic, None);
+                    b.set_monospace_width(Some(self.cell_w));
+                    b.shape_until_scroll(fs, false);
+                }
+                let buf: &Buffer = unsafe { &*(&pool[i] as *const Buffer) };
                 areas.push(TextArea {
                     buffer: buf,
                     left: run.col as f32 * self.cell_w,
@@ -1164,6 +1201,9 @@ impl App {
                 h,
                 &mut areas,
             );
+            // Thumbnails reuse pooled buffers at a different scale, so every
+            // cached signature is stale once the overview has drawn.
+            gpu.slot_sig.fill(0);
         }
         gpu.render_frame(&mut self.font_system, areas, window);
         self.gpu = Some(gpu);
