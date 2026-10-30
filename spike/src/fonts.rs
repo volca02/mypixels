@@ -13,13 +13,17 @@
 //! family come first because they share its advance width -- an icon then still
 //! occupies exactly one cell instead of drifting the grid.
 //!
-//! fontdb 0.23 exposes no charset API, so coverage is inferred from family
-//! names. That is a heuristic, and deliberately a conservative one: it only
-//! ever *adds* families, and fallback is consulted only for glyphs the
-//! configured family is missing.
+//! fontdb 0.23 exposes no charset API, so `Coverage` below queries each face's
+//! `cmap` through skrifa to find out what is actually installed. That is the
+//! only trustworthy route: family-name patterns were tried first and are wrong
+//! in both directions (an icon font under an unusual name is missed, a font
+//! whose name merely looks right is trusted).
 
-use glyphon::cosmic_text::{Fallback, FontSystem, PlatformFallback};
-use glyphon::fontdb::Database;
+use glyphon::cosmic_text::{
+    skrifa, skrifa::prelude::*, Attrs, Fallback, Family, FontSystem, PlatformFallback,
+};
+use glyphon::fontdb::{Database, ID};
+use std::collections::HashMap;
 use unicode_script::Script;
 
 /// 'static so we can borrow the platform fallback list out of it.
@@ -109,7 +113,7 @@ pub fn icon_families(primary: &str, db: &Database) -> Vec<String> {
     let fams = installed_families(db);
     let mut chain: Vec<String> = Vec::new();
 
-    let mut push = |name: &str, chain: &mut Vec<String>| {
+    let push = |name: &str, chain: &mut Vec<String>| {
         let name = name.to_string();
         if name != primary && !chain.contains(&name) && fams.iter().any(|f| f == &name) {
             chain.push(name);
@@ -213,9 +217,212 @@ pub fn build_font_system(primary_families: &[&str]) -> (FontSystem, Vec<String>)
     (fs, chain)
 }
 
+/// Which font should draw a given codepoint.
+///
+/// cosmic-text cannot answer this usefully. As `Fallback` it is effectively
+/// unused (see `build_font_system`), and the one font it does consult is a
+/// single global choice, so icons and CJK compete for the same slot.
+///
+/// This asks each loaded face's actual `cmap` whether it covers a codepoint, so
+/// a font is selected by coverage rather than by name pattern: a Nerd Font
+/// installed under an unusual name still works, and a font whose name merely
+/// looks right does not get a free pass.
+///
+/// Results are memoised per codepoint, so per-cell cost is one hash lookup --
+/// and nothing at all for ASCII, which any usable terminal font covers.
+pub struct Coverage {
+    /// Families the terminal already draws with; a hit here is not a fallback.
+    primary: Vec<String>,
+    /// Every loaded face, ordered so the best candidate comes first: primary
+    /// families, then monospaced faces (`FaceInfo::monospaced`, a real font
+    /// flag, not a name match), then everything else.
+    faces: Vec<(ID, String)>,
+    base: &'static Attrs<'static>,
+    by_char: HashMap<char, &'static Attrs<'static>>,
+    by_family: HashMap<String, &'static Attrs<'static>>,
+}
+
+impl Coverage {
+    pub fn new(fs: &FontSystem, base: &Attrs<'static>, primary: &[String]) -> Coverage {
+        let db: &Database = fs.db();
+        let mut faces: Vec<(ID, String, u8)> = db
+            .faces()
+            .filter_map(|fi| {
+                let fam = fi.families.first().map(|(n, _)| n.clone())?;
+                let rank = if primary.iter().any(|p| p == &fam) {
+                    0
+                } else if primary.iter().any(|p| fam.starts_with(p.as_str())) {
+                    // A companion variant of the terminal font ("Cascadia Code
+                    // NF" for "Cascadia Code"): same design, so an icon's advance
+                    // width still agrees with the cell grid. An ordering hint --
+                    // coverage decides eligibility, so a variant that lacks the
+                    // glyph is never chosen to satisfy the name.
+                    1
+                } else if fi.monospaced {
+                    2
+                } else {
+                    3
+                };
+                Some((fi.id, fam, rank))
+            })
+            .collect();
+        faces.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+        Coverage {
+            primary: primary.to_vec(),
+            faces: faces.into_iter().map(|(id, fam, _)| (id, fam)).collect(),
+            base: Box::leak(Box::new(base.clone())),
+            by_char: HashMap::new(),
+            by_family: HashMap::new(),
+        }
+    }
+
+    /// Attrs to draw `ch` with: the base attrs, unless some other installed face
+    /// is the first one that actually covers the codepoint.
+    pub fn attrs_for(&mut self, db: &Database, ch: char) -> &'static Attrs<'static> {
+        if ch.is_ascii() {
+            return self.base;
+        }
+        if let Some(a) = self.by_char.get(&ch) {
+            return a;
+        }
+        let hit = self
+            .faces
+            .iter()
+            .find(|(id, fam)| {
+                !self.primary.iter().any(|p| p == fam) && face_covers(db, *id, ch)
+            })
+            .map(|(_, fam)| fam.clone());
+        let attrs = match hit {
+            Some(ref fam) => self.attrs_for_family(fam),
+            // Nothing installed covers it: draw with the terminal font and accept
+            // the notdef box, which at least keeps the cell grid intact.
+            None => self.base,
+        };
+        if let Some(ref fam) = hit {
+            log::debug!("glyph U+{:04X} -> {}", ch as u32, fam);
+        }
+        self.by_char.insert(ch, attrs);
+        attrs
+    }
+
+    /// One leaked Attrs per fallback family -- bounded by how many a session
+    /// needs, typically one or two. Everything from the base attrs is kept
+    /// (size, weight, metrics); only the family changes.
+    fn attrs_for_family(&mut self, fam: &str) -> &'static Attrs<'static> {
+        if let Some(a) = self.by_family.get(fam) {
+            return a;
+        }
+        // The leaked name gives the Attrs a 'static lifetime.
+        let name: &'static str = Box::leak(fam.to_string().into_boxed_str());
+        let attrs: &'static Attrs<'static> =
+            Box::leak(Box::new(self.base.clone().family(Family::Name(name))));
+        self.by_family.insert(fam.to_string(), attrs);
+        attrs
+    }
+
+    /// Fallback families resolved so far (diagnostics, tests).
+    pub fn families(&self) -> Vec<&str> {
+        self.by_family.keys().map(|s| s.as_str()).collect()
+    }
+}
+
+/// Does this face's `cmap` contain `ch`?
+fn face_covers(db: &Database, id: ID, ch: char) -> bool {
+    db.with_face_data(id, |data, index| {
+        skrifa::FontRef::from_index(data, index)
+            .map(|f| f.charmap().map(ch).is_some())
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coverage(primary: &str) -> (FontSystem, Coverage) {
+        let (fs, _) = build_font_system(&[primary]);
+        // Attrs borrow the family name, and Coverage needs 'static attrs.
+        let fam: &'static str = Box::leak(primary.to_string().into_boxed_str());
+        let base = Attrs::new().family(Family::Name(fam));
+        let cov = Coverage::new(&fs, &base, &[primary.to_string()]);
+        (fs, cov)
+    }
+
+    /// The family we route to must actually contain the glyph -- otherwise the
+    /// routing is just a different kind of tofu.
+    fn really_covers(db: &Database, cov: &Coverage, fam: &str, ch: char) -> bool {
+        cov.faces
+            .iter()
+            .any(|(id, f)| f == fam && face_covers(db, *id, ch))
+    }
+
+    #[test]
+    fn ascii_never_consults_the_index() {
+        let (fs, mut cov) = coverage("Cascadia Code");
+        for ch in "abcXYZ019 ~!@#$%^&*()".chars() {
+            assert!(
+                std::ptr::eq(cov.attrs_for(fs.db(), ch), cov.base),
+                "ASCII {:?} should draw with the terminal font",
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn powerline_glyph_gets_a_font_that_has_it() {
+        let (fs, mut cov) = coverage("Cascadia Code");
+        // U+E0B0: the powerline separator starship draws.
+        let ch = '\u{e0b0}';
+        let a = cov.attrs_for(fs.db(), ch);
+        match a.family {
+            Family::Name(name) if name != "Cascadia Code" => {
+                assert!(
+                    really_covers(fs.db(), &cov, name, ch),
+                    "routed {ch:?} to {name}, which cannot draw it"
+                );
+            }
+            _ => {
+                // Acceptable only if the terminal font really does cover it.
+                assert!(
+                    cov.faces.iter().any(|(id, f)| f == "Cascadia Code"
+                        && face_covers(fs.db(), *id, ch)),
+                    "no fallback found for {ch:?}, but Cascadia Code cannot draw it either"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolution_is_stable_and_honest() {
+        let (fs, mut cov) = coverage("Cascadia Code");
+        // Mixed bag: CJK, box drawing, emoji, a combining mark, an arrow.
+        for ch in ['あ', '█', '😀', '́', '⇢', '€', 'Ⅷ'] {
+            let first = cov.attrs_for(fs.db(), ch);
+            let second = cov.attrs_for(fs.db(), ch);
+            assert!(std::ptr::eq(first, second), "{ch:?} resolved twice differently");
+            if let Family::Name(name) = first.family {
+                if name != "Cascadia Code" {
+                    assert!(
+                        really_covers(fs.db(), &cov, name, ch),
+                        "routed {ch:?} to {name}, which cannot draw it"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unassigned_codepoints_stay_with_the_terminal_font() {
+        let (fs, mut cov) = coverage("Cascadia Code");
+        // Plane 15 private use: nothing on a normal desktop covers these.
+        for ch in ['\u{f0000}', '\u{fffff}'] {
+            assert!(
+                std::ptr::eq(cov.attrs_for(fs.db(), ch), cov.base),
+                "{ch:?} should not be routed anywhere"
+            );
+        }
+    }
 
     fn db_with(names: &[&str]) -> Database {
         // Faces cannot be synthesised without font files, so `installed_families`

@@ -9,6 +9,7 @@ mod fonts;
 mod gpu;
 mod tab;
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -164,6 +165,9 @@ struct Run {
     fg: [f32; 3],
     bg: [f32; 3],
     text: String,
+    /// Font for this run. Runs split where the required face changes, so a
+    /// starship prompt becomes "text | icon | text" instead of "text | tofu".
+    attrs: &'static Attrs<'static>,
 }
 
 struct FrameData {
@@ -242,6 +246,8 @@ struct App {
     font_system: FontSystem,
     mono_attrs: Attrs<'static>,
     tab_attrs: Attrs<'static>,
+    /// Per-codepoint font routing, rebuilt whenever the terminal font changes.
+    coverage: RefCell<Option<fonts::Coverage>>,
     /// Runtime terminal font state. `term_pt` is the live size (enlarge/
     /// shrink font mutates it); a config reload resets it to the config value.
     term_family: &'static str,
@@ -450,6 +456,7 @@ impl App {
             font_system,
             mono_attrs,
             tab_attrs,
+            coverage: RefCell::new(None),
             term_family,
             term_pt,
             renaming: false,
@@ -622,10 +629,34 @@ impl App {
         }
         // Cell size changed -> the grid that fits the surface changes.
         self.sync_term_size();
+        // Font routing depends on the terminal font, so rebuild it with it.
+        *self.coverage.borrow_mut() = Some(fonts::Coverage::new(
+            &self.font_system,
+            &self.mono_attrs,
+            &[self.term_family.to_string()],
+        ));
         log::info!(
             "term font: {} {:.0}pt; cell = {:.2} x {:.2}",
             self.term_family, self.term_pt, cell_w, cell_h
         );
+    }
+
+    /// Attrs for a single codepoint: the terminal font, or whichever installed
+    /// face actually covers the glyph when the terminal font does not.
+    ///
+    /// Built on demand because the startup path sets the font without going
+    /// through `rebuild_term_font`; the font-rebuild path replaces it so a font
+    /// change cannot leave a stale base behind.
+    fn cell_attrs(&self, ch: char) -> &'static Attrs<'static> {
+        let mut cov = self.coverage.borrow_mut();
+        let cov = cov.get_or_insert_with(|| {
+            fonts::Coverage::new(
+                &self.font_system,
+                &self.mono_attrs,
+                &[self.term_family.to_string()],
+            )
+        });
+        cov.attrs_for(self.font_system.db(), ch)
     }
 
     /// Rebuild the tablist font from config (family + size): attrs, tab
@@ -728,13 +759,15 @@ impl App {
 
             let fg = palette.resolve_with(&cell.fg, self.fg, self.bg);
             let bg = palette.resolve_with(&cell.bg, self.fg, self.bg);
+            let attrs = self.cell_attrs(cell.c);
 
             match cur.as_mut() {
                 Some(r)
                     if r.row == row as u32
                         && r.col + r.width == col as u32
                         && r.fg == fg
-                        && r.bg == bg =>
+                        && r.bg == bg
+                        && std::ptr::eq(r.attrs, attrs) =>
                 {
                     r.width += 1;
                     r.text.push_str(&glyph);
@@ -750,6 +783,7 @@ impl App {
                         fg,
                         bg,
                         text: glyph,
+                        attrs,
                     });
                 },
             }
@@ -775,45 +809,6 @@ impl App {
 
     /// Render the standalone tab overview. Builds a frame per tab (before the
     /// mutable gpu borrow), then hands off to `draw_overview`.
-    fn draw_overview_mode(&mut self, window: &Window) {
-        if self.overview.is_none() || self.tabs.is_empty() {
-            return;
-        }
-        let frames: Vec<FrameData> = self.tabs.iter().map(|t| self.build_frame(t, true)).collect();
-        let ov = self.overview.as_ref().unwrap();
-        let gpu: &mut Gpu = match self.gpu.as_mut() {
-            Some(g) => g,
-            None => return,
-        };
-        let (w, h) = (gpu.config.width, gpu.config.height);
-        if w == 0 || h == 0 {
-            return;
-        }
-        gpu.rects.clear();
-        let mut areas: Vec<TextArea> = Vec::new();
-        draw_overview(
-            gpu,
-            &mut self.font_system,
-            &self.tabs,
-            &frames,
-            ov.mode,
-            ov.selected,
-            &self.config,
-            &self.mono_attrs,
-            &self.tab_attrs,
-            self.tab_text_h,
-            self.tab_char_w,
-            self.cell_w,
-            self.cell_h,
-            self.cols,
-            self.rows,
-            w,
-            h,
-            &mut areas,
-        );
-        gpu.render_frame(&mut self.font_system, areas, window);
-    }
-
     fn draw(&mut self, window: &Window) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -824,21 +819,28 @@ impl App {
             let active = &self.tabs[self.active];
             active.term.lock().is_focused = window.has_focus();
         }
-        // Overview mode is drawn as a full overlay and skips the normal view.
-        if self.overview.is_some() {
-            self.draw_overview_mode(window);
-            return;
-        }
-        let frame = self.build_frame(tab, self.cursor_blink.load(Ordering::SeqCst));
+        let blink = self.cursor_blink.load(Ordering::SeqCst);
+        // The overview is an overlay on the live terminal, so the terminal is
+        // still painted underneath it -- that is what the backdrop dims.
+        // Every tab's frame is built first (thumbnails are live), before the
+        // borrow of `tab` ends.
+        let ov_frames: Vec<FrameData> = if self.overview.is_some() {
+            self.tabs.iter().map(|t| self.build_frame(t, true)).collect()
+        } else {
+            Vec::new()
+        };
+        let frame = self.build_frame(tab, blink);
         let show_strip = self.show_tab_strip();
-        let gpu: &mut Gpu = match self.gpu.as_mut() {
-            Some(g) => g,
+        let (w, h) = match &self.gpu {
+            Some(g) => (g.config.width, g.config.height),
             None => return,
         };
-        let (w, h) = (gpu.config.width, gpu.config.height);
         if w == 0 || h == 0 {
             return;
         }
+        // Moved out of `self` so the drawing code below can keep borrowing
+        // other `self` fields freely. Put back before every exit.
+        let mut gpu = self.gpu.take().expect("gpu present, checked above");
         let wf = w as f32;
         let hf = h as f32;
 
@@ -1035,9 +1037,15 @@ impl App {
         // only used this frame, before any further pool writes.
         {
             let fs = &mut self.font_system;
-            let attrs = &self.mono_attrs;
             let pool = &mut gpu.pool;
             for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
+                // Behind the overview the terminal is painted as a colour field
+                // only. Text is drawn in a single pass after every rect, so
+                // terminal text would otherwise bleed through the tiles; real
+                // see-through needs the overlay in its own pass (see TODO).
+                if self.overview.is_some() {
+                    break;
+                }
                 // Row 0 is replaced by the rename prompt.
                 if self.renaming && run.row == 0 {
                     continue;
@@ -1052,7 +1060,7 @@ impl App {
                 }
                 let b = &mut pool[i];
                 b.set_size(Some(run.width as f32 * self.cell_w), None);
-                b.set_text(&run.text, attrs, Shaping::Basic, None);
+                b.set_text(&run.text, run.attrs, Shaping::Basic, None);
                 b.set_monospace_width(Some(self.cell_w));
                 b.shape_until_scroll(fs, false);
                 let ptr: *const Buffer = b;
@@ -1109,7 +1117,29 @@ impl App {
             }
         }
 
+        if let Some(ov) = &self.overview {
+            draw_overview(
+                &mut gpu,
+                &mut self.font_system,
+                &self.tabs,
+                &ov_frames,
+                ov.mode,
+                ov.selected,
+                &self.config,
+                &self.tab_attrs,
+                self.tab_text_h,
+                self.tab_char_w,
+                self.cell_w,
+                self.cell_h,
+                self.cols,
+                self.rows,
+                w,
+                h,
+                &mut areas,
+            );
+        }
         gpu.render_frame(&mut self.font_system, areas, window);
+        self.gpu = Some(gpu);
 
         if std::env::var("SPIKE_TRACE").is_ok() {
             let t0 = *TRACE_T0.get_or_init(Instant::now);
@@ -1761,7 +1791,6 @@ fn draw_overview(
     mode: OverviewMode,
     selected: usize,
     config: &Config,
-    mono_attrs: &Attrs,
     tab_attrs: &Attrs,
     tab_text_h: f32,
     tab_char_w: f32,
@@ -1789,7 +1818,14 @@ fn draw_overview(
     let mut slot = 0usize;
 
     // Dark backdrop over the whole window.
-    push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [0.0, 0.0, 0.0, config.tab_overview_opacity]);
+    // The live terminal is painted underneath now, so this is a dim rather than
+    // a cover. The Alt-held switcher is a peek over running output, so it stays
+    // lighter than the standalone overview even when the config asks for opaque.
+    let dim = match mode {
+        OverviewMode::Switcher => config.tab_overview_opacity.min(0.7),
+        OverviewMode::Standalone => config.tab_overview_opacity,
+    };
+    push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [0.0, 0.0, 0.0, dim]);
 
     let n = tabs.len();
     let cols = grid_cols(n);
@@ -1797,15 +1833,6 @@ fn draw_overview(
 
     // Banner, using the tab (larger) font. Standalone gets a two-line header
     // with the key hints; the Alt-held switcher gets a single quiet label.
-    if mode == OverviewMode::Standalone {
-        push_ov_text(pool, slot, fs, tab_attrs, "TAB OVERVIEW MODE", 16.0, 12.0, 1.0, [1.0, 1.0, 1.0], None, None, areas, bounds);
-        slot += 1;
-        push_ov_text(pool, slot, fs, tab_attrs, "ESC exit | Enter select | Alt+Return new | Arrows move | Shift+Arrows reorder | Ctrl+Alt+X close", 16.0, 34.0, 1.0, [0.7, 0.7, 0.7], None, None, areas, bounds);
-        slot += 1;
-    } else {
-        push_ov_text(pool, slot, fs, tab_attrs, "Tab Switcher", 16.0, 12.0, 1.0, [0.36, 0.75, 0.75], None, None, areas, bounds);
-        slot += 1;
-    }
 
     // Grid geometry.
     let pad = 10.0;
@@ -1825,16 +1852,43 @@ fn draw_overview(
     let grid_x = ((wf - grid_w) / 2.0).max(8.0);
     let grid_y = (banner_h + ((hf - banner_h - grid_h) / 2.0)).max(banner_h);
 
-    // Preview scale. Fitting the whole grid into a tile (170 columns into 300px)
-    // puts every glyph at a couple of pixels and reads as grey mush, so keep the
-    // glyphs legible and *crop* instead -- anchored on the cursor, which is where
-    // an agent's output actually is.
+    // Headers sit on a dark pill: the live tab strip shows through now, and bare
+    // text over it was unreadable.
+    let title = if mode == OverviewMode::Standalone { "TAB OVERVIEW MODE" } else { "Tab Switcher" };
+    let title_col: [f32; 3] =
+        if mode == OverviewMode::Standalone { [1.0, 1.0, 1.0] } else { [0.36, 0.75, 0.75] };
+    let (bx, by) = if mode == OverviewMode::Standalone {
+        (16.0, 12.0)
+    } else {
+        // Just above the tiles, which keeps it clear of the tab strip.
+        (grid_x, (grid_y - tab_text_h - 14.0).max(4.0))
+    };
+    push_rrect(
+        &mut gpu.rects, bx - 8.0, by - 5.0,
+        title.len() as f32 * tab_char_w + 16.0, tab_text_h + 10.0,
+        [0.0, 0.0, 0.0, 0.62], 5.0,
+    );
+    push_ov_text(pool, slot, fs, tab_attrs, title, bx, by, 1.0, title_col, None, None, areas, bounds);
+    slot += 1;
+    if mode == OverviewMode::Standalone {
+        let hint = "ESC exit | Enter select | Alt+Return new | Arrows move | Shift+Arrows reorder | Ctrl+Alt+X close";
+        push_rrect(
+            &mut gpu.rects, 8.0, 31.0,
+            hint.len() as f32 * tab_char_w + 16.0, tab_text_h + 10.0,
+            [0.0, 0.0, 0.0, 0.62], 5.0,
+        );
+        push_ov_text(pool, slot, fs, tab_attrs, hint, 16.0, 36.0, 1.0, [0.72, 0.72, 0.72], None, None, areas, bounds);
+        slot += 1;
+    }
+
+    // Previews are the whole grid, shrunk -- a low-resolution picture of the
+    // terminal rather than a readable excerpt. Small and unreadable is the
+    // point: across eight tiles it still tells you *where* the content sits
+    // (prompt at the left, a dense block of output, empty rows below), which a
+    // zoomed crop of one tab cannot.
     let full_w = term_cols.max(1) as f32 * cell_w;
     let full_h = term_rows.max(1) as f32 * cell_h;
-    let fit = (thumb_w / full_w).min(thumb_h / full_h);
-    let scale = fit.max(3.5 / cell_w).min(1.0);
-    let view_cols = ((thumb_w / (cell_w * scale)) as usize).max(1);
-    let view_rows = ((thumb_h / (cell_h * scale)) as usize).max(1);
+    let scale = (thumb_w / full_w).min(thumb_h / full_h);
     let radius = 8.0f32;
     let chip = tab_text_h.max(14.0);
 
@@ -1874,7 +1928,11 @@ fn draw_overview(
                 [1.0, 1.0, 1.0, 0.12], radius + 1.0, 
             );
         }
-        let bgc = if selected { [0.13, 0.30, 0.30, 0.98] } else { [0.09, 0.09, 0.09, 0.97] };
+        // Tiles are fully opaque on purpose: all text is drawn in a single pass
+        // after all rects, so a translucent tile had the live terminal's text
+        // bleeding through it. The dim between tiles is where the live terminal
+        // shows; inside a tile you see only that tab's preview.
+        let bgc = if selected { [0.13, 0.30, 0.30, 1.0] } else { [0.09, 0.09, 0.09, 1.0] };
         push_rrect(&mut gpu.rects, tx, ty, tile_w, tile_h, bgc, radius);
 
         // Header: index chip in the accent colour, then the title.
@@ -1901,60 +1959,46 @@ fn draw_overview(
         );
         slot += 1;
 
-        // Preview, clipped to the tile so nothing bleeds over the frame.
+        // Preview area: a slightly deeper well inside the tile, for depth.
         let thx = tx + pad;
         let thy = ty + pad + header_h;
-        let thumb_bounds = TextBounds {
-            left: thx as i32,
-            top: thy as i32,
-            right: (thx + thumb_w) as i32,
-            bottom: (thy + thumb_h) as i32,
-        };
         push_rrect(
             &mut gpu.rects, thx - 1.0, thy - 1.0, thumb_w + 2.0, thumb_h + 2.0,
-            [0.0, 0.0, 0.0, 0.55], 4.0, 
+            [0.03, 0.03, 0.03, 1.0], 4.0,
         );
-        let anchor = frame
-            .cursor
-            .map(|(_, cy)| cy as usize)
-            .unwrap_or(term_rows.saturating_sub(1))
-            .min(term_rows.saturating_sub(1));
-        let top_row = if term_rows > view_rows {
-            anchor
-                .saturating_sub(view_rows / 2)
-                .min(term_rows - view_rows)
-        } else {
-            0
-        };
+        // Preview: one block per non-blank run, tinted with the run's own text
+        // colour. Shaped glyphs at this scale are one or two pixels tall and read
+        // as noise; blocks read as a picture -- where text sits, how dense it is,
+        // whether the prompt is still waiting at the bottom. It costs no glyph
+        // pool slots either, which matters when eight tiles draw at once.
         for run in &frame.runs {
-            if slot >= pool.len() {
-                break; // glyph pool exhausted; stop rather than panic
-            }
-            if (run.row as usize) < top_row || (run.row as usize) >= top_row + view_rows {
-                continue;
-            }
-            if run.col as usize >= view_cols {
+            if (run.row as usize) >= term_rows || (run.col as usize) >= term_cols {
                 continue;
             }
             if run.text.chars().all(|c| c == ' ') {
                 continue;
             }
-            let sx = thx + run.col as f32 * cell_w * scale;
-            let sy = thy + (run.row as f32 - top_row as f32) * cell_h * scale;
-            let sw = (run.width as f32 * cell_w * scale).min(thx + thumb_w - sx);
+            // Runs carry the padding spaces out to the end of the line. That is
+            // invisible when drawing glyphs but would paint a block across the
+            // whole tile here, so measure the inked extent, not the run.
+            let lead = run.text.chars().take_while(|c| *c == ' ').count();
+            let trail = run.text.chars().rev().take_while(|c| *c == ' ').count();
+            let inked = run
+                .width
+                .saturating_sub((lead + trail) as u32)
+                .max(1) as f32
+                * cell_w
+                * scale;
+            let sx = thx + (run.col as f32 + lead as f32) * cell_w * scale;
+            let sy = thy + run.row as f32 * cell_h * scale;
+            let sw = inked.max(cell_w * scale).min(thx + thumb_w - sx);
             if sw <= 0.0 {
                 continue;
             }
             push_rect(
-                &mut gpu.rects, sx, sy, sw, cell_h * scale,
-                [run.bg[0], run.bg[1], run.bg[2], 1.0],
+                &mut gpu.rects, sx, sy, sw, (cell_h * scale * 0.62).max(1.0),
+                [run.fg[0], run.fg[1], run.fg[2], 0.62],
             );
-            push_ov_text(
-                pool, slot, fs, mono_attrs, &run.text,
-                sx, sy, scale, run.fg, Some(cell_w), Some(run.width as f32 * cell_w),
-                areas, thumb_bounds,
-            );
-            slot += 1;
         }
         // Entangled marker.
         if t.entangled {

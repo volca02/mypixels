@@ -264,7 +264,7 @@ impl Gpu {
 
         let rect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rects"),
-            size: (1024 * 24) as u64,
+            size: (1024 * std::mem::size_of::<RectVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -338,10 +338,16 @@ impl Gpu {
             });
 
             pass.set_pipeline(&self.rect_pipeline);
-            if self.rects.len() * 24 > self.rect_buffer.size() as usize {
+            // Stride must come from the type, not a literal: `RectVertex` grew
+            // when rounded corners landed, and a stale 24 here let 1024 vertices
+            // be written into a buffer holding 512.
+            let need = self.rects.len() * std::mem::size_of::<RectVertex>();
+            if need > self.rect_buffer.size() as usize {
                 self.rect_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("rects"),
-                    size: (self.rects.len() * 48) as u64,
+                    // 2x headroom, rounded up, so a busy overview does not
+                    // reallocate on every frame.
+                    size: ((need * 2) as u64).next_multiple_of(4096),
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });

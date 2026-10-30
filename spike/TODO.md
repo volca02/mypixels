@@ -32,6 +32,22 @@ their notes: the causes were rarely where the symptom pointed.
 
 ## Still open
 
+- [ ] **See-through switcher (half done).** The terminal is now painted under the
+      overlay, so the dim backdrop means something and coloured backgrounds show
+      through. Terminal *text* does not, and cannot with the current single render
+      pass: glyphon draws all text after all rects, so live text bled through the
+      tiles. Behind the overview the terminal is therefore drawn as a colour field
+      only. Real transparency needs the overlay in its own render pass (`LoadOp::Load`
+      for rects) *and* a second `TextRenderer` -- calling `TextRenderer::prepare`
+      twice a frame with the same renderer swaps the vertex buffers its earlier
+      draw already referenced, so one renderer cannot serve two passes.
+- [ ] **Debug-build CPU.** Not reproducible offscreen: debug idles at 2 fps /
+      4.2% CPU on Xvfb, and coverage resolution is cheap (11 tests including 7
+      codepoint scans run in 0.43s unoptimised). Needs a measurement from the real
+      Wayland session. The correct fix is damage-driven rendering -- `Term::damage()`
+      is public and reports dirty rows, but our glyph pool is indexed by run, so
+      per-row caching needs a slot-per-row layout first.
+
 - [ ] **Titles don't live-update.** They track the terminal title via `Tab.title`,
       but confirm the strip re-renders on change at the original's cadence, and that
       the rename prompt seeds correctly (renaming a tab titled `shell` produced
