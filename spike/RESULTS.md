@@ -87,6 +87,21 @@ backpressure, no dropped frames on the emulation side.
    uses a *different* 6-vertex order that also renders full quads (verified by
    capturing the strip); don't assume any particular 6-vertex order is safe —
    use the explicit two-triangle quad for new rect code.
+9. **A hand-rolled damage flag silently swallowed frames.** `RedrawRequested`
+   only called `draw()` when a `wake` atomic was set, and `wake` was set by the
+   pty listener (plus a few UI sites). Anything else that called
+   `request_redraw()` — e.g. the cursor-blink timer — woke the event loop, got
+   `RedrawRequested`, and then drew *nothing*, because it had remembered to
+   request a redraw but not to set the flag. Symptom: the cursor looked like a
+   static dim block (it is `CURSOR_COLOR` at 35% alpha, so rgb(49,49,53) over
+   black) and never blinked, while the blink flag itself was provably toggling.
+   Fix: draw unconditionally on `RedrawRequested` and delete `wake` entirely.
+   winit already models "a frame is wanted" — a second, manually-maintained
+   damage flag is a footgun where every new caller must remember it, and the
+   failure mode is silent. Verified this costs nothing: under the 30 fps stress
+   the loop draws at 30.0-30.5 fps, i.e. exactly one frame per output batch, so
+   the gate was never actually suppressing work (winit coalesces redundant
+   requests). Lesson: don't duplicate the event loop's own redraw contract.
 
 ## Offscreen visual testing (no desktop interference)
 
@@ -164,6 +179,17 @@ redraw storm at single-digit CPU. The port is validated.
   `show_req` / `open`), with the show guarded by "Alt still held" to dodge the
   press/release race. (The test FIFO can't emit `ModifiersChanged`, so
   `switcher` / `alt_up` key specs open/dismiss it for offscreen tests.)
+- `Cursor blink`, activity-aware (the Python `cursor_blink` option is a
+  boolean; VTE's behaviour is "solid while typing, blink when idle", which is
+  what the user asked to match). The clock thread computes visibility as
+  `solid if idle < 533ms else (idle/533) % 2 == 0`, where `idle` is measured
+  from the last terminal output (`Event::Wakeup` updates `last_activity`) or
+  the last key typed into the pty. `build_frame` takes a `show_cursor` flag and
+  omits the cursor rect when the phase is off. Verified on Xvfb by counting
+  pixels of the exact cursor fill colour: during a continuous `yes` stream it
+  is present in every sample (solid, no blink); after the stream stops the
+  samples alternate 112/0 (blinking). Overview thumbnails always draw the cursor
+  (they pass `true`), so previews aren't flickering.
 
 Not yet ported: search panel (deprioritized).
 Scrollback view, selection, IME, copy/paste still not implemented (spike is

@@ -214,7 +214,6 @@ struct App {
     tablist_hidden: bool,
     fg: [f32; 3],
     bg: [f32; 3],
-    wake: Arc<AtomicBool>,
     exited: Arc<Mutex<Vec<usize>>>,
     window_slot: Arc<Mutex<Option<Arc<Window>>>>,
     window: Option<Arc<Window>>,
@@ -244,6 +243,12 @@ struct App {
     switcher_alt_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     switcher_show_req: Arc<AtomicBool>,
     switcher_open: Arc<AtomicBool>,
+    /// Cursor-blink phase (toggled by the clock thread); render draws the
+    /// cursor only when this is set.
+    cursor_blink: Arc<AtomicBool>,
+    /// Last terminal output time (shared with the pty listeners); the clock
+    /// thread reads it to keep the cursor solid right after activity.
+    last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -314,14 +319,16 @@ impl App {
         let window_slot = Arc::new(Mutex::new(None));
         let key_rx = spawn_key_reader(Arc::clone(&window_slot));
         let shared = SpikeListener {
-            wake: Arc::new(AtomicBool::new(false)),
             window: Arc::clone(&window_slot),
             tab_id: 0,
             title: Arc::new(Mutex::new(String::new())),
             exited: Arc::new(Mutex::new(Vec::new())),
+            last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
         };
-        let wake = Arc::clone(&shared.wake);
         let exited = Arc::clone(&shared.exited);
+        let last_activity = Arc::clone(&shared.last_activity);
+        // Cursor blink phase, toggled by the clock thread (activity-aware).
+        let cursor_blink = Arc::new(AtomicBool::new(true));
 
         // Alt-held switcher clock. Shared with the event-loop thread.
         let switcher_alt_at = Arc::new(Mutex::new(None));
@@ -332,14 +339,30 @@ impl App {
             let alt_at = Arc::clone(&switcher_alt_at);
             let show_req = Arc::clone(&switcher_show_req);
             let open = Arc::clone(&switcher_open);
-            let wakec = Arc::clone(&wake);
+            let blink = Arc::clone(&cursor_blink);
+            let last_act = Arc::clone(&last_activity);
             let delay_ms = config.tab_overview_delay_ms;
             let refresh_ms = 150u32; // thumbnail refresh cadence while open
+            let blink_ms = 533u128; // cursor on/off cadence
             std::thread::spawn(move || {
                 let mut last_refresh = std::time::Instant::now();
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(30));
                     let now = std::time::Instant::now();
+                    // Cursor blink: solid right after activity, then blinks in
+                    // blink_ms on/off steps measured from last activity.
+                    let idle = now.duration_since(*last_act.lock().unwrap());
+                    let visible = if idle.as_millis() < blink_ms {
+                        true
+                    } else {
+                        (idle.as_millis() / blink_ms) % 2 == 0
+                    };
+                    if blink.load(Ordering::SeqCst) != visible {
+                        blink.store(visible, Ordering::SeqCst);
+                        if let Some(w) = ws.lock().unwrap().as_ref() {
+                            w.request_redraw();
+                        }
+                    }
                     if !open.load(Ordering::SeqCst) {
                         // Open after the configured Alt hold delay.
                         if let Some(at) = *alt_at.lock().unwrap() {
@@ -350,7 +373,6 @@ impl App {
                     } else if now.duration_since(last_refresh).as_millis() >= refresh_ms as u128 {
                         // Keep every preview live while the switcher is open.
                         last_refresh = now;
-                        wakec.store(true, Ordering::SeqCst);
                         if let Some(w) = ws.lock().unwrap().as_ref() {
                             w.request_redraw();
                         }
@@ -382,7 +404,6 @@ impl App {
             tablist_hidden,
             fg,
             bg,
-            wake,
             exited,
             window_slot,
             window: None,
@@ -398,6 +419,8 @@ impl App {
             switcher_alt_at,
             switcher_show_req,
             switcher_open,
+            cursor_blink,
+            last_activity,
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -441,11 +464,11 @@ impl App {
 
     fn listener(&self) -> SpikeListener {
         SpikeListener {
-            wake: Arc::clone(&self.wake),
             window: Arc::clone(&self.window_slot),
             tab_id: 0,
             title: Arc::new(Mutex::new(String::new())),
             exited: Arc::clone(&self.exited),
+            last_activity: Arc::clone(&self.last_activity),
         }
     }
 
@@ -618,7 +641,7 @@ impl App {
         self.rebuild_term_font();
     }
 
-    fn build_frame(&self, tab: &Tab) -> FrameData {
+    fn build_frame(&self, tab: &Tab, show_cursor: bool) -> FrameData {
         let term = tab.term.lock();
         let content = term.renderable_content();
         let palette = Palette::from_colors(content.colors, &self.config.palette);
@@ -680,12 +703,16 @@ impl App {
             runs.push(r);
         }
 
-        let cursor = match content.cursor.shape {
-            alacritty_terminal::vte::ansi::CursorShape::Hidden => None,
-            _ => Some((
-                content.cursor.point.column.0 as u32,
-                content.cursor.point.line.0 as u32,
-            )),
+        let cursor = if !show_cursor {
+            None
+        } else {
+            match content.cursor.shape {
+                alacritty_terminal::vte::ansi::CursorShape::Hidden => None,
+                _ => Some((
+                    content.cursor.point.column.0 as u32,
+                    content.cursor.point.line.0 as u32,
+                )),
+            }
         };
 
         FrameData { runs, cursor }
@@ -697,7 +724,7 @@ impl App {
         if self.overview.is_none() || self.tabs.is_empty() {
             return;
         }
-        let frames: Vec<FrameData> = self.tabs.iter().map(|t| self.build_frame(t)).collect();
+        let frames: Vec<FrameData> = self.tabs.iter().map(|t| self.build_frame(t, true)).collect();
         let ov = self.overview.as_ref().unwrap();
         let gpu: &mut Gpu = match self.gpu.as_mut() {
             Some(g) => g,
@@ -746,7 +773,7 @@ impl App {
             self.draw_overview_mode(window);
             return;
         }
-        let frame = self.build_frame(tab);
+        let frame = self.build_frame(tab, self.cursor_blink.load(Ordering::SeqCst));
         let show_strip = self.show_tab_strip();
         let gpu: &mut Gpu = match self.gpu.as_mut() {
             Some(g) => g,
@@ -1049,7 +1076,6 @@ impl App {
             }
         }
         if let Some(window) = self.window.as_ref() {
-            self.wake.store(true, Ordering::SeqCst);
             window.request_redraw();
         }
     }
@@ -1077,6 +1103,9 @@ impl App {
         }
         // 3. Everything else goes to the active terminal
         if let Some(bytes) = key_bytes(key, self.modifiers) {
+            // Typing counts as activity: keep the cursor solid (no blink)
+            // right after a keypress.
+            *self.last_activity.lock().unwrap() = std::time::Instant::now();
             if let Some(tab) = self.tabs.get(self.active) {
                 // Entanglement: type into all entangled tabs
                 if self.tabs[self.active].entangled {
@@ -1461,7 +1490,6 @@ impl App {
             },
             _ => {},
         }
-        self.wake.store(true, Ordering::SeqCst);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1996,9 +2024,12 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
-                if self.wake.swap(false, Ordering::SeqCst) {
-                    self.draw(&window);
-                }
+                // Draw unconditionally: winit only sends RedrawRequested when a
+                // frame is actually wanted (our own request_redraw, resize, or
+                // compositor damage). A hand-rolled damage flag here would have
+                // to be remembered by every caller -- and silently swallow
+                // frames for the ones that didn't (e.g. the cursor blink).
+                self.draw(&window);
             },
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state == ElementState::Pressed && !key.repeat {
@@ -2023,14 +2054,12 @@ impl ApplicationHandler for App {
                         self.close_switcher();
                     }
                 }
-                self.wake.store(true, Ordering::SeqCst);
                 window.request_redraw();
             },
             WindowEvent::Focused(focused) => {
                 if let Some(tab) = self.tabs.get(self.active) {
                     tab.term.lock().is_focused = focused;
                 }
-                self.wake.store(true, Ordering::SeqCst);
                 window.request_redraw();
             },
             WindowEvent::Resized(size) => {
@@ -2047,7 +2076,6 @@ impl ApplicationHandler for App {
                     }
                 }
                 self.sync_term_size();
-                self.wake.store(true, Ordering::SeqCst);
                 window.request_redraw();
             },
             _ => {},

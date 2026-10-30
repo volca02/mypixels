@@ -25,10 +25,12 @@ spike gets usable; more feedback expected.
 
 ## Terminal rendering
 
-- [ ] **Cursor does not blink.** Add a blinking cursor. Needs a periodic
-      redraw while the terminal is focused (a timer driving `request_redraw`,
-      or a winit time-driven tick) and toggling cursor visibility on the blink
-      phase. Must not burn CPU when idle (blink at ~500ms, no redraw otherwise).
+- [x] **Cursor does not blink.** Done (activity-aware: solid while the
+      terminal is producing output or right after a keypress, ~533ms on/off
+      when idle). Note: this was blocked by a systemic bug, not a missing
+      feature -- `RedrawRequested` only drew when a hand-rolled `wake` flag was
+      set, so redraw requests that didn't set it drew nothing. That flag is
+      gone; see bug 9 in RESULTS.md.
 - [ ] **Prompt has extra characters.** Investigate which prompt shows stray
       glyphs (suspects: the inline rename prompt, or a terminal prompt line).
       Confirm against the original once identified.

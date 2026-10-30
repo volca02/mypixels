@@ -2,7 +2,6 @@
 //! plus tab metadata (title, color group, entanglement).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -18,12 +17,13 @@ use winit::window::Window;
 /// records title changes, and reports child exit.
 #[derive(Clone)]
 pub struct SpikeListener {
-    pub wake: Arc<AtomicBool>,
     pub window: Arc<Mutex<Option<Arc<Window>>>>,
     pub tab_id: usize,
     pub title: Arc<Mutex<String>>,
     /// tab ids whose child process exited (drained by the app)
     pub exited: Arc<Mutex<Vec<usize>>>,
+    /// last time the terminal produced output (drives cursor-blink cadence)
+    pub last_activity: Arc<Mutex<std::time::Instant>>,
 }
 
 impl SpikeListener {
@@ -38,17 +38,17 @@ impl EventListener for SpikeListener {
     fn send_event(&self, event: Event) {
         match event {
             Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {
-                self.wake.store(true, Ordering::SeqCst);
+                *self.last_activity.lock().unwrap() = std::time::Instant::now();
                 self.notify_window();
             },
             Event::Title(t) => {
                 *self.title.lock().unwrap() = t;
-                self.wake.store(true, Ordering::SeqCst);
+                *self.last_activity.lock().unwrap() = std::time::Instant::now();
                 self.notify_window();
             },
             Event::Exit | Event::ChildExit(_) => {
                 self.exited.lock().unwrap().push(self.tab_id);
-                self.wake.store(true, Ordering::SeqCst);
+                *self.last_activity.lock().unwrap() = std::time::Instant::now();
                 self.notify_window();
             },
             _ => {},
@@ -96,11 +96,11 @@ impl Tab {
         history: usize,
     ) -> Tab {
         let listener = SpikeListener {
-            wake: Arc::clone(&shared.wake),
             window: Arc::clone(&shared.window),
             tab_id,
             title: Arc::new(Mutex::new(String::new())),
             exited: Arc::clone(&shared.exited),
+            last_activity: Arc::clone(&shared.last_activity),
         };
 
         let term = Arc::new(FairMutex::new(Term::new(
