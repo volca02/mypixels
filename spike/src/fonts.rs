@@ -20,9 +20,10 @@
 //! whose name merely looks right is trusted).
 
 use glyphon::cosmic_text::{
-    skrifa, skrifa::prelude::*, Attrs, Fallback, Family, FontSystem, PlatformFallback,
+    skrifa, skrifa::prelude::*, Attrs, Fallback, Family, FontSystem, PlatformFallback, Style,
+    Weight,
 };
-use glyphon::fontdb::{Database, ID};
+use glyphon::fontdb::{Database, ID, Style as DbStyle};
 use std::collections::HashMap;
 use unicode_script::Script;
 
@@ -69,11 +70,13 @@ impl LineMetrics {
 pub fn line_metrics(fs: &mut FontSystem, family: &str) -> Option<LineMetrics> {
     let id = {
         let db = fs.db_mut();
+        let want = pick_face(db, family).map(|p| p.postscript);
         db.faces()
-            .find(|face| {
-                face.families
-                    .iter()
-                    .any(|(name, _lang)| name == family)
+            .find(|face| match &want {
+                // Metrics of the face we will actually draw with: Bold has
+                // different vertical metrics from the upright face.
+                Some(ps) => face.post_script_name == *ps,
+                None => face.families.iter().any(|(name, _)| name == family),
             })
             .map(|face| face.id)?
     };
@@ -93,6 +96,69 @@ pub fn line_metrics(fs: &mut FontSystem, family: &str) -> Option<LineMetrics> {
         m.units_per_em, m.ascent, m.descent, m.leading
     );
     Some(lm)
+}
+
+/// The face we intend to use for a family: which one, and at what weight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FacePick {
+    pub postscript: String,
+    pub weight: u16,
+}
+
+/// Resolve a family name to the one face we want from it.
+///
+/// Asking for a family alone is not enough. A family can ship Bold, Italic and
+/// Medium faces and no Regular at all -- Terminus (TTF) here is exactly that --
+/// and "whichever face comes first in the database" is then a coin flip that can
+/// land on Bold, which is what made the tab strip look emboldened. Rank upright
+/// faces by distance from 400 and break ties by database order, so the answer is
+/// stable and never an accident of file scan order.
+pub fn pick_face(db: &Database, family: &str) -> Option<FacePick> {
+    let mut best: Option<(u32, u16, String)> = None; // (penalty, weight, postscript)
+    for face in db.faces() {
+        if !face
+            .families
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(family))
+        {
+            continue;
+        }
+        // An italic cell is wrong in a terminal either way, so sloped faces are
+        // only ever a last resort.
+        let slope: u32 = match face.style {
+            DbStyle::Normal => 0,
+            _ => 10_000,
+        };
+        let penalty = slope + (face.weight.0 as i32 - 400).unsigned_abs();
+        if best.as_ref().map(|(b, _, _)| penalty < *b).unwrap_or(true) {
+            best = Some((penalty, face.weight.0, face.post_script_name.clone()));
+        }
+    }
+    best.map(|(_, weight, postscript)| FacePick { postscript, weight })
+}
+
+/// Pin an `Attrs` to the exact face `pick_face` chose for `family`.
+///
+/// The postscript name goes FIRST: cosmic-text matches on it directly, which
+/// takes face selection out of the matcher's hands entirely. The configured
+/// family stays as the second candidate so an unresolvable name degrades to
+/// today's behaviour instead of to a different font.
+pub fn pin_face(db: &Database, attrs: Attrs<'static>, family: &'static str) -> Attrs<'static> {
+    match pick_face(db, family) {
+        Some(pick) => {
+            log::info!("family {family:?} pinned to {:?} (weight {})", pick.postscript, pick.weight);
+            attrs
+                .family(Family::Name(Box::leak(pick.postscript.into_boxed_str())))
+                .family(Family::Name(family))
+                .weight(cosmic_weight(pick.weight))
+                .style(Style::Normal)
+        },
+        None => attrs,
+    }
+}
+
+fn cosmic_weight(w: u16) -> Weight {
+    Weight(w)
 }
 
 /// Every family name known to the database, deduped, in database order.

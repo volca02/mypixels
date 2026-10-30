@@ -343,8 +343,21 @@ impl App {
         // mono_attrs/tab_attrs are 'static, so the family names must be too.
         let term_family: &'static str = Box::leak(term_family.into_boxed_str());
         let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
-        let mono_attrs = Attrs::new().family(Family::Name(term_family));
-        let tab_attrs = Attrs::new().family(Family::Name(tab_family));
+        let (mono_attrs, tab_attrs) = {
+            let db = font_system.db();
+            (
+                fonts::pin_face(
+                    db,
+                    Attrs::new().family(Family::Name(term_family)),
+                    term_family,
+                ),
+                fonts::pin_face(
+                    db,
+                    Attrs::new().family(Family::Name(tab_family)),
+                    tab_family,
+                ),
+            )
+        };
 
         // Line height comes from the font itself, not a guessed factor.
         let term_metrics =
@@ -365,8 +378,14 @@ impl App {
                 total += word.width(font_px);
             }
         }
-        let cell_w = (total / 4.0).max(1.0);
-        let cell_h = term_lh;
+        // Whole-pixel cell grid. A fractional advance puts every glyph on a
+        // sub-pixel origin, so each stem is antialiased twice: text reads
+        // heavier than the original, and solid shapes (powerline separators,
+        // block glyphs) pick up a fringe along their edges. VTE snaps cells to
+        // integers; matching that is also what keeps columns within a pixel or
+        // two of the reference at the same point size.
+        let cell_w = (total / 4.0).round().max(1.0);
+        let cell_h = term_lh.round().max(1.0);
 
         let mut tmeasure =
             Buffer::new(&mut font_system, Metrics::new(tab_font_px, tab_lh));
@@ -381,7 +400,7 @@ impl App {
             }
         }
         let tab_char_w = (ttotal / 4.0).max(1.0);
-        let tab_h = tab_lh + TAB_VPAD * 2.0;
+        let tab_h = (tab_lh + TAB_VPAD * 2.0).round();
 
         log::info!(
             "font: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}, strip = {tab_h:.1}px"
@@ -654,7 +673,14 @@ impl App {
         self.term_metrics = fonts::line_metrics(&mut self.font_system, self.term_family)
             .unwrap_or(fonts::LineMetrics::DEFAULT);
         let term_lh = self.term_metrics.height_at(font_px);
-        self.mono_attrs = Attrs::new().family(Family::Name(self.term_family));
+        self.mono_attrs = {
+            let db = self.font_system.db();
+            fonts::pin_face(
+                db,
+                Attrs::new().family(Family::Name(self.term_family)),
+                self.term_family,
+            )
+        };
 
         let mut measure =
             Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh));
@@ -668,8 +694,8 @@ impl App {
                 total += word.width(font_px);
             }
         }
-        let cell_w = (total / 4.0).max(1.0);
-        let cell_h = term_lh;
+        let cell_w = (total / 4.0).round().max(1.0);
+        let cell_h = term_lh.round().max(1.0);
         self.cell_w = cell_w;
         self.cell_h = cell_h;
 
@@ -723,7 +749,10 @@ impl App {
         self.tab_metrics = fonts::line_metrics(&mut self.font_system, tab_family)
             .unwrap_or(fonts::LineMetrics::DEFAULT);
         let tab_lh = self.tab_metrics.height_at(tab_font_px);
-        self.tab_attrs = Attrs::new().family(Family::Name(tab_family));
+        self.tab_attrs = {
+            let db = self.font_system.db();
+            fonts::pin_face(db, Attrs::new().family(Family::Name(tab_family)), tab_family)
+        };
 
         let mut tmeasure =
             Buffer::new(&mut self.font_system, Metrics::new(tab_font_px, tab_lh));
@@ -740,7 +769,8 @@ impl App {
         let tab_char_w = (ttotal / 4.0).max(1.0);
         self.tab_char_w = tab_char_w;
         self.tab_text_h = tab_lh;
-        self.tab_h = tab_lh + TAB_VPAD * 2.0;
+        // Whole pixels again, for the same reason as the cell grid.
+        self.tab_h = (tab_lh + TAB_VPAD * 2.0).round().max(1.0);
 
         if let Some(gpu) = &mut self.gpu {
             gpu.tab_pool = (0..16)
@@ -926,7 +956,7 @@ impl App {
         if show_strip {
             let bar = self.config.tablist_background.to_f32();
             push_rect(&mut gpu.rects, 0.0, 0.0, wf, self.tab_h, [bar[0], bar[1], bar[2], 1.0]);
-            let text_y = (self.tab_h - self.tab_text_h) / 2.0;
+            let text_y = ((self.tab_h - self.tab_text_h) / 2.0).round();
 
             // Measure the labels first. With enough tabs the strip has to scroll
             // to keep the active one visible, which needs the total width up
@@ -1135,8 +1165,8 @@ impl App {
                 let buf: &Buffer = unsafe { &*(&pool[i] as *const Buffer) };
                 areas.push(TextArea {
                     buffer: buf,
-                    left: run.col as f32 * self.cell_w,
-                    top: strip_h + run.row as f32 * self.cell_h,
+                    left: (run.col as f32 * self.cell_w).round(),
+                    top: (strip_h + run.row as f32 * self.cell_h).round(),
                     scale: 1.0,
                     bounds,
                     default_color: glyphon::Color::rgb(
