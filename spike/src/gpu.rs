@@ -190,18 +190,37 @@ impl Gpu {
         // which writes a correctly premultiplied framebuffer, and the pass has
         // always cleared to TRANSPARENT -- the alpha channel was simply ignored
         // while the surface was Opaque.
-        let alpha_ok = caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PreMultiplied);
-        let alpha_mode = if alpha_ok {
-            wgpu::CompositeAlphaMode::PreMultiplied
+        // Whether the compositor will honour our alpha at all. Do NOT gate this
+        // on PreMultiplied alone: on Wayland the Vulkan swapchain typically
+        // advertises only Opaque|Inherit, because INHERIT means the compositor
+        // uses the buffer's own format semantics -- and an ARGB buffer's alpha is
+        // honoured, premultiplied as wl_shm requires. Gating on PreMultiplied
+        // silently disabled transparency on a compositor that supports it.
+        let modes = &caps.alpha_modes;
+        let want = [
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Inherit,
+        ];
+        let alpha_ok = modes.iter().any(|m| want.contains(m));
+        let alpha_mode = if modes.contains(&want[0]) {
+            want[0]
+        } else if modes.contains(&want[1]) {
+            want[1]
         } else {
-            log::warn!(
-                "surface offers no premultiplied alpha ({:?}); terminal background stays opaque",
-                caps.alpha_modes
-            );
             wgpu::CompositeAlphaMode::Auto
         };
+        log::info!(
+            "alpha: surface offers {:?}, using {:?} (translucent background: {})",
+            modes,
+            alpha_mode,
+            alpha_ok
+        );
+        if !alpha_ok {
+            log::warn!(
+                "surface offers no usable alpha ({:?}); terminal background stays opaque",
+                modes
+            );
+        }
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
