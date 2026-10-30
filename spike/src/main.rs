@@ -5,6 +5,7 @@
 //! Usage: mypixels-rs [command [args...]]   (defaults to $SHELL or bash)
 
 mod config;
+mod fonts;
 mod gpu;
 mod tab;
 
@@ -259,11 +260,15 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let mut font_system = FontSystem::new();
         let config = Config::load();
         // Pango sizes are points; cosmic-text wants pixels (@96 dpi).
         let (term_family, term_pt) = config::parse_font(&config.term_font);
         let (tab_family, tab_pt) = config::parse_font(&config.tablist_font);
+        // Fallback chain must know the primary families up front, so powerline /
+        // Nerd Font glyphs in prompts resolve to icons instead of tofu.
+        let (mut font_system, fallback_chain) =
+            fonts::build_font_system(&[term_family.as_str(), tab_family.as_str()]);
+        log::info!("font fallback chain: {:?}", fallback_chain);
         let font_px = term_pt * 96.0 / 72.0;
         let tab_font_px = tab_pt * 96.0 / 72.0;
         // Font size comes from the Buffer Metrics (see Gpu::init), not Attrs.

@@ -9,10 +9,12 @@ glyphon = "0.12.0"
 wgpu = "30"
 winit = "0.30"
 portable-pty = "0.9"
-fontdb = "0.24"
 serde_yaml = "0.9"
 dirs = "6"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
 arc-swap = "1"
+# The crate cosmic-text's `Fallback` trait signature uses; cargo unifies it so
+# we implement the very same trait cosmic-text calls.
+unicode-script = "0.5"
