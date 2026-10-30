@@ -948,18 +948,20 @@ impl App {
         // original: it sets VTE's background to alpha = 1 - term_opacity and
         // leaves the tab strip opaque. `term_opacity` is therefore an amount of
         // *transparency*, not of opacity -- 0.1 means 10% see-through.
-        let bg_a = if gpu.alpha_ok && self.config.term_opacity > 0.0 {
-            1.0 - self.config.term_opacity
+        let term_opacity = effective_opacity(self.config.term_opacity);
+        let bg_a = if gpu.alpha_ok && term_opacity > 0.0 {
+            1.0 - term_opacity
         } else {
             1.0
         };
         static BG_LOG: std::sync::Once = std::sync::Once::new();
         BG_LOG.call_once(|| {
             log::info!(
-                "background alpha {:.3} (alpha_ok {}, term_opacity {:.2}, surface alpha {:?})",
+                "background alpha {:.3} (alpha_ok {}, term_opacity {:.2} -> effective {:.2}, surface alpha {:?})",
                 bg_a,
                 gpu.alpha_ok,
                 self.config.term_opacity,
+                term_opacity,
                 gpu.config.alpha_mode
             );
         });
@@ -2519,6 +2521,26 @@ impl ApplicationHandler for App {
             let _ = tab.sender.send(Msg::Shutdown);
         }
     }
+}
+
+/// TEMPORARY compensation for the original's second alpha stage.
+///
+/// mypixels sets an RGBA visual AND app_paintable, so GTK paints the window and
+/// then VTE draws its 0.9-alpha background over that -- two stages. We have one,
+/// so our see-through does not follow 1 - term_opacity and the two disagree at
+/// different ends (too dark at 0.1, too transparent at 0.6): the curves cross,
+/// which is why no constant is a real fix. `SPIKE_OPACITY` overrides the
+/// effective transparency so it can be dialled to match at the value actually
+/// used, until the tint/window layer is modelled properly.
+fn effective_opacity(cfg: f32) -> f32 {
+    static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let over = *OVERRIDE.get_or_init(|| {
+        std::env::var("SPIKE_OPACITY")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+    });
+    over.unwrap_or(cfg)
 }
 
 /// Report what this compositor + driver pair will actually do with our alpha,
