@@ -27,3 +27,12 @@ codegen-units = 1
 lto = "thin"
 strip = true
 debug = false
+
+# --- patched dependency -------------------------------------------------------
+# The only change is one extra entry in the raster source list of
+# vendor/cosmic-text/src/swash.rs: swash's `Source::Bitmap`, which makes a
+# font's embedded alpha bitmap strikes (EBLC/EBDT) usable. Upstream omits it, so
+# a bitmap terminal font such as Terminus is drawn as an unhinted outline and
+# looks blurry. The vendored copy is trimmed of tests/docs otherwise.
+[patch.crates-io]
+cosmic-text = { path = "vendor/cosmic-text" }
