@@ -195,6 +195,52 @@ Not yet ported: search panel (deprioritized).
 Scrollback view, selection, IME, copy/paste still not implemented (spike is
 a rendering/emulation perf + config test, not a full terminal yet).
 
+## Visual pass (matching the original, then improving it)
+
+Measured the original offscreen instead of guessing: ran the Python app on Xvfb
+with `HOME=/tmp/pyhome` and a `.zshrc` that prints a ruler of 100 chars on 25
+rows, then read the cell pitch out of the screenshot by autocorrelating the
+ink profile. Result: **cell 7.0 x 15.0, 1px left padding, strip 21px**. Those
+numbers drove the metric and strip work; the spike was at 7.03 x 15.60 and 27px.
+
+- **Font fallback** (`src/fonts.rs`): see bug 10.
+- **Line height from the font**: `LineMetrics::height_at` reads `upem`/`ascent`/
+  `descent`/`leading` and rounds each component separately, Pango-style. Strip
+  lands on 21px. Two traps: skrifa's `descent` is *negative* (`ascent + descent`
+  is not a height at all -- it gave 8px), and Terminus carries leading that has
+  to be counted to reach 17px.
+- **Rounded rects**: `RectVertex` gained `local` + `size_radius`, and the fragment
+  shader does an antialiased rounded-box SDF. This is what makes the switcher
+  tiles, chips and shadows possible without a second render pass.
+- **Switcher previews**: fitting 170 columns into a 300px tile puts every glyph at
+  ~2px and reads as grey mush. Now the scale has a floor (~3.5px per column) and
+  the preview *crops*, anchored on the cursor and clipped to the tile via
+  per-`TextArea` bounds -- so each tile shows the region where an agent's output
+  actually is, and it is readable.
+- **Strip**: config-faithful colours and GTK geometry, plus a 2px accent under the
+  active tab in the tab's own colour, a theme-derived hover wash, and scrolling so
+  the active tab is revealed on overflow (it previously stopped drawing tabs past
+  the last glyph-pool slot). Mouse hover/click, with hit boxes recorded during
+  drawing.
+
+## Bugs found and fixed in the visual pass
+
+10. **Tofu for every powerline/Nerd Font glyph.** The user's starship prompt draws
+    PUA codepoints absent from plain Cascadia Code; fontconfig resolves them to
+    "Cascadia Code NF" and VTE/Pango render icons. cosmic-text 0.19 never asks
+    fontconfig: its Unix `Fallback` list is a hardcoded `&'static [&'static str]`
+    (Noto/DejaVu/FreeMono -- no PUA), and worse, the `Fallback` trait is close to
+    dead code: when shaping yields `glyph_id == 0` for a `Family::Name` run,
+    `shape.rs` builds fallback attrs with `Family::Monospace` and takes **only
+    `.next()`** -- one font, the generic monospace family, which cosmic-text seeds
+    with "Noto Sans Mono". So the one shot always missed. Fix: discover installed
+    icon families (same-design variants first, so advance widths still match the
+    cell grid) and point `Database::set_monospace_family` at the best one. A
+    `Fallback` impl is kept for iteration-based callers.
+    Consequence worth knowing: because that path consults exactly one font, CJK
+    and emoji fallback is limited to whatever it covers -- already true before the
+    change (Noto Sans Mono covers neither).
+
 ## Remaining validation (manual)
 
 Run a real agentic session inside `target/release/spike` and confirm the

@@ -13,23 +13,82 @@ use crate::MAX_RUNS;
 pub struct RectVertex {
     pub pos: [f32; 2],
     pub color: [f32; 4],
+    /// Offset from this rect's top-left in pixels. The fragment shader needs a
+    /// local coordinate to evaluate a corner radius.
+    pub local: [f32; 2],
+    /// (width, height, corner radius, unused) in pixels.
+    pub size_radius: [f32; 4],
+}
+
+/// One axis-aligned rect as six vertices -- two triangles, since the pipeline
+/// is TriangleList. Coordinates are pixels, converted to clip space against a
+/// `wf` x `hf` window. `radius` rounds the corners with an antialiased distance
+/// field; 0.0 gives a plain rect.
+///
+/// Vertex order is (TL, TR, BR) + (TL, BR, BL). An earlier version emitted
+/// (TL, TR, BL, BR, BL, BR), whose second triangle is degenerate, so only half
+/// of every rect filled -- invisible on small swatches, obvious on big ones.
+pub fn rect_vertices(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [f32; 4],
+    radius: f32,
+    wf: f32,
+    hf: f32,
+) -> [RectVertex; 6] {
+    let clip = |px: f32, py: f32| -> [f32; 2] {
+        [(px / wf) * 2.0 - 1.0, 1.0 - (py / hf) * 2.0]
+    };
+    let sr = [w, h, radius.min(w.min(h) * 0.5), 0.0];
+    let v = |px: f32, py: f32| RectVertex {
+        pos: clip(px, py),
+        color,
+        local: [px - x, py - y],
+        size_radius: sr,
+    };
+    let (x1, y1) = (x + w, y + h);
+    [
+        v(x, y),
+        v(x1, y),
+        v(x1, y1),
+        v(x, y),
+        v(x1, y1),
+        v(x, y1),
+    ]
 }
 
 const RECT_VS_WGSL: &str = r#"
 struct VSOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) local: vec2<f32>,
+    @location(2) size_radius: vec4<f32>,
 };
 @vertex
-fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> VSOut {
-    return VSOut(vec4<f32>(pos, 0.0, 1.0), color);
+fn vs(@location(0) pos: vec2<f32>,
+      @location(1) color: vec4<f32>,
+      @location(2) local: vec2<f32>,
+      @location(3) size_radius: vec4<f32>) -> VSOut {
+    return VSOut(vec4<f32>(pos, 0.0, 1.0), color, local, size_radius);
 }
 "#;
 
 const RECT_FS_WGSL: &str = r#"
 @fragment
-fn fs(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
-    return color;
+fn fs(@location(0) color: vec4<f32>,
+      @location(1) local: vec2<f32>,
+      @location(2) size_radius: vec4<f32>) -> @location(0) vec4<f32> {
+    let r = size_radius.z;
+    if (r <= 0.0) {
+        return color;
+    }
+    // Signed distance to a rounded box; negative is inside.
+    let half = size_radius.xy * 0.5;
+    let q = abs(local - half) - half + vec2<f32>(r);
+    let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    return vec4<f32>(color.rgb, color.a * smoothstep(0.5, -0.5, d));
 }
 "#;
 
@@ -165,6 +224,16 @@ impl Gpu {
                         wgpu::VertexAttribute {
                             offset: 8,
                             shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 24,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 32,
+                            shader_location: 3,
                             format: wgpu::VertexFormat::Float32x4,
                         },
                     ],

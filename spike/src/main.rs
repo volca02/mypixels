@@ -802,6 +802,7 @@ impl App {
             &self.mono_attrs,
             &self.tab_attrs,
             self.tab_text_h,
+            self.tab_char_w,
             self.cell_w,
             self.cell_h,
             self.cols,
@@ -848,15 +849,7 @@ impl App {
         // +y pointing up, screen pixels have y pointing down, so flip y.
         let push_rect =
             |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
-                let clip = |px: f32, py: f32| -> [f32; 2] {
-                    [(px / wf) * 2.0 - 1.0, 1.0 - (py / hf) * 2.0]
-                };
-                v.push(gpu::RectVertex { pos: clip(x, y), color: c });
-                v.push(gpu::RectVertex { pos: clip(x + rw, y), color: c });
-                v.push(gpu::RectVertex { pos: clip(x, y + rh), color: c });
-                v.push(gpu::RectVertex { pos: clip(x, y + rh), color: c });
-                v.push(gpu::RectVertex { pos: clip(x + rw, y), color: c });
-                v.push(gpu::RectVertex { pos: clip(x + rw, y + rh), color: c });
+                v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, 0.0, wf, hf));
             };
 
         // Window background
@@ -1771,6 +1764,7 @@ fn draw_overview(
     mono_attrs: &Attrs,
     tab_attrs: &Attrs,
     tab_text_h: f32,
+    tab_char_w: f32,
     cell_w: f32,
     cell_h: f32,
     term_cols: usize,
@@ -1783,16 +1777,11 @@ fn draw_overview(
     let hf = h as f32;
     let push_rect =
         |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
-            let clip = |px: f32, py: f32| -> [f32; 2] {
-                [(px / wf) * 2.0 - 1.0, 1.0 - (py / hf) * 2.0]
-            };
-            // Full quad as two non-degenerate triangles (TriangleList).
-            v.push(gpu::RectVertex { pos: clip(x, y), color: c });        // TL
-            v.push(gpu::RectVertex { pos: clip(x + rw, y), color: c });   // TR
-            v.push(gpu::RectVertex { pos: clip(x + rw, y + rh), color: c }); // BR
-            v.push(gpu::RectVertex { pos: clip(x, y), color: c });        // TL
-            v.push(gpu::RectVertex { pos: clip(x + rw, y + rh), color: c }); // BR
-            v.push(gpu::RectVertex { pos: clip(x, y + rh), color: c });   // BL
+            v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, 0.0, wf, hf));
+        };
+    let push_rrect =
+        |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], r: f32| {
+            v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, r, wf, hf));
         };
 
     let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
@@ -1836,10 +1825,18 @@ fn draw_overview(
     let grid_x = ((wf - grid_w) / 2.0).max(8.0);
     let grid_y = (banner_h + ((hf - banner_h - grid_h) / 2.0)).max(banner_h);
 
-    // Full terminal pixel size -> thumbnail scale.
+    // Preview scale. Fitting the whole grid into a tile (170 columns into 300px)
+    // puts every glyph at a couple of pixels and reads as grey mush, so keep the
+    // glyphs legible and *crop* instead -- anchored on the cursor, which is where
+    // an agent's output actually is.
     let full_w = term_cols.max(1) as f32 * cell_w;
     let full_h = term_rows.max(1) as f32 * cell_h;
-    let scale = (thumb_w / full_w).min(thumb_h / full_h);
+    let fit = (thumb_w / full_w).min(thumb_h / full_h);
+    let scale = fit.max(3.5 / cell_w).min(1.0);
+    let view_cols = ((thumb_w / (cell_w * scale)) as usize).max(1);
+    let view_rows = ((thumb_h / (cell_h * scale)) as usize).max(1);
+    let radius = 8.0f32;
+    let chip = tab_text_h.max(14.0);
 
     for (idx, t) in tabs.iter().enumerate() {
         let frame = &frames[idx];
@@ -1848,52 +1845,116 @@ fn draw_overview(
         let tx = grid_x + col as f32 * (tile_w + spacing);
         let ty = grid_y + row as f32 * (tile_h + spacing);
         let selected = idx == selected;
-
-        let (border, bgc, bw) = if selected {
-            ([0.29, 0.60, 0.60, 0.95], [0.13, 0.30, 0.30, 0.95], 3.0)
+        let accent = if t.group < 8 {
+            config.col[t.group].to_f32()
         } else {
-            ([0.28, 0.28, 0.28, 1.0], [0.09, 0.09, 0.09, 0.95], 2.0)
+            [0.36, 0.75, 0.75]
         };
-        push_rect(&mut gpu.rects, tx, ty, tile_w, tile_h, border);
-        push_rect(&mut gpu.rects, tx + bw, ty + bw, tile_w - 2.0 * bw, tile_h - 2.0 * bw, bgc);
 
-        // Header: group-colour square + "N: title".
-        let hx = tx + pad;
-        let hy = ty + pad + 2.0;
-        if t.group < 8 {
-            let c = config.col[t.group].to_f32();
-            push_rect(&mut gpu.rects, hx, hy + 1.0, 9.0, 9.0, [c[0], c[1], c[2], 1.0]);
+        // Depth: three expanding, fading rounded rects behind the tile. A real
+        // blur needs a second render pass; stacked rects read the same at this
+        // size and cost a handful of triangles.
+        for (grow, a) in [(10.0f32, 0.05f32), (6.0, 0.08), (3.0, 0.12)] {
+            push_rrect(
+                &mut gpu.rects, tx - grow, ty - grow + 4.0,
+                tile_w + grow * 2.0, tile_h + grow * 2.0,
+                [0.0, 0.0, 0.0, a], radius + grow, 
+            );
         }
-        let title = t.display_title().chars().take(34).collect::<String>();
-        let header_text = format!("{}: {}", idx + 1, title);
-        let header_color: [f32; 3] = if selected { [1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.8] };
+        // Frame: the selected tile is ringed in its own group colour, the rest
+        // get a faint light edge.
+        if selected {
+            push_rrect(
+                &mut gpu.rects, tx - 2.0, ty - 2.0, tile_w + 4.0, tile_h + 4.0,
+                [accent[0], accent[1], accent[2], 0.95], radius + 2.0, 
+            );
+        } else {
+            push_rrect(
+                &mut gpu.rects, tx - 1.0, ty - 1.0, tile_w + 2.0, tile_h + 2.0,
+                [1.0, 1.0, 1.0, 0.12], radius + 1.0, 
+            );
+        }
+        let bgc = if selected { [0.13, 0.30, 0.30, 0.98] } else { [0.09, 0.09, 0.09, 0.97] };
+        push_rrect(&mut gpu.rects, tx, ty, tile_w, tile_h, bgc, radius);
+
+        // Header: index chip in the accent colour, then the title.
+        let hx = tx + pad;
+        let hy = ty + pad;
+        push_rrect(
+            &mut gpu.rects, hx, hy, chip, chip,
+            [accent[0], accent[1], accent[2], 1.0], 3.0, 
+        );
+        let digits = if idx < 9 { 1 } else { 2 };
+        let num_x = hx + (chip - digits as f32 * tab_char_w) / 2.0;
         push_ov_text(
-            pool, slot, fs, tab_attrs, &header_text,
-            hx + 14.0, hy - 2.0, 1.0, header_color, None, None, areas, bounds,
+            pool, slot, fs, tab_attrs, &format!("{}", idx + 1),
+            num_x, hy - 1.0, 1.0, [0.05, 0.05, 0.05], None, None, areas, bounds,
         );
         slot += 1;
 
-        // Thumbnail: terminal content scaled into the tile.
+        let room = ((tile_w - pad * 2.0 - chip - 6.0) / tab_char_w).max(1.0) as usize;
+        let title: String = t.display_title().chars().take(room).collect();
+        let header_color: [f32; 3] = if selected { [1.0, 1.0, 1.0] } else { [0.78, 0.78, 0.78] };
+        push_ov_text(
+            pool, slot, fs, tab_attrs, &title,
+            hx + chip + 6.0, hy - 1.0, 1.0, header_color, None, None, areas, bounds,
+        );
+        slot += 1;
+
+        // Preview, clipped to the tile so nothing bleeds over the frame.
         let thx = tx + pad;
         let thy = ty + pad + header_h;
+        let thumb_bounds = TextBounds {
+            left: thx as i32,
+            top: thy as i32,
+            right: (thx + thumb_w) as i32,
+            bottom: (thy + thumb_h) as i32,
+        };
+        push_rrect(
+            &mut gpu.rects, thx - 1.0, thy - 1.0, thumb_w + 2.0, thumb_h + 2.0,
+            [0.0, 0.0, 0.0, 0.55], 4.0, 
+        );
+        let anchor = frame
+            .cursor
+            .map(|(_, cy)| cy as usize)
+            .unwrap_or(term_rows.saturating_sub(1))
+            .min(term_rows.saturating_sub(1));
+        let top_row = if term_rows > view_rows {
+            anchor
+                .saturating_sub(view_rows / 2)
+                .min(term_rows - view_rows)
+        } else {
+            0
+        };
         for run in &frame.runs {
-            let blank = run.text.chars().all(|c| c == ' ');
+            if slot >= pool.len() {
+                break; // glyph pool exhausted; stop rather than panic
+            }
+            if (run.row as usize) < top_row || (run.row as usize) >= top_row + view_rows {
+                continue;
+            }
+            if run.col as usize >= view_cols {
+                continue;
+            }
+            if run.text.chars().all(|c| c == ' ') {
+                continue;
+            }
             let sx = thx + run.col as f32 * cell_w * scale;
-            let sy = thy + run.row as f32 * cell_h * scale;
-            let sw = run.width as f32 * cell_w * scale;
-            let sh = cell_h * scale;
-            // Per-run background (skip when it matches the tile bg).
-            if !blank {
-                push_rect(&mut gpu.rects, sx, sy, sw, sh, [run.bg[0], run.bg[1], run.bg[2], 1.0]);
+            let sy = thy + (run.row as f32 - top_row as f32) * cell_h * scale;
+            let sw = (run.width as f32 * cell_w * scale).min(thx + thumb_w - sx);
+            if sw <= 0.0 {
+                continue;
             }
-            if !blank {
-                push_ov_text(
-                    pool, slot, fs, mono_attrs, &run.text,
-                    sx, sy, scale, run.fg, Some(cell_w), Some(run.width as f32 * cell_w),
-                    areas, bounds,
-                );
-                slot += 1;
-            }
+            push_rect(
+                &mut gpu.rects, sx, sy, sw, cell_h * scale,
+                [run.bg[0], run.bg[1], run.bg[2], 1.0],
+            );
+            push_ov_text(
+                pool, slot, fs, mono_attrs, &run.text,
+                sx, sy, scale, run.fg, Some(cell_w), Some(run.width as f32 * cell_w),
+                areas, thumb_bounds,
+            );
+            slot += 1;
         }
         // Entangled marker.
         if t.entangled {
