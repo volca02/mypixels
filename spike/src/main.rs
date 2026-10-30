@@ -967,9 +967,11 @@ impl App {
             };
             let clock_w = clock_label
                 .as_ref()
-                .map(|s| s.chars().count() as f32 * self.tab_char_w + TAB_PAD * 2.0)
+                .map(|s| s.chars().count() as f32 * self.tab_char_w + 2.0)
                 .unwrap_or(0.0);
-            let add_w = 2.0 * self.tab_char_w + TAB_PAD * 2.0;
+            // "[+]" is three glyphs; the original's add button carries only a
+            // couple of pixels of padding, not the tabs' 8px.
+            let add_w = 3.0 * self.tab_char_w + 2.0;
             let total =
                 clock_w + faces.iter().map(|f| f.w + TAB_GAP).sum::<f32>() + add_w;
 
@@ -977,6 +979,7 @@ impl App {
             let mut scroll = 0.0f32;
             if total > wf && !faces.is_empty() {
                 let active_end = clock_w
+                    + add_w
                     + faces.iter().take(self.active + 1).map(|f| f.w + TAB_GAP).sum::<f32>();
                 let want = active_end - (wf - add_w - TAB_PAD);
                 scroll = want.max(0.0).min((total - wf).max(0.0));
@@ -991,10 +994,26 @@ impl App {
 
                 if let Some(label) = clock_label.as_deref() {
                     if slot < tpool.len() {
-                        push_tab_label(tpool, slot, fs, attrs, label, x + TAB_PAD, text_y, CLOCK_COLOR, &mut areas, self.tab_char_w, bounds);
+                        push_tab_label(tpool, slot, fs, attrs, label, x + 1.0, text_y, CLOCK_COLOR, &mut areas, self.tab_char_w, bounds);
                         slot += 1;
                     }
-                    x += clock_w + TAB_GAP;
+                    x += clock_w;
+                }
+
+                // The add button comes FIRST, right after the prepend: the
+                // original packs it with `pack_start`, so it renders to the left
+                // of every tab. Appending it after the tabs (as this did) was the
+                // single most visible difference between the two title bars.
+                {
+                    let c = self.config.add_button_color.to_f32();
+                    let bbg = if self.hover_add { brighten(bar, 1.4) } else { brighten(bar, 1.1) };
+                    push_rect(&mut gpu.rects, x, 0.0, add_w, self.tab_h - 1.0, [bbg[0], bbg[1], bbg[2], 1.0]);
+                    if slot < tpool.len() {
+                        push_tab_label(tpool, slot, fs, attrs, "[+]", x + 1.0, text_y, c, &mut areas, self.tab_char_w, bounds);
+                        slot += 1;
+                    }
+                    add_hit = (x, x + add_w);
+                    x += add_w;
                 }
 
                 for (i, face) in faces.iter().enumerate() {
@@ -1029,11 +1048,6 @@ impl App {
                         // grey, so hover matches whatever theme is configured.
                         push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [fgc[0], fgc[1], fgc[2], 0.12]);
                     }
-                    if selected {
-                        // 2px accent in the tab's own colour: keeps selection
-                        // legible even when fg and bg differ only slightly.
-                        push_rect(&mut gpu.rects, x, self.tab_h - 3.0, face.w, 3.0, [fgc[0], fgc[1], fgc[2], 1.0]);
-                    }
                     let marker_slot = slot;
                     let label_slot = slot + if face.marker { 1 } else { 0 };
                     let mut tx = x + TAB_PAD;
@@ -1046,15 +1060,6 @@ impl App {
                     slot += need;
                     x += face.w + TAB_GAP;
                 }
-
-                // [+] button: GTK styles it `brighten(tablist_background, 1.1)`.
-                let c = self.config.add_button_color.to_f32();
-                let bbg = if self.hover_add { brighten(bar, 1.4) } else { brighten(bar, 1.1) };
-                push_rect(&mut gpu.rects, x, 0.0, add_w, self.tab_h - 1.0, [bbg[0], bbg[1], bbg[2], 1.0]);
-                if slot < tpool.len() {
-                    push_tab_label(tpool, slot, fs, attrs, "[+]", x + TAB_PAD, text_y, c, &mut areas, self.tab_char_w, bounds);
-                }
-                add_hit = (x, x + add_w);
             }
         }
         self.tab_hits = tab_hits;
