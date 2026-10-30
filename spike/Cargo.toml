@@ -19,3 +19,11 @@ arc-swap = "1"
 # we implement the very same trait cosmic-text calls.
 unicode-script = "0.5"
 libc = "0.2"
+
+[profile.release]
+# Terminal emulator: throughput matters, and the default release profile leaves
+# real gains on the table. Thin LTO across crates without fat-LTO build times.
+codegen-units = 1
+lto = "thin"
+strip = true
+debug = false
