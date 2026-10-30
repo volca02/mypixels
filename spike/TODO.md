@@ -68,22 +68,35 @@ their notes: the causes were rarely where the symptom pointed.
 - The reference app runs offscreen with `HOME=/tmp/pyhome`, whose `.zshrc` prints a
   ruler; that is how the 7x15 cell and 21px strip were measured.
 
-## Switcher previews: real downscaled frames, one tile per frame (mostly done)
+## Switcher previews: real downscaled frames (done), one caveat
 
-Shipped: the selected tab's tile samples a real render. Its screen is shaped into
-a `Buffer` of its own -- one line per terminal row, gaps padded with spaces so
+Shipped: every tile samples a real render. Each tab's screen is shaped into a
+`Buffer` of its own -- one line per terminal row, gaps padded with spaces so
 columns land on the grid -- drawn into an offscreen texture at window size, and
-sampled back into the tile by a new pipeline with a 4x4 box filter. The other
-tiles still draw the tinted colour blocks, and that is the right fallback: only
-one tab per frame is affordable (see the budget note below).
+sampled back into the tile by a new pipeline with a 4x4 box filter. Nothing is
+shaped every frame: a preview is rebuilt when its content changed *and* its own
+throttle expired (60ms for the selected tile, 200ms for the rest), at most two
+per frame, so a busy grid cannot turn one redraw into a 60ms hitch. A throttled
+tile keeps showing its previous frame, which is what a thumbnail needs anyway.
+
+The colour-block previews are gone. Mixed styles read as broken: half the grid
+looking like a picture and half like a bar chart looks like a bug even when each
+half is working.
+
+Two bugs found by looking at the output rather than at the code:
+
+- Binding the whole quad vertex buffer and drawing `0..6` per tile painted the
+  *first* tile's geometry once per texture. Only one tile showed anything, and it
+  showed the wrong tab. Slice the buffer per quad.
+- A round-robin that seeded with the selected tab and rotated from index 1 could
+  list one tab twice and starve another forever.
 
 What is left:
 
-- Only the selected tile is real. Round-robin one more tab per frame, skipping
-  tabs whose `frame_sig` is unchanged, so a grid of eight fills in over a second.
-- A faithful downscale of a mostly-black terminal is mostly black: the real tile
-  reads dimmer than the bright blocks next to it. If that is annoying, lift it in
-  the sampling shader rather than in the offscreen render.
+- Dense small text reads faint. A faithful downscale of thin grey glyphs on black
+  is mostly black, so a wall of output looks dimmer than the coloured prompt
+  lines. If that is annoying, lift it in the sampling shader (`PREV_FS_WGSL`),
+  not in the offscreen render.
 - The same pass now makes a true see-through switcher possible: the offscreen
   target already holds a complete frame per tab.
 
