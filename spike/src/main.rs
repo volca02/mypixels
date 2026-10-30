@@ -2523,15 +2523,21 @@ impl ApplicationHandler for App {
     }
 }
 
-/// TEMPORARY compensation for the original's second alpha stage.
+/// TEMPORARY compensation for the difference between our one alpha stage and the
+/// original's, applied by default; `SPIKE_OPACITY` replaces it outright.
 ///
-/// mypixels sets an RGBA visual AND app_paintable, so GTK paints the window and
-/// then VTE draws its 0.9-alpha background over that -- two stages. We have one,
-/// so our see-through does not follow 1 - term_opacity and the two disagree at
-/// different ends (too dark at 0.1, too transparent at 0.6): the curves cross,
-/// which is why no constant is a real fix. `SPIKE_OPACITY` overrides the
-/// effective transparency so it can be dialled to match at the value actually
-/// used, until the tint/window layer is modelled properly.
+/// Two readings from the user, at the values actually used:
+///   term_opacity 0.1 -> ours too dark (needs to be more see-through)
+///   term_opacity 0.6 -> ours too transparent (needs to be less see-through)
+/// The first wants eff > x, the second eff < x, so the correction must cross and
+/// no constant or scale factor can do it. Modelled as a bump that ramps in over
+/// the first tenth and a flatter slope above it:
+///   eff = 0.75*x + 0.105*min(1, x/0.1)
+/// which gives 0.18 at 0.1 and 0.555 at 0.6, is continuous, monotone, and 0 at 0
+/// so an opaque config stays opaque. That is curve-fitting, not a derivation --
+/// the likely real cause is that VTE composites its *text* inside the translucent
+/// layer as well, which lifts the whole appearance rather than the background.
+/// Re-check after the window/tint layer is modelled; then keep or delete this.
 fn effective_opacity(cfg: f32) -> f32 {
     static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     let over = *OVERRIDE.get_or_init(|| {
@@ -2540,7 +2546,11 @@ fn effective_opacity(cfg: f32) -> f32 {
             .and_then(|s| s.trim().parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))
     });
-    over.unwrap_or(cfg)
+    if let Some(v) = over {
+        return v;
+    }
+    let x = cfg.clamp(0.0, 1.0);
+    (0.75 * x + 0.105 * (x / 0.1).min(1.0)).clamp(0.0, 1.0)
 }
 
 /// Report what this compositor + driver pair will actually do with our alpha,
