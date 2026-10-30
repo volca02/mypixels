@@ -163,6 +163,24 @@ struct FrameData {
     cursor: Option<(u32, u32)>,
 }
 
+/// Tab overview navigation state (mirrors the Python TabOverview, standalone
+/// mode). `selected` is the highlighted tile; `desired_column` is remembered
+/// so up/down navigation stays in a column even when rows have fewer tabs.
+#[derive(Clone, Copy)]
+struct OverviewState {
+    selected: usize,
+    desired_column: usize,
+}
+
+/// Grid columns for a tab overview, matching the original:
+/// `ceil(sqrt(n * 1.5))`, at least 1.
+fn grid_cols(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    ((n as f32 * 1.5).sqrt().ceil() as usize).max(1)
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -199,6 +217,11 @@ struct App {
     /// terminal; Enter commits, Esc cancels.
     renaming: bool,
     rename_draft: String,
+    /// Tab overview (standalone mode): when Some, the overview overlay is
+    /// shown and keys navigate/select/move tabs instead of reaching the
+    /// terminal. `selected` is the highlighted tab; `desired_column` is kept
+    /// for vertical navigation (like the original TabOverview).
+    overview: Option<OverviewState>,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -313,6 +336,7 @@ impl App {
             term_pt,
             renaming: false,
             rename_draft: String::new(),
+            overview: None,
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -606,6 +630,45 @@ impl App {
         FrameData { runs, cursor }
     }
 
+    /// Render the standalone tab overview. Builds a frame per tab (before the
+    /// mutable gpu borrow), then hands off to `draw_overview`.
+    fn draw_overview_mode(&mut self, window: &Window) {
+        if self.overview.is_none() || self.tabs.is_empty() {
+            return;
+        }
+        let frames: Vec<FrameData> = self.tabs.iter().map(|t| self.build_frame(t)).collect();
+        let ov = self.overview.as_ref().unwrap();
+        let gpu: &mut Gpu = match self.gpu.as_mut() {
+            Some(g) => g,
+            None => return,
+        };
+        let (w, h) = (gpu.config.width, gpu.config.height);
+        if w == 0 || h == 0 {
+            return;
+        }
+        gpu.rects.clear();
+        let mut areas: Vec<TextArea> = Vec::new();
+        draw_overview(
+            gpu,
+            &mut self.font_system,
+            &self.tabs,
+            &frames,
+            ov,
+            &self.config,
+            &self.mono_attrs,
+            &self.tab_attrs,
+            self.tab_text_h,
+            self.cell_w,
+            self.cell_h,
+            self.cols,
+            self.rows,
+            w,
+            h,
+            &mut areas,
+        );
+        gpu.render_frame(&mut self.font_system, areas, window);
+    }
+
     fn draw(&mut self, window: &Window) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -615,6 +678,11 @@ impl App {
         {
             let active = &self.tabs[self.active];
             active.term.lock().is_focused = window.has_focus();
+        }
+        // Overview mode is drawn as a full overlay and skips the normal view.
+        if self.overview.is_some() {
+            self.draw_overview_mode(window);
+            return;
         }
         let frame = self.build_frame(tab);
         let show_strip = self.show_tab_strip();
@@ -907,13 +975,18 @@ impl App {
             self.handle_rename_key(key);
             return;
         }
-        // 1. Configured bindings
-        let overview_active = false; // overview not ported yet
-        if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
+        // 1. Overview mode is modal: keys navigate/select/move tabs. Only
+        //    keys the overview doesn't claim fall through to the terminal.
+        if self.overview.is_some() {
+            self.handle_overview_key(key, event_loop);
+            return;
+        }
+        // 2. Configured bindings
+        if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, false) {
             self.do_action(&action, event_loop);
             return;
         }
-        // 2. Everything else goes to the active terminal
+        // 3. Everything else goes to the active terminal
         if let Some(bytes) = key_bytes(key, self.modifiers) {
             if let Some(tab) = self.tabs.get(self.active) {
                 // Entanglement: type into all entangled tabs
@@ -957,6 +1030,153 @@ impl App {
         }
     }
 
+    /// Keyboard handling while the tab overview is open (standalone mode).
+    /// Mirrors the original TabOverview::handle_key: nav/select/move plus
+    /// close_tab, new_tab, and bare number keys for quick switching.
+    fn handle_overview_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+        let n = self.tabs.len();
+        if n == 0 {
+            self.overview = None;
+            return;
+        }
+        let cols = grid_cols(n);
+        let action = config::find_action(&self.config.bindings, key, self.modifiers, true);
+        match action.as_deref() {
+            Some("overview_exit") => {
+                self.overview = None;
+            },
+            Some("overview_select") => {
+                let sel = self.overview.as_ref().unwrap().selected.min(n - 1);
+                self.active = sel;
+                self.overview = None;
+            },
+            Some("overview_new_tab") | Some("new_tab") => {
+                self.add_tab();
+                let newn = self.tabs.len();
+                let ov = self.overview.get_or_insert(OverviewState {
+                    selected: 0,
+                    desired_column: 0,
+                });
+                ov.selected = newn - 1;
+                ov.desired_column = (newn - 1) % grid_cols(newn);
+            },
+            Some("close_tab") => {
+                let sel = self.overview.as_ref().unwrap().selected.min(n - 1);
+                self.close_tab_at(sel, event_loop);
+                if self.tabs.is_empty() {
+                    self.overview = None;
+                } else {
+                    let newn = self.tabs.len();
+                    let ov = self.overview.as_mut().unwrap();
+                    if ov.selected >= newn {
+                        ov.selected = newn - 1;
+                    }
+                    ov.desired_column = ov.selected % grid_cols(newn);
+                }
+            },
+            Some("overview_nav_left") => {
+                let ov = self.overview.as_mut().unwrap();
+                if ov.selected > 0 {
+                    ov.selected -= 1;
+                    ov.desired_column = ov.selected % cols;
+                }
+            },
+            Some("overview_nav_right") => {
+                let ov = self.overview.as_mut().unwrap();
+                if ov.selected < n - 1 {
+                    ov.selected += 1;
+                    ov.desired_column = ov.selected % cols;
+                }
+            },
+            Some("overview_nav_up") => {
+                let ov = self.overview.as_mut().unwrap();
+                let row = ov.selected / cols;
+                if row > 0 {
+                    ov.selected = ((row - 1) * cols + ov.desired_column).min(n - 1);
+                }
+            },
+            Some("overview_nav_down") => {
+                let ov = self.overview.as_mut().unwrap();
+                let row = ov.selected / cols;
+                let target = (row + 1) * cols + ov.desired_column;
+                if target < n && target / cols > row {
+                    ov.selected = target;
+                }
+            },
+            Some("overview_first") => {
+                let ov = self.overview.as_mut().unwrap();
+                ov.selected = 0;
+                ov.desired_column = 0;
+            },
+            Some("overview_last") => {
+                let ov = self.overview.as_mut().unwrap();
+                ov.selected = n - 1;
+                ov.desired_column = (n - 1) % cols;
+            },
+            Some("overview_move_left") => {
+                let sel = self.overview.as_ref().unwrap().selected;
+                if sel > 0 {
+                    self.tabs.swap(sel, sel - 1);
+                    let ov = self.overview.as_mut().unwrap();
+                    ov.selected = sel - 1;
+                    ov.desired_column = (sel - 1) % cols;
+                }
+            },
+            Some("overview_move_right") => {
+                let sel = self.overview.as_ref().unwrap().selected;
+                if sel < n - 1 {
+                    self.tabs.swap(sel, sel + 1);
+                    let ov = self.overview.as_mut().unwrap();
+                    ov.selected = sel + 1;
+                    ov.desired_column = (sel + 1) % cols;
+                }
+            },
+            Some("overview_move_up") => {
+                let sel = self.overview.as_ref().unwrap().selected;
+                if sel >= cols {
+                    let t = self.tabs.remove(sel);
+                    let newpos = sel - cols;
+                    self.tabs.insert(newpos, t);
+                    let ov = self.overview.as_mut().unwrap();
+                    ov.selected = newpos;
+                    ov.desired_column = newpos % grid_cols(self.tabs.len());
+                }
+            },
+            Some("overview_move_down") => {
+                let sel = self.overview.as_ref().unwrap().selected;
+                if sel + cols < n {
+                    let t = self.tabs.remove(sel);
+                    let newpos = sel + cols;
+                    self.tabs.insert(newpos, t);
+                    let ov = self.overview.as_mut().unwrap();
+                    ov.selected = newpos;
+                    ov.desired_column = newpos % grid_cols(self.tabs.len());
+                }
+            },
+            _ => {
+                // Bare number keys for quick switching (standalone: no mods),
+                // matching the original. Alt+digit (goto_tab_*) has a modifier
+                // and is intentionally ignored while the overview is open.
+                if self.modifiers.is_empty() {
+                    if let Key::Character(c) = key {
+                        if let Some(ch) = c.chars().next() {
+                            if let Some(d) = ch.to_digit(10) {
+                                let idx = if d == 0 { 9 } else { (d - 1) as usize };
+                                if idx < n {
+                                    self.active = idx;
+                                    self.overview = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
     fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
         let n = self.tabs.len();
         match action {
@@ -974,6 +1194,18 @@ impl App {
             },
             "first_tab" => self.active = 0,
             "last_tab" => self.active = n.saturating_sub(1),
+            "show_tab_overview" => {
+                // Toggle: close if open, else open (standalone mode).
+                if self.overview.is_some() {
+                    self.overview = None;
+                } else if !self.tabs.is_empty() {
+                    let cols = grid_cols(self.tabs.len());
+                    self.overview = Some(OverviewState {
+                        selected: self.active,
+                        desired_column: self.active % cols,
+                    });
+                }
+            },
             "move_prev_tab" => {
                 if n > 1 && self.active > 0 {
                     self.tabs.swap(self.active, self.active - 1);
@@ -1045,8 +1277,7 @@ impl App {
                 self.renaming = true;
             },
             // Not yet ported
-            "show_search" | "show_search_all" | "search_prev" | "search_next"
-            | "show_tab_overview" => {
+            "show_search" | "show_search_all" | "search_prev" | "search_next" => {
                 log::debug!("unported action: {action}");
             },
             _ => {},
@@ -1113,6 +1344,197 @@ fn push_tab_label(
         custom_glyphs: &[],
     });
 }
+
+/// Push one text area into an overview tile, with a `scale` (for scaled
+/// thumbnails) and an optional monospace width. Mirrors `push_tab_label` but
+/// generalised. `slot` must be < pool.len().
+fn push_ov_text(
+    pool: &mut [Buffer],
+    slot: usize,
+    fs: &mut FontSystem,
+    attrs: &Attrs,
+    text: &str,
+    x: f32,
+    y: f32,
+    scale: f32,
+    color: [f32; 3],
+    monow: Option<f32>,
+    size_w: Option<f32>,
+    areas: &mut Vec<TextArea>,
+    bounds: TextBounds,
+) {
+    if slot >= pool.len() || text.is_empty() {
+        return;
+    }
+    let b = &mut pool[slot];
+    if let Some(mw) = monow {
+        b.set_monospace_width(Some(mw));
+    }
+    b.set_size(size_w, None);
+    b.set_text(text, attrs, Shaping::Basic, None);
+    b.shape_until_scroll(fs, false);
+    let buf: &Buffer = unsafe { &*(b as *const Buffer) };
+    areas.push(TextArea {
+        buffer: buf,
+        left: x,
+        top: y,
+        scale,
+        bounds,
+        default_color: glyphon::Color::rgb(
+            (color[0] * 255.0) as u8,
+            (color[1] * 255.0) as u8,
+            (color[2] * 255.0) as u8,
+        ),
+        custom_glyphs: &[],
+    });
+}
+
+/// Render the standalone tab overview: a dark backdrop, a two-line banner, and
+/// a centred grid of tiles. Each tile shows the tab's group colour, its title,
+/// and a scaled thumbnail of the terminal content (built from `frames`).
+fn draw_overview(
+    gpu: &mut Gpu,
+    fs: &mut FontSystem,
+    tabs: &[Tab],
+    frames: &[FrameData],
+    ov: &OverviewState,
+    config: &Config,
+    mono_attrs: &Attrs,
+    tab_attrs: &Attrs,
+    tab_text_h: f32,
+    cell_w: f32,
+    cell_h: f32,
+    term_cols: usize,
+    term_rows: usize,
+    w: u32,
+    h: u32,
+    areas: &mut Vec<TextArea>,
+) {
+    let wf = w as f32;
+    let hf = h as f32;
+    let push_rect =
+        |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
+            let clip = |px: f32, py: f32| -> [f32; 2] {
+                [(px / wf) * 2.0 - 1.0, 1.0 - (py / hf) * 2.0]
+            };
+            // Full quad as two non-degenerate triangles (TriangleList).
+            v.push(gpu::RectVertex { pos: clip(x, y), color: c });        // TL
+            v.push(gpu::RectVertex { pos: clip(x + rw, y), color: c });   // TR
+            v.push(gpu::RectVertex { pos: clip(x + rw, y + rh), color: c }); // BR
+            v.push(gpu::RectVertex { pos: clip(x, y), color: c });        // TL
+            v.push(gpu::RectVertex { pos: clip(x + rw, y + rh), color: c }); // BR
+            v.push(gpu::RectVertex { pos: clip(x, y + rh), color: c });   // BL
+        };
+
+    let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+    let pool = &mut gpu.pool;
+    let mut slot = 0usize;
+
+    // Dark backdrop over the whole window.
+    push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [0.0, 0.0, 0.0, config.tab_overview_opacity]);
+
+    let n = tabs.len();
+    let cols = grid_cols(n);
+    let rows = (n + cols - 1) / cols;
+
+    // Banner (two lines), using the tab (larger) font.
+    let banner = "TAB OVERVIEW MODE";
+    let hints =
+        "ESC exit | Enter select | Alt+Return new | Arrows move | Shift+Arrows reorder | Ctrl+Alt+X close";
+    push_ov_text(pool, slot, fs, tab_attrs, banner, 16.0, 12.0, 1.0, [1.0, 1.0, 1.0], None, None, areas, bounds);
+    slot += 1;
+    push_ov_text(pool, slot, fs, tab_attrs, hints, 16.0, 34.0, 1.0, [0.7, 0.7, 0.7], None, None, areas, bounds);
+    slot += 1;
+
+    // Grid geometry.
+    let pad = 10.0;
+    let spacing = 12.0;
+    let banner_h = 58.0;
+    let thumb_w = (config.tab_overview_thumb_width as f32)
+        .min((wf - 100.0) / 4.0 - 20.0)
+        .max(60.0);
+    let thumb_h = (config.tab_overview_thumb_height as f32)
+        .min(thumb_w * 0.75)
+        .max(40.0);
+    let header_h = tab_text_h + 6.0;
+    let tile_w = thumb_w + pad * 2.0;
+    let tile_h = header_h + thumb_h + pad * 2.0;
+    let grid_w = cols as f32 * tile_w + (cols.saturating_sub(1)) as f32 * spacing;
+    let grid_h = rows as f32 * tile_h + (rows.saturating_sub(1)) as f32 * spacing;
+    let grid_x = ((wf - grid_w) / 2.0).max(8.0);
+    let grid_y = (banner_h + ((hf - banner_h - grid_h) / 2.0)).max(banner_h);
+
+    // Full terminal pixel size -> thumbnail scale.
+    let full_w = term_cols.max(1) as f32 * cell_w;
+    let full_h = term_rows.max(1) as f32 * cell_h;
+    let scale = (thumb_w / full_w).min(thumb_h / full_h);
+
+    for (idx, t) in tabs.iter().enumerate() {
+        let frame = &frames[idx];
+        let row = idx / cols;
+        let col = idx % cols;
+        let tx = grid_x + col as f32 * (tile_w + spacing);
+        let ty = grid_y + row as f32 * (tile_h + spacing);
+        let selected = idx == ov.selected;
+
+        let (border, bgc, bw) = if selected {
+            ([0.29, 0.60, 0.60, 0.95], [0.13, 0.30, 0.30, 0.95], 3.0)
+        } else {
+            ([0.28, 0.28, 0.28, 1.0], [0.09, 0.09, 0.09, 0.95], 2.0)
+        };
+        push_rect(&mut gpu.rects, tx, ty, tile_w, tile_h, border);
+        push_rect(&mut gpu.rects, tx + bw, ty + bw, tile_w - 2.0 * bw, tile_h - 2.0 * bw, bgc);
+
+        // Header: group-colour square + "N: title".
+        let hx = tx + pad;
+        let hy = ty + pad + 2.0;
+        if t.group < 8 {
+            let c = config.col[t.group].to_f32();
+            push_rect(&mut gpu.rects, hx, hy + 1.0, 9.0, 9.0, [c[0], c[1], c[2], 1.0]);
+        }
+        let title = t.display_title().chars().take(34).collect::<String>();
+        let header_text = format!("{}: {}", idx + 1, title);
+        let header_color: [f32; 3] = if selected { [1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.8] };
+        push_ov_text(
+            pool, slot, fs, tab_attrs, &header_text,
+            hx + 14.0, hy - 2.0, 1.0, header_color, None, None, areas, bounds,
+        );
+        slot += 1;
+
+        // Thumbnail: terminal content scaled into the tile.
+        let thx = tx + pad;
+        let thy = ty + pad + header_h;
+        for run in &frame.runs {
+            let blank = run.text.chars().all(|c| c == ' ');
+            let sx = thx + run.col as f32 * cell_w * scale;
+            let sy = thy + run.row as f32 * cell_h * scale;
+            let sw = run.width as f32 * cell_w * scale;
+            let sh = cell_h * scale;
+            // Per-run background (skip when it matches the tile bg).
+            if !blank {
+                push_rect(&mut gpu.rects, sx, sy, sw, sh, [run.bg[0], run.bg[1], run.bg[2], 1.0]);
+            }
+            if !blank {
+                push_ov_text(
+                    pool, slot, fs, mono_attrs, &run.text,
+                    sx, sy, scale, run.fg, Some(cell_w), Some(run.width as f32 * cell_w),
+                    areas, bounds,
+                );
+                slot += 1;
+            }
+        }
+        // Entangled marker.
+        if t.entangled {
+            push_ov_text(
+                pool, slot, fs, tab_attrs, "* entangled",
+                thx, thy + thumb_h - tab_text_h, 1.0,
+                [1.0, 0.35, 0.35], None, None, areas, bounds,
+            );
+            slot += 1;
+        }
+    }
+}
+
 /// Parse a test key spec like "alt+shift+t", "ctrl+c", "esc", "f5".
 /// Test hook: read key specs from the $SPIKE_KEYS FIFO in a background
 /// thread and forward them over a channel. Returns None when unset.

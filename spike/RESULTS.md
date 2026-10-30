@@ -78,6 +78,15 @@ backpressure, no dropped frames on the emulation side.
    sRGB colors. (Note: SGR 30-37/90-97 map to `Color::Named(..)`, not
    `Indexed(..)`; the 16-color palette override had to apply to the Named
    branch too, not just Indexed.)
+8. Rect vertex order under `TriangleList`: the overview's first `push_rect`
+   emitted the 6 quad vertices as (TL,TR,BL,BR,BL,BR). As two triangles that
+   is (TL,TR,BL) + (BR,BL,BR) — the second triangle is degenerate, so only the
+   upper-left triangle filled. The large overview thumbnails made this obvious
+   as a clean diagonal clipping every tile. Fix: emit a proper two-triangle
+   quad (TL,TR,BR) + (TL,BR,BL). Note: the tab-strip `push_rect` in `draw()`
+   uses a *different* 6-vertex order that also renders full quads (verified by
+   capturing the strip); don't assume any particular 6-vertex order is safe —
+   use the explicit two-triangle quad for new rect code.
 
 ## Offscreen visual testing (no desktop interference)
 
@@ -129,7 +138,22 @@ redraw storm at single-digit CPU. The port is validated.
   prompt owns the line, and no keys reach the terminal. Verified on Xvfb:
   shell->MyTab committed, and a second rename cancelled with Esc.
 
-Not yet ported: search panel (deprioritized), tab overview (thumbnails).
+- `Tab overview` (standalone mode, Alt+o / `show_tab_overview`): a render
+  overlay (no GTK) — dark backdrop, a two-line "TAB OVERVIEW MODE" banner,
+  and a centred grid of tiles. Grid columns = `ceil(sqrt(n*1.5))` (matches the
+  Python). Each tile: group-colour square + "N: title" header, and a live
+  thumbnail = that tab's terminal runs rendered at a uniform scale into the
+  tile (a per-tab frame is built before the mutable gpu borrow). Keyboard
+  (mirrors Python TabOverview::handle_key): arrows navigate, Shift+arrows
+  reorder (swap / remove+insert), Home/End first/last, Enter selects + closes,
+  Esc exits, Alt+Return + Ctrl+Alt+W new/close tab, bare 1-9/0 quick-switch.
+  State is `OverviewState{selected,desired_column}`; `overview_*` bindings are
+  gated on `overview_active` in `find_action`, and `handle_overview_key` is
+  modal (only unclaimed keys fall through). Verified on Xvfb: open, navigate,
+  select, close, new, reorder, exit all correct.
+
+Not yet ported: search panel (deprioritized), switcher-mode overview (Alt
+hold, periodic thumbnail refresh).
 Scrollback view, selection, IME, copy/paste still not implemented (spike is
 a rendering/emulation perf + config test, not a full terminal yet).
 

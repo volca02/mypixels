@@ -94,6 +94,8 @@ pub struct Config {
     pub tab_overview_on_alt: bool,
     pub tab_overview_opacity: f32,
     pub tab_overview_delay_ms: u32,
+    pub tab_overview_thumb_width: u32,
+    pub tab_overview_thumb_height: u32,
     pub focus_new_tabs: bool,
     pub hide_single_tab: bool,
     pub multiline_tabs: bool,
@@ -195,6 +197,8 @@ impl Default for Config {
             tab_overview_on_alt: true,
             tab_overview_opacity: 0.3,
             tab_overview_delay_ms: 500,
+            tab_overview_thumb_width: 300,
+            tab_overview_thumb_height: 225,
             focus_new_tabs: true,
             hide_single_tab: false,
             multiline_tabs: true,
@@ -405,6 +409,16 @@ fn dedupe_top_level(text: &str) -> String {
                 "tab_overview_opacity" => {
                     if let Some(f) = val.as_f64() {
                         cfg.tab_overview_opacity = f.clamp(0.0, 1.0) as f32;
+                    }
+                },
+                "tab_overview_thumb_width" => {
+                    if let Some(n) = val.as_u64() {
+                        cfg.tab_overview_thumb_width = (n as u32).max(40);
+                    }
+                },
+                "tab_overview_thumb_height" => {
+                    if let Some(n) = val.as_u64() {
+                        cfg.tab_overview_thumb_height = (n as u32).max(30);
                     }
                 },
                 "autohide_delay" => {
