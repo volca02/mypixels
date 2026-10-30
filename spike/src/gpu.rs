@@ -79,7 +79,9 @@ impl Gpu {
         window: &Arc<Window>,
         font_system: &mut FontSystem,
         font_px: f32,
+        font_lh: f32,
         tab_font_px: f32,
+        tab_font_lh: f32,
     ) -> Gpu {
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
@@ -199,12 +201,12 @@ impl Gpu {
         });
 
         let pool: Vec<Buffer> = (0..MAX_RUNS)
-            .map(|_| Buffer::new(font_system, Metrics::new(font_px, font_px * 1.3)))
+            .map(|_| Buffer::new(font_system, Metrics::new(font_px, font_lh)))
             .collect();
         let tab_pool: Vec<Buffer> = (0..16)
-            .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_px * 1.3)))
+            .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_lh)))
             .collect();
-        let prompt_buf = Buffer::new(font_system, Metrics::new(font_px, font_px * 1.3));
+        let prompt_buf = Buffer::new(font_system, Metrics::new(font_px, font_lh));
 
         Gpu {
             device,

@@ -25,6 +25,72 @@ use unicode_script::Script;
 /// 'static so we can borrow the platform fallback list out of it.
 static PLATFORM: PlatformFallback = PlatformFallback;
 
+/// A font's own vertical metrics, for deriving line height at any pixel size.
+#[derive(Clone, Copy, Debug)]
+pub struct LineMetrics {
+    pub upem: f32,
+    pub ascent: f32,
+    /// Below the baseline; skrifa's convention makes this negative.
+    pub descent: f32,
+    pub leading: f32,
+}
+
+impl LineMetrics {
+    /// Fallback when a family cannot be found: 1.25 em, a typical terminal.
+    pub const DEFAULT: LineMetrics = LineMetrics {
+        upem: 1000.0,
+        ascent: 1000.0,
+        descent: -250.0,
+        leading: 0.0,
+    };
+
+    /// Pixel line height at `px`, rounding ascent, descent and leading
+    /// separately the way Pango does. Two things bit us here: skrifa reports
+    /// descent *negative* (so `ascent + descent` is not a height at all), and
+    /// some fonts carry leading that must be counted -- Terminus 12 needs it to
+    /// reach the 17px the original measures, while Cascadia Code has none.
+    pub fn height_at(&self, px: f32) -> f32 {
+        if self.upem <= 0.0 {
+            return (px * 1.25).max(1.0);
+        }
+        let scale = px / self.upem;
+        let a = (self.ascent * scale).round();
+        let d = (self.descent.abs() * scale).round();
+        let l = (self.leading * scale).round();
+        (a + d + l).max(1.0)
+    }
+}
+
+/// Read a family's vertical metrics out of the loaded database.
+pub fn line_metrics(fs: &mut FontSystem, family: &str) -> Option<LineMetrics> {
+    let id = {
+        let db = fs.db_mut();
+        db.faces()
+            .find(|face| {
+                face.families
+                    .iter()
+                    .any(|(name, _lang)| name == family)
+            })
+            .map(|face| face.id)?
+    };
+    let font = fs.get_font(id, glyphon::fontdb::Weight::NORMAL)?;
+    let m = font.metrics();
+    if m.units_per_em == 0 {
+        return None;
+    }
+    let lm = LineMetrics {
+        upem: m.units_per_em as f32,
+        ascent: m.ascent,
+        descent: m.descent,
+        leading: m.leading,
+    };
+    log::debug!(
+        "line_metrics({family}): upem={} ascent={} descent={} leading={}",
+        m.units_per_em, m.ascent, m.descent, m.leading
+    );
+    Some(lm)
+}
+
 /// Every family name known to the database, deduped, in database order.
 fn installed_families(db: &Database) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -156,6 +222,29 @@ mod tests {
         // is exercised against the real system database instead.
         let _ = names;
         Database::new()
+    }
+
+    #[test]
+    fn line_height_counts_negative_descent_as_height() {
+        // skrifa gives descent negative; the height must still grow with it.
+        let lm = LineMetrics { upem: 1000.0, ascent: 800.0, descent: -200.0, leading: 0.0 };
+        assert_eq!(lm.height_at(10.0), 10.0);
+    }
+
+    #[test]
+    fn line_height_counts_leading() {
+        // Terminus (TTF) 12pt: upem 1000, ascent 833, descent -167, leading 90
+        // -> 13 + 3 + 1 = 17px, which is what the original's tab strip measures
+        // (21px total with 2px margins above and below).
+        let lm = LineMetrics { upem: 1000.0, ascent: 833.0, descent: -167.0, leading: 90.0 };
+        assert_eq!(lm.height_at(16.0), 17.0);
+    }
+
+    #[test]
+    fn degenerate_upem_does_not_panic() {
+        let lm = LineMetrics { upem: 0.0, ascent: 0.0, descent: 0.0, leading: 0.0 };
+        assert_eq!(lm.height_at(12.0), 15.0);
+        assert!(lm.height_at(0.0) >= 1.0);
     }
 
     #[test]

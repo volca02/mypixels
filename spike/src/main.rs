@@ -34,6 +34,9 @@ use tab::{SpikeListener, Tab};
 const HISTORY: usize = 10_000;
 const MAX_RUNS: usize = 4096;
 const TAB_PAD: f32 = 6.0;
+/// Vertical padding inside a tab. The original gets 21px for Terminus 12 from
+/// GTK (`padding: 2px 8px` plus 2px label margins); we reproduce the 2+2.
+const TAB_VPAD: f32 = 2.0;
 
 const PALETTE: [[f32; 3]; 16] = [
     [0.0, 0.0, 0.0], [0.8, 0.2, 0.2], [0.2, 0.6, 0.2], [0.6, 0.6, 0.2],
@@ -212,6 +215,11 @@ struct App {
     tab_char_w: f32,
     tab_h: f32,
     tab_text_h: f32,
+    /// Vertical metrics of the term/tablist fonts, read from the fonts
+    /// themselves -- line height differs a lot per family (Cascadia 9pt lands on
+    /// 15px, Terminus 12 on 17px) and one guessed factor fit neither.
+    term_metrics: fonts::LineMetrics,
+    tab_metrics: fonts::LineMetrics,
     tablist_hidden: bool,
     fg: [f32; 3],
     bg: [f32; 3],
@@ -278,7 +286,15 @@ impl App {
         let mono_attrs = Attrs::new().family(Family::Name(term_family));
         let tab_attrs = Attrs::new().family(Family::Name(tab_family));
 
-        let mut measure = Buffer::new(&mut font_system, Metrics::new(font_px, font_px * 1.3));
+        // Line height comes from the font itself, not a guessed factor.
+        let term_metrics =
+            fonts::line_metrics(&mut font_system, &term_family).unwrap_or(fonts::LineMetrics::DEFAULT);
+        let tab_metrics =
+            fonts::line_metrics(&mut font_system, &tab_family).unwrap_or(fonts::LineMetrics::DEFAULT);
+        let term_lh = term_metrics.height_at(font_px);
+        let tab_lh = tab_metrics.height_at(tab_font_px);
+
+        let mut measure = Buffer::new(&mut font_system, Metrics::new(font_px, term_lh));
         measure.set_size(Some(800.0), None);
         measure.set_text("MMMM", &mono_attrs, Shaping::Basic, None);
         measure.shape_until_scroll(&mut font_system, false);
@@ -290,10 +306,10 @@ impl App {
             }
         }
         let cell_w = (total / 4.0).max(1.0);
-        let cell_h = font_px * 1.3;
+        let cell_h = term_lh;
 
         let mut tmeasure =
-            Buffer::new(&mut font_system, Metrics::new(tab_font_px, tab_font_px * 1.3));
+            Buffer::new(&mut font_system, Metrics::new(tab_font_px, tab_lh));
         tmeasure.set_size(Some(800.0), None);
         tmeasure.set_text("MMMM", &tab_attrs, Shaping::Basic, None);
         tmeasure.shape_until_scroll(&mut font_system, false);
@@ -305,10 +321,10 @@ impl App {
             }
         }
         let tab_char_w = (ttotal / 4.0).max(1.0);
-        let tab_h = tab_font_px * 1.3 + 6.0;
+        let tab_h = tab_lh + TAB_VPAD * 2.0;
 
         log::info!(
-            "font: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}"
+            "font: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}, strip = {tab_h:.1}px"
         );
 
         let fg = config.foreground_color.to_f32();
@@ -405,7 +421,9 @@ impl App {
             cell_h,
             tab_char_w,
             tab_h,
-            tab_text_h: tab_font_px * 1.3,
+            tab_text_h: tab_lh,
+            term_metrics,
+            tab_metrics,
             tablist_hidden,
             fg,
             bg,
@@ -434,14 +452,20 @@ impl App {
     }
 
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
-        let (_, term_pt) = config::parse_font(&self.config.term_font);
+        // Live sizes, not the config's: `term_pt` carries any zoom applied this
+        // session, and cell_h/tab_text_h are the rounded line heights we lay
+        // the grid out with, so the glyph buffers must match them exactly.
+        let term_px = self.term_pt * 96.0 / 72.0;
         let (_, tab_pt) = config::parse_font(&self.config.tablist_font);
+        let tab_px = tab_pt * 96.0 / 72.0;
         self.gpu = Some(Gpu::init(
             event_loop,
             window,
             &mut self.font_system,
-            term_pt * 96.0 / 72.0,
-            tab_pt * 96.0 / 72.0,
+            term_px,
+            self.cell_h,
+            tab_px,
+            self.tab_text_h,
         ));
     }
 
@@ -551,10 +575,13 @@ impl App {
     /// new buffers.
     fn rebuild_term_font(&mut self) {
         let font_px = self.term_pt * 96.0 / 72.0;
+        self.term_metrics = fonts::line_metrics(&mut self.font_system, self.term_family)
+            .unwrap_or(fonts::LineMetrics::DEFAULT);
+        let term_lh = self.term_metrics.height_at(font_px);
         self.mono_attrs = Attrs::new().family(Family::Name(self.term_family));
 
         let mut measure =
-            Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3));
+            Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh));
         measure.set_size(Some(800.0), None);
         measure.set_text("MMMM", &self.mono_attrs, Shaping::Basic, None);
         measure.shape_until_scroll(&mut self.font_system, false);
@@ -566,16 +593,16 @@ impl App {
             }
         }
         let cell_w = (total / 4.0).max(1.0);
-        let cell_h = font_px * 1.3;
+        let cell_h = term_lh;
         self.cell_w = cell_w;
         self.cell_h = cell_h;
 
         if let Some(gpu) = &mut self.gpu {
             gpu.pool = (0..MAX_RUNS)
-                .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3)))
+                .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh)))
                 .collect();
             gpu.prompt_buf =
-                Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3));
+                Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh));
         }
         // Cell size changed -> the grid that fits the surface changes.
         self.sync_term_size();
@@ -591,10 +618,13 @@ impl App {
         let (tab_family, tab_pt) = config::parse_font(&self.config.tablist_font);
         let tab_font_px = tab_pt * 96.0 / 72.0;
         let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
+        self.tab_metrics = fonts::line_metrics(&mut self.font_system, tab_family)
+            .unwrap_or(fonts::LineMetrics::DEFAULT);
+        let tab_lh = self.tab_metrics.height_at(tab_font_px);
         self.tab_attrs = Attrs::new().family(Family::Name(tab_family));
 
         let mut tmeasure =
-            Buffer::new(&mut self.font_system, Metrics::new(tab_font_px, tab_font_px * 1.3));
+            Buffer::new(&mut self.font_system, Metrics::new(tab_font_px, tab_lh));
         tmeasure.set_size(Some(800.0), None);
         tmeasure.set_text("MMMM", &self.tab_attrs, Shaping::Basic, None);
         tmeasure.shape_until_scroll(&mut self.font_system, false);
@@ -607,20 +637,24 @@ impl App {
         }
         let tab_char_w = (ttotal / 4.0).max(1.0);
         self.tab_char_w = tab_char_w;
-        self.tab_h = tab_font_px * 1.3 + 6.0;
-        self.tab_text_h = tab_font_px * 1.3;
+        self.tab_text_h = tab_lh;
+        self.tab_h = tab_lh + TAB_VPAD * 2.0;
 
         if let Some(gpu) = &mut self.gpu {
             gpu.tab_pool = (0..16)
                 .map(|_| {
                     Buffer::new(
                         &mut self.font_system,
-                        Metrics::new(tab_font_px, tab_font_px * 1.3),
+                        Metrics::new(tab_font_px, tab_lh),
                     )
                 })
                 .collect();
         }
         self.sync_term_size();
+        log::info!(
+            "tab font: {} {:.0}pt; text {:.0}, strip {:.0}",
+            tab_family, tab_pt, self.tab_text_h, self.tab_h
+        );
     }
 
     /// Full font re-apply from config (used by config_reload). Resets the live
