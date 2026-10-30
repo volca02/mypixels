@@ -1237,36 +1237,65 @@ impl App {
         }
 
         let t_text = t_start.elapsed();
-        // One tab per frame gets a real render: the tile you are pointing at. Its
-        // screen is shaped into a buffer of its own -- the shared pool is spent on
-        // tile headers in this same frame -- then drawn into an offscreen target by
-        // `render_frame` and sampled back into the tile, filtered.
+        // Every tile shows a real render, and no tab is rebuilt every frame. A
+        // preview is refreshed when its content changed *and* its own throttle has
+        // expired -- 60ms for the tile you are on, 200ms for the rest -- with at
+        // most two rebuilt per frame so eight busy tabs cannot turn one redraw into
+        // a 60ms hitch. A throttled tile keeps showing its previous frame, which is
+        // plenty for a thumbnail. A tab that has never been drawn ignores the cap,
+        // so opening the overlay fills the whole grid in one go.
         let mut jobs: Vec<gpu::PreviewJob> = Vec::new();
-        let mut previewed: Option<usize> = None;
         if let Some(ov) = &self.overview {
-            let sel = ov.selected.min(self.tabs.len().saturating_sub(1));
-            if let Some(fd) = ov_frames.get(sel) {
-                gpu.ensure_previews(self.tabs.len(), (w, h), &mut self.font_system);
-                let sig = frame_sig(fd, self.cell_w);
-                if gpu.prev_sigs.get(sel).copied().unwrap_or(0) != sig {
-                    if let Some(b) = gpu.prev_bufs.get_mut(sel) {
-                        b.set_metrics(glyphon::Metrics::new(self.cell_w, self.cell_h));
-                        b.set_size(Some(self.cols as f32 * self.cell_w), None);
-                        b.set_monospace_width(Some(self.cell_w));
-                        b.set_rich_text(
-                            preview_spans(fd, self.rows, &self.mono_attrs)
-                                .iter()
-                                .map(|(s, a)| (s.as_str(), a.clone())),
-                            &self.mono_attrs,
-                            Shaping::Basic,
-                            None,
-                        );
-                        b.shape_until_scroll(&mut self.font_system, false);
-                    }
-                    gpu.set_prev_sig(sel, sig);
+            let n = self.tabs.len();
+            let sel = ov.selected.min(n.saturating_sub(1));
+            gpu.ensure_previews(n, (w, h), &mut self.font_system);
+            let now = Instant::now();
+            // Selected tab first, then every other tab exactly once, from a
+            // rotating cursor so a backlog drains in order and nothing starves.
+            let mut order: Vec<usize> = Vec::with_capacity(n);
+            order.push(sel);
+            for k in 0..n {
+                let i = (gpu.prev_rr + k) % n;
+                if i != sel {
+                    order.push(i);
                 }
+            }
+            gpu.prev_rr = (gpu.prev_rr + 1) % n.max(1);
+            let mut built = 0usize;
+            for i in order {
+                let Some(fd) = ov_frames.get(i) else {
+                    continue;
+                };
+                let sig = frame_sig(fd, self.cell_w);
+                let held = gpu.prev_sigs.get(i).copied().unwrap_or(0);
+                if held == sig {
+                    continue;
+                }
+                let gate = if i == sel { 60 } else { 200 };
+                let throttled = held != 0
+                    && now.duration_since(gpu.prev_last[i])
+                        < std::time::Duration::from_millis(gate);
+                if throttled || (held != 0 && built >= 2) {
+                    continue;
+                }
+                if let Some(b) = gpu.prev_bufs.get_mut(i) {
+                    b.set_metrics(glyphon::Metrics::new(self.cell_w, self.cell_h));
+                    b.set_size(Some(self.cols as f32 * self.cell_w), None);
+                    b.set_monospace_width(Some(self.cell_w));
+                    b.set_rich_text(
+                        preview_spans(fd, self.rows, &self.mono_attrs)
+                            .iter()
+                            .map(|(s, a)| (s.as_str(), a.clone())),
+                        &self.mono_attrs,
+                        Shaping::Basic,
+                        None,
+                    );
+                    b.shape_until_scroll(&mut self.font_system, false);
+                }
+                gpu.set_prev_sig(i, sig);
+                gpu.prev_last[i] = now;
                 jobs.push(gpu::PreviewJob {
-                    idx: sel,
+                    idx: i,
                     top: strip_h,
                     bounds,
                     default_fg: self.fg,
@@ -1283,7 +1312,7 @@ impl App {
                         h,
                     ),
                 });
-                previewed = Some(sel);
+                built += 1;
             }
         }
         if let Some(ov) = &self.overview {
@@ -1291,18 +1320,12 @@ impl App {
                 &mut gpu,
                 &mut self.font_system,
                 &self.tabs,
-                &ov_frames,
                 ov.mode,
                 ov.selected,
-                previewed,
                 &self.config,
                 &self.tab_attrs,
                 self.tab_text_h,
                 self.tab_char_w,
-                self.cell_w,
-                self.cell_h,
-                self.cols,
-                self.rows,
                 w,
                 h,
                 &mut areas,
@@ -2098,20 +2121,12 @@ fn draw_overview(
     gpu: &mut Gpu,
     fs: &mut FontSystem,
     tabs: &[Tab],
-    frames: &[FrameData],
     mode: OverviewMode,
     selected: usize,
-    // Tab whose tile samples a real rendered frame instead of drawing colour
-    // blocks. One per frame is the budget (see `gpu::PreviewJob`).
-    previewed: Option<usize>,
     config: &Config,
     tab_attrs: &Attrs,
     tab_text_h: f32,
     tab_char_w: f32,
-    cell_w: f32,
-    cell_h: f32,
-    term_cols: usize,
-    term_rows: usize,
     w: u32,
     h: u32,
     areas: &mut Vec<TextArea>,
@@ -2195,14 +2210,6 @@ fn draw_overview(
         slot += 1;
     }
 
-    // Previews are the whole grid, shrunk -- a low-resolution picture of the
-    // terminal rather than a readable excerpt. Small and unreadable is the
-    // point: across eight tiles it still tells you *where* the content sits
-    // (prompt at the left, a dense block of output, empty rows below), which a
-    // zoomed crop of one tab cannot.
-    let full_w = term_cols.max(1) as f32 * cell_w;
-    let full_h = term_rows.max(1) as f32 * cell_h;
-    let scale = (thumb_w / full_w).min(thumb_h / full_h);
     let radius = 8.0f32;
     let chip = tab_text_h.max(14.0);
     // Tiles that sample a real frame, collected during the loop and pushed to
@@ -2210,7 +2217,6 @@ fn draw_overview(
     let mut tile_previews: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
 
     for (idx, t) in tabs.iter().enumerate() {
-        let frame = &frames[idx];
         let row = idx / cols;
         let col = idx % cols;
         let tx = grid_x + col as f32 * (tile_w + spacing);
@@ -2283,10 +2289,11 @@ fn draw_overview(
             &mut gpu.rects, thx - 1.0, thy - 1.0, thumb_w + 2.0, thumb_h + 2.0,
             [0.03, 0.03, 0.03, 1.0], 4.0,
         );
-        // Preview: either a real render of the tab, sampled down, or one tinted
-        // block per non-blank run. Blocks are the fallback for tiles with no
-        // texture this frame; they read as "where is the text" and cost nothing.
-        if previewed == Some(idx) {
+        // Preview: a real render of the tab, sampled down. Every tile has one.
+        // A tile whose frame was not rebuilt this tick simply keeps showing its
+        // previous frame, so previews run at a few frames a second instead of
+        // stalling the overlay (see the rebuild budget in `draw`).
+        {
             // Fit the whole window into the thumb, aspect intact, so the tile is
             // a picture of the window -- the tab strip comes with it. The quad is
             // pushed after the loop: `pool` holds `gpu` borrowed until then.
@@ -2300,36 +2307,6 @@ fn draw_overview(
                 fw,
                 fh,
             ));
-        } else {
-        for run in &frame.runs {
-            if (run.row as usize) >= term_rows || (run.col as usize) >= term_cols {
-                continue;
-            }
-            if run.text.chars().all(|c| c == ' ') {
-                continue;
-            }
-            // Runs carry the padding spaces out to the end of the line. That is
-            // invisible when drawing glyphs but would paint a block across the
-            // whole tile here, so measure the inked extent, not the run.
-            let lead = run.text.chars().take_while(|c| *c == ' ').count();
-            let trail = run.text.chars().rev().take_while(|c| *c == ' ').count();
-            let inked = run
-                .width
-                .saturating_sub((lead + trail) as u32)
-                .max(1) as f32
-                * cell_w
-                * scale;
-            let sx = thx + (run.col as f32 + lead as f32) * cell_w * scale;
-            let sy = thy + run.row as f32 * cell_h * scale;
-            let sw = inked.max(cell_w * scale).min(thx + thumb_w - sx);
-            if sw <= 0.0 {
-                continue;
-            }
-            push_rect(
-                &mut gpu.rects, sx, sy, sw, (cell_h * scale * 0.62).max(1.0),
-                [run.fg[0], run.fg[1], run.fg[2], 0.62],
-            );
-        }
         }
         // Entangled marker.
         if t.entangled {

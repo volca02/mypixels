@@ -2,6 +2,7 @@
 //! tab strip), glyphon text rendering.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use glyphon::{Buffer, Cache, ColorMode, FontSystem, Metrics, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport};
 use winit::window::Window;
@@ -192,6 +193,10 @@ pub struct Gpu {
     /// Shaped content signature per preview buffer, so an unchanged screen is
     /// only re-drawn, never re-shaped.
     pub prev_sigs: Vec<u64>,
+    /// When each preview was last rebuilt, for the per-tab throttle, and the
+    /// rotating cursor that decides who goes next when there is a backlog.
+    pub prev_last: Vec<Instant>,
+    pub prev_rr: usize,
     prev_sampler: wgpu::Sampler,
     prev_bgl: wgpu::BindGroupLayout,
     prev_pipeline: wgpu::RenderPipeline,
@@ -528,6 +533,8 @@ impl Gpu {
             alpha_ok,
             prev_bufs: Vec::new(),
             prev_sigs: Vec::new(),
+            prev_last: Vec::new(),
+            prev_rr: 0,
             prev_sampler,
             prev_bgl,
             prev_pipeline,
@@ -556,6 +563,11 @@ impl Gpu {
         hf: f32,
     ) {
         if self.previews.get(tab).map(|p| p.is_none()).unwrap_or(true) {
+            return;
+        }
+        // Never drawn: the texture holds nothing yet, so sampling it would show
+        // garbage. The tile keeps its empty well for that one frame.
+        if self.prev_sigs.get(tab).copied().unwrap_or(0) == 0 {
             return;
         }
         let cx = |px: f32| px / wf * 2.0 - 1.0;
@@ -603,6 +615,7 @@ impl Gpu {
             self.prev_bufs
                 .push(Buffer::new(fs, Metrics::new(1.0, 1.0)));
             self.prev_sigs.push(0);
+            self.prev_last.push(Instant::now());
         }
         while self.previews.len() < n {
             let i = self.previews.len();
@@ -828,8 +841,14 @@ impl Gpu {
                 pass.set_pipeline(&self.prev_pipeline);
                 pass.set_vertex_buffer(0, self.prev_buffer.slice(..));
                 for (n, (chunk, tab)) in quads.chunks(6).zip(owners.iter()).enumerate() {
-                    let _ = n;
                     if let Some(Some(slot)) = self.previews.get(*tab) {
+                        // Slice per quad: binding the whole buffer and drawing
+                        // 0..6 every time would paint the first tile's geometry
+                        // once per texture, so only one tile showed anything and
+                        // it showed the wrong tab.
+                        let v = std::mem::size_of::<PrevVertex>() as u64;
+                        let first = (n * 6) as u64 * v;
+                        pass.set_vertex_buffer(0, self.prev_buffer.slice(first..first + 6 * v));
                         pass.set_bind_group(0, &slot.bind, &[]);
                         pass.draw(0..chunk.len() as u32, 0..1);
                     }
