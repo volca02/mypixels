@@ -175,3 +175,43 @@ Still open:
   because winit 0.30 has no clipboard and the primary-selection protocol needs a
   device plus a seat handshake inside the event loop winit owns. See
   `src/clipboard.rs`; swapping in a protocol client changes only that file.
+
+## Clipboard: replace the helper tools with wlr-data-control (open)
+
+`src/clipboard.rs` forks `wl-copy`/`wl-paste` (Wayland) and `xsel` (X11). That
+works, and it is the wrong shape: a process per selection change, nothing at all
+happens if the binary is missing, and a paste waits on whoever owns the buffer
+instead of on us. In process is the right answer and it needs no new dependency:
+`wayland-client` 0.31.15 and `wayland-protocols-wlr` 0.3.12 are already in the
+tree via winit.
+
+The protocol to speak, pinned from
+`wlr-protocols/unstable/wlr-data-control-unstable-v1.xml` in the crate source:
+
+- `zwlr_data_control_manager_v1`: `create_data_source`, `get_data_device(seat)`.
+- `zwlr_data_control_device_v1`: requests `set_selection(source)` and, since
+  version 2, `set_primary_selection(source)`; events `data_offer(id)`,
+  `selection`, `primary_selection`, `finished`.
+- `zwlr_data_control_source_v1`: request `offer(mime_type)`; events
+  `send(mime_type, fd)` (fill that pipe with our text) and `cancelled` (drop it).
+- `zwlr_data_control_offer_v1`: request `receive(mime_type, fd)`; event
+  `offer(mime_type)`. `data_offer` arrives *before* the `selection` or
+  `primary_selection` event that says which buffer it belongs to, so offers have
+  to be held unattributed until that arrives.
+
+Why a private connection is legitimate here: wlr-data-control asks for no pointer
+serial to take ownership. The spec `wl_data_device` protocol does ask for the
+serial of a user event delivered on the same connection, and a connection with no
+surfaces never gets pointer focus -- which is why the helper binaries need their
+`--foreground` dance at all. Compositors without this protocol (GNOME, Weston)
+keep the fallback path.
+
+Shape worth keeping from the draft: one worker thread owning the connection and an
+`EventQueue`, the UI thread posting over a `sync_channel` and waking the queue with
+`EventQueueHandle::wake()`; reads return the read end of a pipe so the caller sets
+its own deadline rather than blocking on a stranger's client.
+
+Verification: `weston` is installed here, and Weston does *not* implement
+wlr-data-control, so a headless Weston run proves the fallback and the global
+enumeration but not the happy path. The happy path needs a wlroots compositor;
+running the user's own niri session is not an option for tests.
