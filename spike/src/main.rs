@@ -11,7 +11,7 @@ mod tab;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use alacritty_terminal::event::WindowSize;
@@ -50,7 +50,6 @@ const PALETTE: [[f32; 3]; 16] = [
     [0.4, 0.4, 1.0], [1.0, 0.4, 1.0], [0.4, 1.0, 1.0], [1.0, 1.0, 1.0],
 ];
 
-static TRACE_T0: OnceLock<Instant> = OnceLock::new();
 
 fn cube_color(i: u8) -> [f32; 3] {
     let i = (i - 16) as usize;
@@ -157,6 +156,18 @@ const CURSOR_COLOR: [f32; 3] = [0.55, 0.55, 0.6];
 // ---------------------------------------------------------------------------
 // Draw list (owned data copied out of the terminal under the lock)
 // ---------------------------------------------------------------------------
+
+/// Append a run, dropping the ones that could never draw anything: padding in
+/// the default colours. A mostly-empty 4K grid is 80k cells, and this is the
+/// difference between thousands of dead runs and the handful that matter. Runs
+/// carrying a background colour are kept -- that is how a TUI's highlighted row
+/// still shows.
+fn push_run(runs: &mut Vec<Run>, r: Run, def_fg: [f32; 3], def_bg: [f32; 3]) {
+    if r.fg == def_fg && r.bg == def_bg && r.text.chars().all(|c| c == ' ') {
+        return;
+    }
+    runs.push(r);
+}
 
 struct Run {
     row: u32,
@@ -558,8 +569,19 @@ impl App {
         }
         let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
         let term_h = (h as f32 - strip_h) as usize;
-        let (ncols, nrows) =
-            ((w as f32 / self.cell_w) as usize, (term_h as f32 / self.cell_h) as usize);
+        let (mut ncols, mut nrows) = (
+            (w as f32 / self.cell_w) as usize,
+            (term_h as f32 / self.cell_h) as usize,
+        );
+        // Benchmark hook: ask for a grid larger than the window allows, to
+        // separate grid-walk and shaping cost from rasterisation when the test
+        // display is software only.
+        if let Ok(g) = std::env::var("SPIKE_GRID") {
+            if let Some((c, r)) = g.split_once('x') {
+                ncols = c.parse().unwrap_or(ncols);
+                nrows = r.parse().unwrap_or(nrows);
+            }
+        }
         if (ncols, nrows) != (self.cols, self.rows) {
             eprintln!("term resize: {}x{} -> {}x{}", self.cols, self.rows, ncols, nrows);
             self.cols = ncols;
@@ -751,45 +773,47 @@ impl App {
                 continue;
             }
 
+            let fg = palette.resolve_with(&cell.fg, self.fg, self.bg);
+            let bg = palette.resolve_with(&cell.bg, self.fg, self.bg);
+            let attrs = self.cell_attrs(cell.c);
+
+            // Continue the current run in place. Building a `String` per cell is
+            // ~80k allocations a frame at 4K, and a debug build feels every one.
+            if let Some(r) = cur.as_mut() {
+                if r.row == row as u32
+                    && r.col + r.width == col as u32
+                    && r.fg == fg
+                    && r.bg == bg
+                    && std::ptr::eq(r.attrs, attrs)
+                {
+                    r.width += 1;
+                    r.text.push(cell.c);
+                    if let Some(zw) = cell.zerowidth() {
+                        r.text.extend(zw.iter().copied());
+                    }
+                    continue;
+                }
+            }
+            if let Some(r) = cur.take() {
+                push_run(&mut runs, r, self.fg, self.bg);
+            }
             let mut glyph = String::with_capacity(4);
             glyph.push(cell.c);
             if let Some(zw) = cell.zerowidth() {
                 glyph.extend(zw.iter());
             }
-
-            let fg = palette.resolve_with(&cell.fg, self.fg, self.bg);
-            let bg = palette.resolve_with(&cell.bg, self.fg, self.bg);
-            let attrs = self.cell_attrs(cell.c);
-
-            match cur.as_mut() {
-                Some(r)
-                    if r.row == row as u32
-                        && r.col + r.width == col as u32
-                        && r.fg == fg
-                        && r.bg == bg
-                        && std::ptr::eq(r.attrs, attrs) =>
-                {
-                    r.width += 1;
-                    r.text.push_str(&glyph);
-                },
-                _ => {
-                    if let Some(r) = cur.take() {
-                        runs.push(r);
-                    }
-                    cur = Some(Run {
-                        row: row as u32,
-                        col: col as u32,
-                        width: 1,
-                        fg,
-                        bg,
-                        text: glyph,
-                        attrs,
-                    });
-                },
-            }
+            cur = Some(Run {
+                row: row as u32,
+                col: col as u32,
+                width: 1,
+                fg,
+                bg,
+                text: glyph,
+                attrs,
+            });
         }
         if let Some(r) = cur.take() {
-            runs.push(r);
+            push_run(&mut runs, r, self.fg, self.bg);
         }
 
         let cursor = if !show_cursor {
@@ -810,6 +834,7 @@ impl App {
     /// Render the standalone tab overview. Builds a frame per tab (before the
     /// mutable gpu borrow), then hands off to `draw_overview`.
     fn draw(&mut self, window: &Window) {
+        let t_start = Instant::now();
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -830,6 +855,7 @@ impl App {
             Vec::new()
         };
         let frame = self.build_frame(tab, blink);
+        let t_built = t_start.elapsed();
         let show_strip = self.show_tab_strip();
         let (w, h) = match &self.gpu {
             Some(g) => (g.config.width, g.config.height),
@@ -1117,6 +1143,7 @@ impl App {
             }
         }
 
+        let t_text = t_start.elapsed();
         if let Some(ov) = &self.overview {
             draw_overview(
                 &mut gpu,
@@ -1142,7 +1169,6 @@ impl App {
         self.gpu = Some(gpu);
 
         if std::env::var("SPIKE_TRACE").is_ok() {
-            let t0 = *TRACE_T0.get_or_init(Instant::now);
             let mut h: u64 = 0xcbf29ce484222325;
             for run in &frame.runs {
                 for b in run.text.as_bytes() {
@@ -1150,7 +1176,13 @@ impl App {
                     h = h.wrapping_mul(0x100000001b3);
                 }
             }
-            eprintln!("{:?} {} {:?}", Instant::now().duration_since(t0), h, frame.cursor);
+            eprintln!(
+                "frame build {t_built:?} text {t_text:?} total {:?} grid {}x{} runs {} hash {h:x}",
+                t_start.elapsed(),
+                self.cols,
+                self.rows,
+                frame.runs.len(),
+            );
         }
     }
 
