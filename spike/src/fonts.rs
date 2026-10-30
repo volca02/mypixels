@@ -38,6 +38,11 @@ pub struct LineMetrics {
     /// Below the baseline; skrifa's convention makes this negative.
     pub descent: f32,
     pub leading: f32,
+    /// (unitsPerEm, ascender, descender) from the `hhea` table, when it could be
+    /// read. That table -- not the OS/2 typo box skrifa reports -- is the one
+    /// FreeType, Cairo and Pango use for a font's line, and it is what decides
+    /// whether a full-height glyph fits its cell.
+    pub hhea: Option<(f32, f32, f32)>,
 }
 
 impl LineMetrics {
@@ -47,23 +52,82 @@ impl LineMetrics {
         ascent: 1000.0,
         descent: -250.0,
         leading: 0.0,
+        hhea: None,
     };
 
-    /// Pixel line height at `px`, rounding ascent, descent and leading
-    /// separately the way Pango does. Two things bit us here: skrifa reports
-    /// descent *negative* (so `ascent + descent` is not a height at all), and
-    /// some fonts carry leading that must be counted -- Terminus 12 needs it to
-    /// reach the 17px the original measures, while Cascadia Code has none.
+    /// Pixel line height, using Pango's rule: the font's ascent and descent each
+    /// rounded UP to a whole pixel, and no leading term. Verified against Pango
+    /// itself over 16 font/size combinations (`ceil(hhea.asc) + ceil(-hhea.desc)`
+    /// matched 14 of them; the misses are Terminus at its bitmap-strike sizes,
+    /// where FreeType answers with the strike's metrics instead of hhea).
+    ///
+    /// The old rule -- round each of ascent, descent and leading from skrifa's
+    /// typo metrics -- was one pixel short for Cascadia Code 9 (14 instead of
+    /// 15). Ordinary text only inks 9px so nothing showed, but a powerline peak
+    /// inks 14px and had nowhere to go, so it bled into the row below.
     pub fn height_at(&self, px: f32) -> f32 {
-        if self.upem <= 0.0 {
+        let (upem, asc, desc) = match self.hhea {
+            Some(h) => h,
+            None => (self.upem, self.ascent, self.descent),
+        };
+        if upem <= 0.0 {
             return (px * 1.25).max(1.0);
         }
-        let scale = px / self.upem;
-        let a = (self.ascent * scale).round();
-        let d = (self.descent.abs() * scale).round();
-        let l = (self.leading * scale).round();
-        (a + d + l).max(1.0)
+        let scale = px / upem;
+        let a = (asc * scale).ceil();
+        let d = (desc.abs() * scale).ceil();
+        (a + d).max(1.0)
     }
+}
+
+/// Read (unitsPerEm, ascender, descender) out of the `hhea` table.
+///
+/// Neither fontdb 0.23 nor skrifa 0.40 exposes it -- skrifa's `Metrics` gives
+/// the OS/2 typo box instead, which for DejaVu Sans Mono, Hack and Liberation
+/// Mono is several pixels shorter than hhea and would silently shrink the row
+/// height out of agreement with Pango. So: walk the sfnt table directory.
+fn read_hhea(db: &Database, id: ID) -> Option<(f32, f32, f32)> {
+    fn be16(b: &[u8], at: usize) -> Option<u16> {
+        Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    }
+    fn be32(b: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    }
+    db.with_face_data(id, |data, index| {
+        // A TrueType collection keeps each font at its own offset.
+        let base = if data.get(0..4) == Some(b"ttcf") {
+            let n = be32(data, 8)? as usize;
+            let i = (index as usize).min(n.saturating_sub(1));
+            be32(data, 12 + i * 4)? as usize
+        } else {
+            0
+        };
+        let ntables = be16(data, base + 4)? as usize;
+        let mut head: Option<usize> = None;
+        let mut hhea: Option<usize> = None;
+        for i in 0..ntables {
+            let rec = base + 12 + i * 16;
+            match data.get(rec..rec + 4) {
+                Some(b"head") => head = be32(data, rec + 8).map(|o| o as usize),
+                Some(b"hhea") => hhea = be32(data, rec + 8).map(|o| o as usize),
+                _ => {}
+            }
+            if head.is_some() && hhea.is_some() {
+                break;
+            }
+        }
+        let upem = be16(data, head? + 18)? as f32;
+        // hhea opens with a 4-byte version, then ascender, descender, lineGap --
+        // reading the ascent at +2 gets the version's minor word instead, which
+        // is 0, and the ascent then shows up as the descent.
+        let asc = (be16(data, hhea? + 4)? as i16) as f32;
+        let desc = (be16(data, hhea? + 6)? as i16) as f32;
+        if upem <= 0.0 {
+            return None;
+        }
+        Some((upem, asc, desc))
+    })
+    .flatten()
 }
 
 /// Read a family's vertical metrics out of the loaded database.
@@ -80,20 +144,36 @@ pub fn line_metrics(fs: &mut FontSystem, family: &str) -> Option<LineMetrics> {
             })
             .map(|face| face.id)?
     };
-    let font = fs.get_font(id, glyphon::fontdb::Weight::NORMAL)?;
-    let m = font.metrics();
-    if m.units_per_em == 0 {
+    // hhea first: skrifa's Metrics borrows the face (and through it the
+    // FontSystem), so nothing can touch the database while it is alive.
+    let hhea = {
+        let db = fs.db_mut();
+        read_hhea(db, id)
+    };
+    let (upem, ascent, descent, leading) = {
+        let font = fs.get_font(id, glyphon::fontdb::Weight::NORMAL)?;
+        let m = font.metrics();
+        (
+            m.units_per_em as f32,
+            m.ascent,
+            m.descent,
+            m.leading,
+        )
+    };
+    if upem <= 0.0 {
         return None;
     }
     let lm = LineMetrics {
-        upem: m.units_per_em as f32,
-        ascent: m.ascent,
-        descent: m.descent,
-        leading: m.leading,
+        upem,
+        ascent,
+        descent,
+        leading,
+        hhea,
     };
     log::debug!(
-        "line_metrics({family}): upem={} ascent={} descent={} leading={}",
-        m.units_per_em, m.ascent, m.descent, m.leading
+        "line_metrics({family}): typo upem={upem} asc={ascent} desc={descent} lead={leading} hhea={:?} -> {}px at 12px",
+        lm.hhea,
+        lm.height_at(12.0)
     );
     Some(lm)
 }
@@ -415,6 +495,30 @@ mod tests {
         (fs, cov)
     }
 
+    /// The row height must be Pango's, because that is the box VTE lays a cell
+    /// out from: a full-height glyph only fits when the cell is tall enough, and
+    /// a row one pixel short pushes a powerline peak into the row below. Both
+    /// numbers are Pango's own, measured with a layout; the general rule was
+    /// checked over 16 font/size combinations.
+    #[test]
+    fn row_height_matches_pango() {
+        for (family, pt, want) in [("Cascadia Code", 9.0, 15.0), ("Terminus (TTF)", 12.0, 17.0)] {
+            let (mut fs, _) = build_font_system(&[family]);
+            let lm = match line_metrics(&mut fs, family) {
+                Some(lm) => lm,
+                None => {
+                    eprintln!("skipping {family}: not installed here");
+                    continue;
+                },
+            };
+            assert_eq!(
+                lm.height_at(pt * 96.0 / 72.0),
+                want,
+                "{family} {pt}pt row height should match Pango"
+            );
+        }
+    }
+
     /// The family we route to must actually contain the glyph -- otherwise the
     /// routing is just a different kind of tofu.
     fn really_covers(db: &Database, cov: &Coverage, fam: &str, ch: char) -> bool {
@@ -500,22 +604,54 @@ mod tests {
     #[test]
     fn line_height_counts_negative_descent_as_height() {
         // skrifa gives descent negative; the height must still grow with it.
-        let lm = LineMetrics { upem: 1000.0, ascent: 800.0, descent: -200.0, leading: 0.0 };
+        let lm = LineMetrics {
+            upem: 1000.0,
+            ascent: 800.0,
+            descent: -200.0,
+            leading: 0.0,
+            hhea: None,
+        };
         assert_eq!(lm.height_at(10.0), 10.0);
     }
 
     #[test]
-    fn line_height_counts_leading() {
-        // Terminus (TTF) 12pt: upem 1000, ascent 833, descent -167, leading 90
-        // -> 13 + 3 + 1 = 17px, which is what the original's tab strip measures
-        // (21px total with 2px margins above and below).
-        let lm = LineMetrics { upem: 1000.0, ascent: 833.0, descent: -167.0, leading: 90.0 };
+    fn hhea_box_drives_row_height_and_leading_does_not() {
+        // Terminus (TTF): hhea is (1000, 849, -183) while the OS/2 typo box skrifa
+        // reports is (1000, 833, -167, leading 90). Pango's row at 16px is 17,
+        // which is ceil(13.584) + ceil(2.928) from hhea -- and NOT typo+leading
+        // (13+3+1), which only agrees by accident, nor typo+leading with hhea's
+        // numbers (19), which is too tall. The strip the original measures is 21px
+        // = this 17 plus 2px margins.
+        let lm = LineMetrics {
+            upem: 1000.0,
+            ascent: 833.0,
+            descent: -167.0,
+            leading: 90.0,
+            hhea: Some((1000.0, 849.0, -183.0)),
+        };
         assert_eq!(lm.height_at(16.0), 17.0);
+        // The case that started this: Cascadia Code 9, hhea (2048, 1900, -480).
+        // ceil(11.13) + ceil(2.81) = 15, where the old rule gave 14 and a
+        // powerline peak (14px of ink) spilled into the row below.
+        let cas = LineMetrics {
+            upem: 2048.0,
+            ascent: 1900.0,
+            descent: -480.0,
+            leading: 0.0,
+            hhea: Some((2048.0, 1900.0, -480.0)),
+        };
+        assert_eq!(cas.height_at(12.0), 15.0);
     }
 
     #[test]
     fn degenerate_upem_does_not_panic() {
-        let lm = LineMetrics { upem: 0.0, ascent: 0.0, descent: 0.0, leading: 0.0 };
+        let lm = LineMetrics {
+            upem: 0.0,
+            ascent: 0.0,
+            descent: 0.0,
+            leading: 0.0,
+            hhea: None,
+        };
         assert_eq!(lm.height_at(12.0), 15.0);
         assert!(lm.height_at(0.0) >= 1.0);
     }
