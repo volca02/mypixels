@@ -68,15 +68,50 @@ their notes: the causes were rarely where the symptom pointed.
 - The reference app runs offscreen with `HOME=/tmp/pyhome`, whose `.zshrc` prints a
   ruler; that is how the 7x15 cell and 21px strip were measured.
 
-## Switcher previews are a density map, not a downscale (open)
+## Switcher previews are colour blocks, not a downscale (open)
 
-The tile previews sample *ink per terminal cell* and paint one block per cell at
-tile scale, so the terminal grid is the resolution ceiling: ~200 columns of one
-sample each, and it reads as pixel-per-character mush rather than a small
-terminal.
+`draw_overview` paints one tinted block per non-blank run (the run's own
+foreground at 0.62 alpha). It reads as "where is the text" and nothing else. The
+terminal grid is the resolution ceiling, so it looks like a bitmap of cells
+rather than a small window.
 
-Real fix: render the tab's own frame into a texture at normal scale and sample
-that down (proper filtering, or supersampled text at a reduced glyph size), so a
-tile looks like a shrunken window instead of a bitmap of cells. Needs a second
-render pass into an offscreen target and probably a second TextRenderer; the same
-pass would also give the true see-through switcher.
+Real fix: render the tab's frame at normal scale into an offscreen texture and
+sample that into the tile. A first attempt stalled on two things that are not
+obvious from the description, so they are written down here.
+
+**What is easy.** glyphon 0.12 takes the render pass, not the target:
+`TextRenderer::render(&atlas, &viewport, &mut pass)`. One `TextRenderer` and one
+atlas can draw into an offscreen pass as long as the texture format matches ours
+(`Bgra8Unorm`); the only extra object is a second `Cache` + `Viewport` at the
+offscreen size. Glyphs are already in the atlas, so a second pass costs
+positioning, not rasterisation. Sampling needs a new pipeline: quad vertices
+carrying `pos`, `uv`, and a box half-width in UV (one destination pixel covers
+`1/tile_w` of the texture), and a 4x4 box filter in the fragment stage -- plain
+bilinear samples one texel in eight at this ratio and aliases worse than the
+blocks it replaces. Quads go between the rect pass and the text pass so tile
+headers stay on top. Sample `uv` 0..1 over the whole window: the tab strip comes
+with it, which makes the tile a picture of the window, and fitting the window
+rect into the thumb with the existing `scale` keeps the aspect ratio.
+Clear the offscreen to *opaque* black: the window background rect carries alpha
+`~0.82`, so a translucent thumbnail composites to mud; draw the tile quad with
+no blending.
+
+**Landmine 1: there is nothing free to reuse.** While the overview is open the
+active tab's runs are deliberately never shaped (`if self.overview.is_some() {
+break }` in the text loop), because glyphon draws all text after all rects and
+terminal text would bleed through the tiles. So the offscreen pass cannot share
+the main pass's areas -- it needs its own shaping, about 25ms for a full grid in
+release. That is affordable because the switcher refreshes on a 150ms cadence and
+only the selected tile has to be real every refresh; the rest can come round-robin
+one tab per frame, invalidated on damage. Rendering all tabs every frame is
+40-250ms and dead on arrival.
+
+**Landmine 2: `gpu.pool` is not free either.** `draw_overview` takes slots from
+the same pool for tile headers and index chips, in the same frame, so preview
+areas cannot use those slots. Either reserve a slice of the pool for previews, or
+put a whole screen into a single `Buffer` -- monospace, one row per `shape_once`,
+lines padded with spaces so columns land where they belong -- which needs one
+buffer per preview instead of thousands of shared slots.
+
+The same pass also closes the see-through switcher: the reason the tiles are
+opaque today is that overlay text and terminal text share one pass.
