@@ -153,3 +153,25 @@ difference between unusable and 4ms.
 
 The same pass also closes the see-through switcher: the reason the tiles are
 opaque today is that overlay text and terminal text share one pass.
+
+## Selection: what works, what is still missing
+
+Working, and verified with `xdotool` drags read back by `xsel` as an independent
+client: drag to select (translucent wash over the cell backgrounds, under the
+glyphs), double-click for the word, triple-click for the rows, middle click to
+paste, `Ctrl+Shift+C` / `Ctrl+Shift+v` for the clipboard. Selecting text fills the
+*primary* buffer, which is the part VTE gives the original for free.
+
+Still open:
+
+- The selection is limited to the visible viewport. There is no scrollback to
+  scroll into yet; when it lands, `Selection::rotate` is what keeps a selection
+  anchored to its text as the view moves.
+- `Selection::is_empty` covers the click-without-drag case, but a click in the tab
+  strip leaves a terminal selection standing. VTE clears it.
+- The wash colour is a constant (Adwaita's selection blue at 0.35). It should be a
+  `selection_color` config option, since the original inherits its theme's.
+- Text moves through `wl-copy`/`wl-paste` and `xsel` rather than in process,
+  because winit 0.30 has no clipboard and the primary-selection protocol needs a
+  device plus a seat handshake inside the event loop winit owns. See
+  `src/clipboard.rs`; swapping in a protocol client changes only that file.

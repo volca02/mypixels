@@ -4,6 +4,7 @@
 //!
 //! Usage: mypixels-rs [command [args...]]   (defaults to $SHELL or bash)
 
+mod clipboard;
 mod config;
 mod fonts;
 mod gpu;
@@ -17,6 +18,8 @@ use std::time::Instant;
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::Msg;
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags;
 
 use glyphon::{
@@ -275,6 +278,15 @@ struct App {
     /// handlers, so hit-testing can never disagree with what is on screen.
     tab_hits: Vec<(f32, f32)>,
     add_hit: (f32, f32),
+    /// Last pointer position, so a button press can hit-test without waiting for
+    /// the next `CursorMoved`.
+    pointer: (f32, f32),
+    /// Cell a left-drag last covered; the selection only moves when a new cell
+    /// is entered, which keeps dragging from repainting every pixel step.
+    drag: Option<Point>,
+    /// Click counting for word/line selection: (button, count, position, when).
+    /// winit 0.30 reports press counts for keys but not for mouse buttons.
+    click: Option<(u8, u32, (f32, f32), std::time::Instant)>,
     /// Tab under the pointer, or usize::MAX for none.
     hover_tab: usize,
     hover_add: bool,
@@ -505,6 +517,9 @@ impl App {
             tab_metrics,
             tab_hits: Vec::new(),
             add_hit: (0.0, 0.0),
+            pointer: (0.0, 0.0),
+            drag: None,
+            click: None,
             hover_tab: usize::MAX,
             hover_add: false,
             tablist_hidden,
@@ -1132,6 +1147,21 @@ impl App {
                 );
             }
         }
+        // Selection wash: over the cell backgrounds, under the cursor and the
+        // glyphs, and translucent so coloured text stays readable underneath --
+        // an opaque wash would hide exactly the text the user selected.
+        for (row, left, right) in self.tabs[self.active].selection_rows() {
+            push_rect(
+                &mut gpu.rects,
+                left as f32 * self.cell_w,
+                strip_h + row as f32 * self.cell_h,
+                (right - left) as f32 * self.cell_w,
+                self.cell_h,
+                // Adwaita's selection blue, at the alpha terminals like VTE use
+                // for an overlay rather than a colour swap.
+                [0.208, 0.518, 0.894, 0.35],
+            );
+        }
         // Cursor (hidden on row 0 while renaming; the prompt owns that line)
         if let Some((cx, cy)) = frame.cursor {
             if !(self.renaming && cy == 0) {
@@ -1439,6 +1469,55 @@ impl App {
         }
     }
 
+    /// Cell under the pointer, in grid coordinates, plus which half of it.
+    /// None outside the terminal area: the tab strip is not text.
+    fn cell_at(&self, px: f32, py: f32) -> Option<(Point, Side)> {
+        let tab = self.tabs.get(self.active)?;
+        let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
+        if py < strip_h {
+            return None;
+        }
+        let col = (px / self.cell_w).floor() as usize;
+        let row = ((py - strip_h) / self.cell_h).floor() as i32;
+        if col >= self.cols || row < 0 || row as usize >= self.rows {
+            return None;
+        }
+        let within = px / self.cell_w - (px / self.cell_w).floor();
+        let side = if within < 0.5 { Side::Left } else { Side::Right };
+        // Selection lines are grid coordinates: line 0 is the top of the
+        // unscrolled screen and scrollback above it is negative, so the scroll
+        // offset comes off the visual row.
+        let off = tab.term.lock().grid().display_offset() as i32;
+        Some((Point { line: Line(row - off), column: Column(col) }, side))
+    }
+
+    /// How many times this button was pressed in this spot within a double-click
+    /// window, capped at three (three means "whole rows").
+    fn count_click(&mut self, button: u8, at: (f32, f32)) -> u32 {
+        let now = std::time::Instant::now();
+        let count = match self.click {
+            Some((b, c, p, t))
+                if b == button
+                    && now.duration_since(t) < std::time::Duration::from_millis(400)
+                    && (at.0 - p.0).abs() < 6.0
+                    && (at.1 - p.1).abs() < 6.0 =>
+            {
+                c + 1
+            }
+            _ => 1,
+        };
+        self.click = Some((button, count, at, now));
+        count.min(3)
+    }
+
+    /// Publish the selection into the primary buffer, the way VTE does: selecting
+    /// text *is* copying it, and middle click is the paste.
+    fn publish_primary(&mut self) {
+        if let Some(text) = self.tabs.get(self.active).and_then(|t| t.selected_text()) {
+            clipboard::set(clipboard::Kind::Primary, &text);
+        }
+    }
+
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
         // 0. Rename mode eats keys (Enter commits, Esc cancels, Backspace and
         //    characters edit the draft). Nothing reaches the terminal.
@@ -1465,6 +1544,11 @@ impl App {
             // Typing counts as activity: keep the cursor solid (no blink)
             // right after a keypress.
             *self.last_activity.lock().unwrap() = std::time::Instant::now();
+            // A selection is something you are about to act on; typing means you
+            // moved on, and leaving the wash over new output would be a lie.
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.clear_selection();
+            }
             if let Some(tab) = self.tabs.get(self.active) {
                 // Entanglement: type into all entangled tabs
                 if self.tabs[self.active].entangled {
@@ -1747,6 +1831,18 @@ impl App {
         let n = self.tabs.len();
         match action {
             "new_tab" => self.add_tab(),
+            "copy" => {
+                if let Some(text) = self.tabs.get(self.active).and_then(|t| t.selected_text()) {
+                    clipboard::set(clipboard::Kind::Clipboard, &text);
+                }
+            },
+            "paste" => {
+                if let Some(text) = clipboard::get(clipboard::Kind::Clipboard) {
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        tab.paste(&text);
+                    }
+                }
+            },
             "close_tab" => self.close_tab_at(self.active, event_loop),
             "prev_tab" | "prev_tab_row" => {
                 if n > 1 {
@@ -2635,19 +2731,65 @@ impl ApplicationHandler for App {
                     self.hover_add = hover_add;
                     window.request_redraw();
                 }
+                self.pointer = (px, py);
+                // Dragging extends the selection cell by cell: repainting on every
+                // pixel step would spend a frame per mouse sample.
+                if self.drag.is_some() {
+                    if let Some((pt, side)) = self.cell_at(px, py) {
+                        if self.drag != Some(pt) {
+                            self.drag = Some(pt);
+                            if let Some(tab) = self.tabs.get_mut(self.active) {
+                                tab.update_selection(pt, side);
+                            }
+                            window.request_redraw();
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+                let at = self.pointer;
+                if button == MouseButton::Middle {
+                    // Middle click pastes the primary selection -- the X11
+                    // convention the original gets free from VTE.
+                    if let Some(text) = clipboard::get(clipboard::Kind::Primary) {
+                        if let Some(tab) = self.tabs.get(self.active) {
+                            tab.paste(&text);
+                        }
+                    }
+                } else if button == MouseButton::Left {
+                    if self.hover_tab < self.tabs.len() {
+                        if self.hover_tab != self.active {
+                            self.active = self.hover_tab;
+                            window.request_redraw();
+                        }
+                    } else if self.hover_add {
+                        self.add_tab();
+                        window.request_redraw();
+                    } else if let Some((pt, side)) = self.cell_at(at.0, at.1) {
+                        // One click starts a run, two take the word, three take
+                        // whole rows: what VTE does, and why the clicks have to be
+                        // counted by hand.
+                        let count = self.count_click(0, at);
+                        let ty = match count {
+                            3 => SelectionType::Lines,
+                            2 => SelectionType::Semantic,
+                            _ => SelectionType::Simple,
+                        };
+                        if let Some(tab) = self.tabs.get_mut(self.active) {
+                            tab.begin_selection(pt, side, ty);
+                        }
+                        self.drag = Some(pt);
+                        window.request_redraw();
+                    }
+                }
             }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
             } => {
-                if self.hover_tab < self.tabs.len() {
-                    if self.hover_tab != self.active {
-                        self.active = self.hover_tab;
-                        window.request_redraw();
-                    }
-                } else if self.hover_add {
-                    self.add_tab();
+                if self.drag.take().is_some() {
+                    self.publish_primary();
                     window.request_redraw();
                 }
             }

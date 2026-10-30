@@ -136,6 +136,11 @@ impl Default for Config {
         bind("last_tab", &["MOD1+End"]);
         bind("close_tab", &["CONTROL+ALT+x", "CONTROL+ALT+q"]);
         bind("new_tab", &["CONTROL+ALT+z", "CONTROL+SHIFT+t"]);
+        // Copy/paste follow the VTE and GNOME Terminal bindings the original gets
+        // from GTK, so the fingers that already know them keep working. Selecting
+        // text feeds the *primary* buffer separately and needs no key.
+        bind("copy", &["CONTROL+SHIFT+c"]);
+        bind("paste", &["CONTROL+SHIFT+v"]);
         bind("shrink_font", &["MOD1+SHIFT+KP_Subtract"]);
         bind("enlarge_font", &["MOD1+SHIFT+KP_Add"]);
         bind("toggle_hide_tabs", &["CONTROL+SHIFT+v"]);

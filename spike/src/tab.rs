@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
@@ -89,6 +92,9 @@ pub struct Tab {
     pub entangled: bool,
     /// User rename (None = use terminal title)
     pub name: Option<String>,
+    /// Mouse selection, in grid coordinates, the way alacritty stores it. Kept
+    /// per tab because a selection belongs to the text it was made in.
+    pub selection: Option<Selection>,
 }
 
 impl Tab {
@@ -148,11 +154,113 @@ impl Tab {
             group: 8,
             entangled: false,
             name: None,
+            selection: None,
         }
     }
 
     pub fn write(&self, bytes: &[u8]) {
         let _ = self.sender.send(Msg::Input(std::borrow::Cow::Owned(bytes.to_vec())));
+    }
+
+    /// Start a selection at a cell. `lines`/`word` come from click count: three
+    /// clicks take whole rows, two take the word under the pointer.
+    pub fn begin_selection(&mut self, at: Point, side: Side, ty: SelectionType) {
+        let mut sel = Selection::new(ty, at, side);
+        if ty != SelectionType::Simple {
+            // Semantic and line selections expand to fill their unit, which is
+            // what `to_range` needs to see the whole word or row.
+            sel.include_all();
+        }
+        self.selection = Some(sel);
+    }
+
+    /// Grow the selection to a cell while dragging.
+    pub fn update_selection(&mut self, at: Point, side: Side) {
+        if let Some(sel) = self.selection.as_mut() {
+            sel.update(at, side);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// The text under the selection, or None if nothing is really selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        let term = self.term.lock();
+        let range = sel.to_range(&term)?;
+        if range.start == range.end {
+            return None;
+        }
+        let mut text = term.bounds_to_string(range.start, range.end);
+        if sel.ty == SelectionType::Semantic {
+            // A semantic expansion swallows the space in front of the word --
+            // alacritty groups whitespace with what follows it. A double-click
+            // should hand over the word, which is what every other terminal does.
+            text = text.trim().to_string();
+        }
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Rows covered by the selection, clamped to the viewport, as
+    /// `(row, first_column, one_past_last_column)` for drawing. Selection lines
+    /// are grid coordinates -- line 0 is the top of the unscrolled screen, above
+    /// that is negative -- so the scroll offset comes off here.
+    pub fn selection_rows(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        let Some(sel) = self.selection.as_ref() else {
+            return out;
+        };
+        // A click with no drag is an empty selection, not a one-cell one: it must
+        // not paint a wash where the pointer happened to land.
+        if sel.is_empty() {
+            return out;
+        }
+        let term = self.term.lock();
+        let Some(range) = sel.to_range(&term) else {
+            return out;
+        };
+        let off = term.grid().display_offset() as i32;
+        let cols = term.columns();
+        let rows = term.screen_lines();
+        for line in range.start.line.0..=range.end.line.0 {
+            let vis = line + off;
+            if vis < 0 || vis as usize >= rows {
+                continue;
+            }
+            let (left, right) = if range.is_block {
+                // A block selection keeps its columns on every row it spans.
+                (range.start.column.0, range.end.column.0 + 1)
+            } else {
+                let left = if line == range.start.line.0 { range.start.column.0 } else { 0 };
+                let right =
+                    if line == range.end.line.0 { range.end.column.0 + 1 } else { cols };
+                (left, right)
+            };
+            let (l, r) = (left.min(cols), right.min(cols));
+            if r > l {
+                out.push((vis as usize, l, r));
+            }
+        }
+        out
+    }
+
+    /// Paste, honouring bracketed paste so a multi-line paste is not run as keys.
+    pub fn paste(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let mut bytes = Vec::new();
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
+        }
+        bytes.extend_from_slice(text.as_bytes());
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+        self.write(&bytes);
     }
 
     /// Tab label, matching the original's precedence: an explicit rename wins,
