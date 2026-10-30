@@ -49,6 +49,8 @@ pub struct Gpu {
     pub pool: Vec<Buffer>,
     /// Pooled buffers for tab-strip labels.
     pub tab_pool: Vec<Buffer>,
+    /// Single buffer for the inline rename prompt (terminal font metrics).
+    pub prompt_buf: Buffer,
 }
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -202,6 +204,7 @@ impl Gpu {
         let tab_pool: Vec<Buffer> = (0..16)
             .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_px * 1.3)))
             .collect();
+        let prompt_buf = Buffer::new(font_system, Metrics::new(font_px, font_px * 1.3));
 
         Gpu {
             device,
@@ -217,6 +220,7 @@ impl Gpu {
             rects: Vec::with_capacity(1024),
             pool,
             tab_pool,
+            prompt_buf,
         }
     }
 

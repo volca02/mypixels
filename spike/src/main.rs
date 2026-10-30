@@ -195,6 +195,10 @@ struct App {
     /// shrink font mutates it); a config reload resets it to the config value.
     term_family: &'static str,
     term_pt: f32,
+    /// Inline rename mode: when true, keys edit `rename_draft` instead of the
+    /// terminal; Enter commits, Esc cancels.
+    renaming: bool,
+    rename_draft: String,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -307,6 +311,8 @@ impl App {
             tab_attrs,
             term_family,
             term_pt,
+            renaming: false,
+            rename_draft: String::new(),
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -455,6 +461,8 @@ impl App {
             gpu.pool = (0..MAX_RUNS)
                 .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3)))
                 .collect();
+            gpu.prompt_buf =
+                Buffer::new(&mut self.font_system, Metrics::new(font_px, font_px * 1.3));
         }
         // Cell size changed -> the grid that fits the surface changes.
         self.sync_term_size();
@@ -722,16 +730,18 @@ impl App {
                 );
             }
         }
-        // Cursor
+        // Cursor (hidden on row 0 while renaming; the prompt owns that line)
         if let Some((cx, cy)) = frame.cursor {
-            push_rect(
-                &mut gpu.rects,
-                cx as f32 * self.cell_w,
-                strip_h + cy as f32 * self.cell_h,
-                self.cell_w,
-                self.cell_h,
-                [CURSOR_COLOR[0], CURSOR_COLOR[1], CURSOR_COLOR[2], 0.35],
-            );
+            if !(self.renaming && cy == 0) {
+                push_rect(
+                    &mut gpu.rects,
+                    cx as f32 * self.cell_w,
+                    strip_h + cy as f32 * self.cell_h,
+                    self.cell_w,
+                    self.cell_h,
+                    [CURSOR_COLOR[0], CURSOR_COLOR[1], CURSOR_COLOR[2], 0.35],
+                );
+            }
         }
 
         // --- Terminal text ---
@@ -743,6 +753,10 @@ impl App {
             let attrs = &self.mono_attrs;
             let pool = &mut gpu.pool;
             for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
+                // Row 0 is replaced by the rename prompt.
+                if self.renaming && run.row == 0 {
+                    continue;
+                }
                 let blank = run.text.chars().all(|c| c == ' ');
                 let default_fg =
                     (run.fg[0] - self.fg[0]).abs() + (run.fg[1] - self.fg[1]).abs()
@@ -768,6 +782,42 @@ impl App {
                         (run.fg[0] * 255.0) as u8,
                         (run.fg[1] * 255.0) as u8,
                         (run.fg[2] * 255.0) as u8,
+                    ),
+                    custom_glyphs: &[],
+                });
+            }
+        }
+
+        // --- Inline rename prompt (overlays terminal row 0) ---
+        if self.renaming {
+            push_rect(
+                &mut gpu.rects,
+                0.0,
+                strip_h,
+                w as f32,
+                self.cell_h,
+                [self.bg[0], self.bg[1], self.bg[2], 1.0],
+            );
+            let prompt = format!("Rename: {}", self.rename_draft);
+            {
+                let fs = &mut self.font_system;
+                let b = &mut gpu.prompt_buf;
+                b.set_size(Some(w as f32), None);
+                b.set_text(&prompt, &self.mono_attrs, Shaping::Basic, None);
+                b.set_monospace_width(Some(self.cell_w));
+                b.shape_until_scroll(fs, false);
+                let ptr: *const Buffer = b;
+                let buf: &Buffer = unsafe { &*ptr };
+                areas.push(TextArea {
+                    buffer: buf,
+                    left: 0.0,
+                    top: strip_h,
+                    scale: 1.0,
+                    bounds,
+                    default_color: glyphon::Color::rgb(
+                        (self.fg[0] * 255.0) as u8,
+                        (self.fg[1] * 255.0) as u8,
+                        (self.fg[2] * 255.0) as u8,
                     ),
                     custom_glyphs: &[],
                 });
@@ -831,7 +881,12 @@ impl App {
                     Some(g) => format!("{}x{}", g.config.width, g.config.height),
                     None => "-".to_string(),
                 };
-                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}]", self.active, surf, cursor, state.join(","));
+                let ren = if self.renaming {
+                    format!("renaming={:?}", self.rename_draft)
+                } else {
+                    String::new()
+                };
+                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {}", self.active, surf, cursor, state.join(","), ren);
                 continue;
             }
             if let Some((mods, key)) = parse_key_spec(line) {
@@ -846,6 +901,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+        // 0. Rename mode eats keys (Enter commits, Esc cancels, Backspace and
+        //    characters edit the draft). Nothing reaches the terminal.
+        if self.renaming {
+            self.handle_rename_key(key);
+            return;
+        }
         // 1. Configured bindings
         let overview_active = false; // overview not ported yet
         if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
@@ -866,6 +927,33 @@ impl App {
                     tab.write(&bytes);
                 }
             }
+        }
+    }
+
+    fn handle_rename_key(&mut self, key: &Key) {
+        use winit::keyboard::NamedKey;
+        match key {
+            Key::Named(NamedKey::Enter) => {
+                let name = self.rename_draft.clone();
+                self.renaming = false;
+                log::info!("rename_tab -> {:?}", name);
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    t.name = if name.is_empty() { None } else { Some(name) };
+                }
+            },
+            Key::Named(NamedKey::Escape) => {
+                self.renaming = false;
+            },
+            Key::Named(NamedKey::Backspace) => {
+                self.rename_draft.pop();
+            },
+            Key::Character(c) => {
+                self.rename_draft.push_str(c);
+            },
+            _ => {},
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -950,9 +1038,15 @@ impl App {
             },
             "enlarge_font" => self.zoom_term(true),
             "shrink_font" => self.zoom_term(false),
+            "rename_tab" => {
+                // Pre-fill the draft with the current displayed title; the
+                // inline prompt takes over from the next key.
+                self.rename_draft = self.tabs[self.active].display_title();
+                self.renaming = true;
+            },
             // Not yet ported
             "show_search" | "show_search_all" | "search_prev" | "search_next"
-            | "show_tab_overview" | "rename_tab" => {
+            | "show_tab_overview" => {
                 log::debug!("unported action: {action}");
             },
             _ => {},
@@ -1046,6 +1140,13 @@ fn spawn_key_reader(
                 }
                 if tx.send(line).is_err() {
                     return;
+                }
+                // Wake the event loop: keys are drained on RedrawRequested, and
+                // an idle terminal produces none on its own.
+                if let Ok(slot) = window_slot.lock() {
+                    if let Some(w) = slot.as_ref() {
+                        w.request_redraw();
+                    }
                 }
                 // Wake the UI thread so the spec is processed promptly.
                 if let Some(window) = window_slot.lock().unwrap().as_ref() {

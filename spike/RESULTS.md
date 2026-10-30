@@ -122,8 +122,14 @@ redraw storm at single-digit CPU. The port is validated.
   the term glyph pool + re-measures the cell + resizes the grid. Config
   reload resets `term_pt` to the config value. Verified on Xvfb: 9->12 over
   three enlarges, then down to the 1pt floor (no 0pt).
+- `rename_tab` (Alt+Shift+n): inline prompt on terminal row 0 (no GTK dialog).
+  Draft prefills with the current title; chars/Backspace edit, Enter commits
+  to `Tab.name` (which `tab_label` prefers over the window title), Esc
+  cancels. While renaming, row-0 terminal runs + cursor are suppressed so the
+  prompt owns the line, and no keys reach the terminal. Verified on Xvfb:
+  shell->MyTab committed, and a second rename cancelled with Esc.
 
-Not yet ported: search panel (deprioritized), tab overview, rename_tab.
+Not yet ported: search panel (deprioritized), tab overview (thumbnails).
 Scrollback view, selection, IME, copy/paste still not implemented (spike is
 a rendering/emulation perf + config test, not a full terminal yet).
 
