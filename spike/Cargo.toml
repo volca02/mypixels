@@ -18,3 +18,4 @@ arc-swap = "1"
 # The crate cosmic-text's `Fallback` trait signature uses; cargo unifies it so
 # we implement the very same trait cosmic-text calls.
 unicode-script = "0.5"
+libc = "0.2"

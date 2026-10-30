@@ -22,7 +22,7 @@ use glyphon::{
     Attrs, Buffer, Family, FontSystem, Metrics, Resolution, Shaping, TextArea, TextBounds,
 };
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -33,7 +33,11 @@ use tab::{SpikeListener, Tab};
 
 const HISTORY: usize = 10_000;
 const MAX_RUNS: usize = 4096;
-const TAB_PAD: f32 = 6.0;
+const TAB_PAD: f32 = 8.0;
+/// Gap between tabs -- the original gets it from `margin-right: 1px`.
+const TAB_GAP: f32 = 1.0;
+/// The original's `clock()` prepend stamps HH:MM in this colour.
+const CLOCK_COLOR: [f32; 3] = [0.6, 0.4, 0.4];
 /// Vertical padding inside a tab. The original gets 21px for Terminus 12 from
 /// GTK (`padding: 2px 8px` plus 2px label margins); we reproduce the 2+2.
 const TAB_VPAD: f32 = 2.0;
@@ -220,6 +224,14 @@ struct App {
     /// 15px, Terminus 12 on 17px) and one guessed factor fit neither.
     term_metrics: fonts::LineMetrics,
     tab_metrics: fonts::LineMetrics,
+    /// Strip hit boxes from the last drawn frame, in window pixels: (x0, x1)
+    /// per tab, plus the [+] button. Recorded while drawing, read by the mouse
+    /// handlers, so hit-testing can never disagree with what is on screen.
+    tab_hits: Vec<(f32, f32)>,
+    add_hit: (f32, f32),
+    /// Tab under the pointer, or usize::MAX for none.
+    hover_tab: usize,
+    hover_add: bool,
     tablist_hidden: bool,
     fg: [f32; 3],
     bg: [f32; 3],
@@ -424,6 +436,10 @@ impl App {
             tab_text_h: tab_lh,
             term_metrics,
             tab_metrics,
+            tab_hits: Vec::new(),
+            add_hit: (0.0, 0.0),
+            hover_tab: usize::MAX,
+            hover_add: false,
             tablist_hidden,
             fg,
             bg,
@@ -851,64 +867,144 @@ impl App {
         let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
 
         // --- Tab strip ---
-        let mut x = 0.0f32;
-        let tab_y = 0.0f32;
+        let mut tab_hits: Vec<(f32, f32)> = Vec::new();
+        let mut add_hit = (0.0f32, 0.0f32);
         if show_strip {
-            let bg4: [f32; 4] = [self.bg[0], self.bg[1], self.bg[2], 1.0];
-            push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, self.tab_h, bg4);
-            // SAFETY: same pool reasoning as for terminal runs below.
-            {
-                let fs = &mut self.font_system;
-                let attrs = &self.tab_attrs;
-                let tpool = &mut gpu.tab_pool;
-                // Each label needs its own pool slot. An entangled tab takes a
-                // second slot for the red * marker (two areas sharing one
-                // Buffer would both draw the buffer's current contents).
-                let usable = tpool.len() - 1; // reserve the last slot for [+]
-                let mut slot = 0usize;
-                for (i, t) in self.tabs.iter().enumerate() {
-                    let need = if t.entangled { 2 } else { 1 };
-                    if slot + need > usable {
-                        break;
-                    }
-                    let marker_slot = slot;
-                    let label_slot = slot + (if t.entangled { 1 } else { 0 });
-                    let selected = i == self.active;
-                    let (fgc, bgc) = if selected {
-                        (self.config.tab_color_fg_selected.to_f32(), self.config.tab_color_bg_selected.to_f32())
-                    } else {
-                        (self.config.tab_color_fg.to_f32(), self.config.tab_color_bg.to_f32())
-                    };
-                    let fgc = if t.group < 8 { self.config.col[t.group].to_f32() } else { fgc };
+            let bar = self.config.tablist_background.to_f32();
+            push_rect(&mut gpu.rects, 0.0, 0.0, wf, self.tab_h, [bar[0], bar[1], bar[2], 1.0]);
+            let text_y = (self.tab_h - self.tab_text_h) / 2.0;
+
+            // Measure the labels first. With enough tabs the strip has to scroll
+            // to keep the active one visible, which needs the total width up
+            // front -- the old code simply stopped drawing past the last pool
+            // slot, so the tail of the tab list silently vanished.
+            struct Face {
+                text: String,
+                marker: bool,
+                w: f32,
+            }
+            let faces: Vec<Face> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
                     let text = tab_label(
                         t,
                         i,
-                        selected,
+                        i == self.active,
                         self.config.tab_title_max_length,
                         self.config.tab_title_short_current,
                         &self.config.tab_shorten_str,
                     );
                     let marker_w = if t.entangled { self.tab_char_w } else { 0.0 };
-                    let tw = text.chars().count() as f32 * self.tab_char_w + marker_w + TAB_PAD * 2.0;
-                    let tbg = if selected { bgc } else { self.config.tab_color_bg.to_f32() };
-                    push_rect(&mut gpu.rects, x, tab_y, tw, self.tab_h, [tbg[0], tbg[1], tbg[2], 1.0]);
-                    let ty = tab_y + (self.tab_h - self.tab_text_h) / 2.0;
-                    if t.entangled {
-                        push_tab_label(tpool, marker_slot, fs, attrs, "*", x + TAB_PAD, ty, self.config.tab_color_entangle.to_f32(), &mut areas, self.tab_char_w, bounds);
+                    let w = text.chars().count() as f32 * self.tab_char_w
+                        + marker_w
+                        + TAB_PAD * 2.0;
+                    Face { text, marker: t.entangled, w }
+                })
+                .collect();
+
+            let clock_label: Option<String> = match self.config.tab_prepend.as_deref() {
+                Some("clock") => {
+                    let (hh, mm) = local_hhmm();
+                    Some(format!("{hh:02}:{mm:02} "))
+                }
+                _ => None,
+            };
+            let clock_w = clock_label
+                .as_ref()
+                .map(|s| s.chars().count() as f32 * self.tab_char_w + TAB_PAD * 2.0)
+                .unwrap_or(0.0);
+            let add_w = 2.0 * self.tab_char_w + TAB_PAD * 2.0;
+            let total =
+                clock_w + faces.iter().map(|f| f.w + TAB_GAP).sum::<f32>() + add_w;
+
+            // Scroll only as far as revealing the active tab requires.
+            let mut scroll = 0.0f32;
+            if total > wf && !faces.is_empty() {
+                let active_end = clock_w
+                    + faces.iter().take(self.active + 1).map(|f| f.w + TAB_GAP).sum::<f32>();
+                let want = active_end - (wf - add_w - TAB_PAD);
+                scroll = want.max(0.0).min((total - wf).max(0.0));
+            }
+
+            {
+                let fs = &mut self.font_system;
+                let attrs = &self.tab_attrs;
+                let tpool = &mut gpu.tab_pool;
+                let mut slot = 0usize;
+                let mut x = -scroll;
+
+                if let Some(label) = clock_label.as_deref() {
+                    if slot < tpool.len() {
+                        push_tab_label(tpool, slot, fs, attrs, label, x + TAB_PAD, text_y, CLOCK_COLOR, &mut areas, self.tab_char_w, bounds);
+                        slot += 1;
                     }
-                    push_tab_label(tpool, label_slot, fs, attrs, &text, x + TAB_PAD + marker_w, ty, fgc, &mut areas, self.tab_char_w, bounds);
+                    x += clock_w + TAB_GAP;
+                }
+
+                for (i, face) in faces.iter().enumerate() {
+                    // One pool slot for the label, one more for the entangle
+                    // marker (two areas sharing a Buffer would both render the
+                    // buffer's current contents).
+                    let need = if face.marker { 2 } else { 1 };
+                    if slot + need > tpool.len() {
+                        break;
+                    }
+                    let selected = i == self.active;
+                    let t = &self.tabs[i];
+                    let mut fgc = if selected {
+                        self.config.tab_color_fg_selected.to_f32()
+                    } else {
+                        self.config.tab_color_fg.to_f32()
+                    };
+                    if t.group < 8 {
+                        fgc = self.config.col[t.group].to_f32();
+                    }
+                    let bgc = if selected {
+                        self.config.tab_color_bg_selected.to_f32()
+                    } else {
+                        self.config.tab_color_bg.to_f32()
+                    };
+                    // Leave the bottom pixel to the bar seam so tabs sit *on*
+                    // the strip instead of covering it.
+                    let body_h = self.tab_h - 1.0;
+                    push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [bgc[0], bgc[1], bgc[2], 1.0]);
+                    if self.hover_tab == i && !selected {
+                        // Wash of the label's own colour rather than an invented
+                        // grey, so hover matches whatever theme is configured.
+                        push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [fgc[0], fgc[1], fgc[2], 0.12]);
+                    }
+                    if selected {
+                        // 2px accent in the tab's own colour: keeps selection
+                        // legible even when fg and bg differ only slightly.
+                        push_rect(&mut gpu.rects, x, self.tab_h - 3.0, face.w, 3.0, [fgc[0], fgc[1], fgc[2], 1.0]);
+                    }
+                    let marker_slot = slot;
+                    let label_slot = slot + if face.marker { 1 } else { 0 };
+                    let mut tx = x + TAB_PAD;
+                    if face.marker {
+                        push_tab_label(tpool, marker_slot, fs, attrs, "*", tx, text_y, self.config.tab_color_entangle.to_f32(), &mut areas, self.tab_char_w, bounds);
+                        tx += self.tab_char_w;
+                    }
+                    push_tab_label(tpool, label_slot, fs, attrs, &face.text, tx, text_y, fgc, &mut areas, self.tab_char_w, bounds);
+                    tab_hits.push((x, x + face.w));
                     slot += need;
-                    x += tw;
+                    x += face.w + TAB_GAP;
                 }
-                // [+] add button
-                let bw = 2.0 * self.tab_char_w + TAB_PAD * 2.0;
+
+                // [+] button: GTK styles it `brighten(tablist_background, 1.1)`.
                 let c = self.config.add_button_color.to_f32();
-                push_rect(&mut gpu.rects, x, tab_y, bw, self.tab_h, [c[0] * 0.3, c[1] * 0.3, c[2] * 0.3, 1.0]);
+                let bbg = if self.hover_add { brighten(bar, 1.4) } else { brighten(bar, 1.1) };
+                push_rect(&mut gpu.rects, x, 0.0, add_w, self.tab_h - 1.0, [bbg[0], bbg[1], bbg[2], 1.0]);
                 if slot < tpool.len() {
-                    push_tab_label(tpool, slot, fs, attrs, "[+]", x + TAB_PAD, tab_y + (self.tab_h - self.tab_text_h) / 2.0, c, &mut areas, self.tab_char_w, bounds);
+                    push_tab_label(tpool, slot, fs, attrs, "[+]", x + TAB_PAD, text_y, c, &mut areas, self.tab_char_w, bounds);
                 }
+                add_hit = (x, x + add_w);
             }
         }
+        self.tab_hits = tab_hits;
+        self.add_hit = add_hit;
 
         // --- Terminal: cell backgrounds ---
         for run in &frame.runs {
@@ -1536,6 +1632,32 @@ impl App {
 }
 
 /// Build the tab strip label text, mimicking the Python tab_format.
+/// Scale a colour toward white, clamped. Mirrors the original's `brighten()`,
+/// which GTK uses for the add-tab button background.
+fn brighten(c: [f32; 3], f: f32) -> [f32; 3] {
+    [
+        (c[0] * f).min(1.0),
+        (c[1] * f).min(1.0),
+        (c[2] * f).min(1.0),
+    ]
+}
+
+/// Local HH:MM. `std::time` has no calendar/local conversion, and pulling in a
+/// date-time crate for a two-number clock label is not worth it.
+fn local_hhmm() -> (u32, u32) {
+    // SAFETY: `time` accepts null; `localtime_r` writes the caller's own tm and
+    // is the thread-safe variant (unlike `localtime`).
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        (
+            tm.tm_hour.max(0) as u32,
+            tm.tm_min.max(0) as u32,
+        )
+    }
+}
+
 fn tab_label(
     t: &Tab,
     idx: usize,
@@ -2070,6 +2192,43 @@ impl ApplicationHandler for App {
                 // frames for the ones that didn't (e.g. the cursor blink).
                 self.draw(&window);
             },
+            WindowEvent::CursorMoved { position, .. } => {
+                let px = position.x as f32;
+                let py = position.y as f32;
+                let in_strip = self.show_tab_strip() && py < self.tab_h;
+                let mut hover = usize::MAX;
+                let mut hover_add = false;
+                if in_strip {
+                    for (i, (x0, x1)) in self.tab_hits.iter().enumerate() {
+                        if px >= *x0 && px < *x1 {
+                            hover = i;
+                            break;
+                        }
+                    }
+                    let (a0, a1) = self.add_hit;
+                    hover_add = px >= a0 && px < a1;
+                }
+                if hover != self.hover_tab || hover_add != self.hover_add {
+                    self.hover_tab = hover;
+                    self.hover_add = hover_add;
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if self.hover_tab < self.tabs.len() {
+                    if self.hover_tab != self.active {
+                        self.active = self.hover_tab;
+                        window.request_redraw();
+                    }
+                } else if self.hover_add {
+                    self.add_tab();
+                    window.request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state == ElementState::Pressed && !key.repeat {
                     self.handle_key(&key.logical_key, event_loop);

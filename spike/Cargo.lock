@@ -2254,6 +2254,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "glyphon",
+ "libc",
  "log",
  "portable-pty",
  "serde_yaml",
