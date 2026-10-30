@@ -120,7 +120,7 @@ pub struct Gpu {
     pub prompt_buf: Buffer,
 }
 
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
         fn noop(_: *const ()) {}

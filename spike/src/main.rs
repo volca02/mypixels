@@ -953,6 +953,16 @@ impl App {
         } else {
             1.0
         };
+        static BG_LOG: std::sync::Once = std::sync::Once::new();
+        BG_LOG.call_once(|| {
+            log::info!(
+                "background alpha {:.3} (alpha_ok {}, term_opacity {:.2}, surface alpha {:?})",
+                bg_a,
+                gpu.alpha_ok,
+                self.config.term_opacity,
+                gpu.config.alpha_mode
+            );
+        });
         push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, h as f32, [self.bg[0], self.bg[1], self.bg[2], bg_a]);
 
         // --- Text areas (tab labels + terminal runs), one prepare() per frame ---
@@ -2511,9 +2521,81 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Report what this compositor + driver pair will actually do with our alpha,
+/// then exit. The window is created with `visible(false)`, so nothing is ever
+/// mapped and the desktop is undisturbed -- which matters because the answer
+/// differs per backend, per driver and per compositor, and cannot be settled by
+/// reading their sources.
+fn alpha_probe(event_loop: &EventLoop<()>) {
+    let window = std::sync::Arc::new(
+        event_loop
+            .create_window(
+                winit::window::Window::default_attributes()
+                    .with_inner_size(winit::dpi::LogicalSize::new(64.0, 64.0))
+                    .with_visible(false)
+                    .with_transparent(true)
+                    .with_title("alpha-probe"),
+            )
+            .expect("window"),
+    );
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+        Box::new(event_loop.owned_display_handle()),
+    ));
+    let surface = instance.create_surface(window.clone()).expect("surface");
+    for a in gpu::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
+        let i = a.get_info();
+        log::info!("probe: adapter available {:?} / {}", i.backend, i.name);
+    }
+    let adapter = gpu::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+        ..Default::default()
+    }))
+    .expect("adapter");
+    let info = adapter.get_info();
+    let caps = surface.get_capabilities(&adapter);
+    log::info!("probe: chosen {:?} / {}", info.backend, info.name);
+    log::info!("probe: alpha_modes advertised = {:?}", caps.alpha_modes);
+    log::info!("probe: formats = {:?}", caps.formats);
+    let (device, _queue) =
+        gpu::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("device");
+    // Some drivers advertise less than they accept, and vice versa: what decides
+    // whether we get an ARGB buffer is whether configure() takes the mode.
+    for m in [
+        wgpu::CompositeAlphaMode::PreMultiplied,
+        wgpu::CompositeAlphaMode::Inherit,
+        wgpu::CompositeAlphaMode::PostMultiplied,
+        wgpu::CompositeAlphaMode::Opaque,
+    ] {
+        let cfg = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: caps.formats[0],
+            width: 64,
+            height: 64,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: m,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            surface.configure(&device, &cfg);
+        }))
+        .is_ok();
+        log::info!("probe: configure({m:?}) -> {}", if ok { "accepted" } else { "rejected" });
+    }
+    log::info!("probe: done");
+}
+
 fn main() {
     env_logger::init();
     let event_loop = EventLoop::new().expect("event loop");
+    if std::env::args().any(|a| a == "--alpha-probe") {
+        alpha_probe(&event_loop);
+        return;
+    }
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("run");
     log::info!("exited");
