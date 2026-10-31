@@ -11,3 +11,7 @@ while True:
         out.write(data)
     if data == b'\x05':
         os.write(1, ''.join(f'history {i:03}\r\n' for i in range(120)).encode())
+    if data == b'm':
+        # drag (1002) + SGR (1006): the smoke test then checks that the
+        # terminal receives mouse reports instead of doing a selection
+        os.write(1, b'\r\n\x1b[?1002h\x1b[?1006hMOUSE')

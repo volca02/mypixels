@@ -100,7 +100,35 @@ try:
     assert other.read_bytes()==b'', 'switcher typed into the wrong tab'
     key('alt+o')
     wait(lambda:capture.read_bytes().endswith(b'\x1bo'), 'retired standalone overview still swallowed Alt+O')
-    print('PASS: keyboard copy/paste, Unicode, bracketed paste, primary, selection, scrollback, delayed paste destination, and Alt-held visual switcher')
+    # Terminal mouse reporting: the fixture now owns the mouse (1002 + 1006),
+    # so a drag is reported to the PTY cell by cell and must not select.
+    last_primary=primary()
+    key('m')
+    time.sleep(.25)
+    def cap(): return capture.read_bytes()
+    before=len(cap())
+    mouse(1,strip+ch/2)
+    run('xdotool','mousedown','1')
+    mouse(cw*1.5,strip+ch/2)
+    mouse(cw*2.5,strip+ch/2)
+    run('xdotool','mouseup','1')
+    time.sleep(.2)
+    reported=cap()[before:]
+    for seq in (b'\x1b[0;1;1M', b'\x1b[32;2;1M', b'\x1b[32;3;1M', b'\x1b[3;3;1m'):
+        assert seq in reported, f'mouse report {seq!r} missing from {reported!r}'
+    assert primary()==last_primary, 'a reported drag must not touch the selection'
+    mouse(cw,strip+ch/2)
+    run('xdotool','click','4')
+    wait(lambda: b'\x1b[64;1;1M' in cap()[before:], 'wheel report missing')
+    # Shift bypasses reporting: the click selects instead, nothing hits the PTY
+    before2=len(cap())
+    run('xdotool','keydown','shift')
+    mouse(cw*3,strip+ch/2)
+    run('xdotool','click','1')
+    run('xdotool','keyup','shift')
+    time.sleep(.2)
+    assert cap()[before2:]==b'', 'shift click was reported instead of bypassing the mouse modes'
+    print('PASS: keyboard copy/paste, Unicode, bracketed paste, primary, selection, scrollback, delayed paste destination, Alt-held visual switcher, and terminal mouse reporting with Shift bypass')
     print('Artifacts:',work)
 finally:
     app.terminate()

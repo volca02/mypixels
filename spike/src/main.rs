@@ -22,6 +22,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::TermMode;
 
 use glyphon::{
     Attrs, Buffer, Family, FontSystem, Metrics, Resolution, Shaping, TextArea, TextBounds,
@@ -302,6 +303,12 @@ struct App {
     /// Last pointer position, so a button press can hit-test without waiting for
     /// the next `CursorMoved`.
     pointer: (f32, f32),
+    /// Button held while the terminal receives mouse reports; motion events
+    /// must carry the held button's code.
+    mouse_button: Option<MouseButton>,
+    /// Last viewport cell a report covered: dedupes motion, and stands in for
+    /// the release coordinates when the pointer leaves the terminal area.
+    mouse_last: Option<(u16, u16)>,
     /// Cell a left-drag last covered; the selection only moves when a new cell
     /// is entered, which keeps dragging from repainting every pixel step.
     drag: Option<(Point, Side)>,
@@ -544,6 +551,8 @@ impl App {
             tab_hits: Vec::new(),
             add_hit: (0.0, 0.0),
             pointer: (0.0, 0.0),
+            mouse_button: None,
+            mouse_last: None,
             drag: None,
             click: None,
             clipboard: None,
@@ -844,6 +853,14 @@ impl App {
 
         if let Some(gpu) = &mut self.gpu {
             gpu.tab_pool = (0..16)
+                .map(|_| {
+                    Buffer::new(
+                        &mut self.font_system,
+                        Metrics::new(tab_font_px, tab_lh),
+                    )
+                })
+                .collect();
+            gpu.ov_pool = (0..64)
                 .map(|_| {
                     Buffer::new(
                         &mut self.font_system,
@@ -1262,19 +1279,14 @@ impl App {
         // --- Terminal text ---
         // SAFETY: pool indices are disjoint (run index < MAX_RUNS), the pool
         // never reallocates after init, and the derived shared references are
-        // only used this frame, before any further pool writes.
+        // only used this frame, before any further pool writes. The overview
+        // uses its own pool (`ov_pool`), so this stays true with it open: its
+        // text sits in `OverlayPhase` and is drawn above the terminal's.
         {
             let cache = shaping_cache_enabled();
             let fs = &mut self.font_system;
             let pool = &mut gpu.pool;
             for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
-                // Behind the overview the terminal is painted as a colour field
-                // only. Text is drawn in a single pass after every rect, so
-                // terminal text would otherwise bleed through the tiles; real
-                // see-through needs the overlay in its own pass (see TODO).
-                if self.overview.is_some() {
-                    break;
-                }
                 // Row 0 is replaced by the rename prompt.
                 if self.renaming && run.row == 0 {
                     continue;
@@ -1428,7 +1440,12 @@ impl App {
                 built += 1;
             }
         }
+        // The switcher's rects and text must sit above the terminal text, so
+        // everything `draw_overview` appends goes to `render_frame` as a
+        // second phase: base rects, terminal text, then dim + tiles + text.
+        let mut overlay: Option<gpu::OverlayPhase> = None;
         if let Some(ov) = &self.overview {
+            let (rects_start, areas_start) = (gpu.rects.len(), areas.len());
             draw_overview(
                 &mut gpu,
                 &mut self.font_system,
@@ -1442,12 +1459,14 @@ impl App {
                 w,
                 h,
                 &mut areas,
+                self.scale,
             );
-            // Thumbnails reuse pooled buffers at a different scale, so every
-            // cached signature is stale once the overview has drawn.
-            gpu.slot_sig.fill(0);
+            overlay = Some(gpu::OverlayPhase {
+                rects: gpu.rects.split_off(rects_start),
+                areas: areas.split_off(areas_start),
+            });
         }
-        gpu.render_frame(&mut self.font_system, areas, jobs, window);
+        gpu.render_frame(&mut self.font_system, areas, overlay, jobs, window);
         self.gpu = Some(gpu);
 
         if std::env::var("SPIKE_TRACE").is_ok() {
@@ -1548,6 +1567,59 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+
+    /// The active terminal's mouse-reporting mode, or None when the terminal
+    /// does not want the mouse. Shift is the bypass: while it is held the
+    /// mouse always selects instead of reporting (the VTE/Alacritty rule).
+    fn mouse_mode(&self) -> Option<TermMode> {
+        if self.modifiers.shift_key() {
+            return None;
+        }
+        let term = self.tabs.get(self.active)?.term.lock();
+        let mode = *term.mode();
+        let any = mode.contains(TermMode::MOUSE_REPORT_CLICK)
+            || mode.contains(TermMode::MOUSE_DRAG)
+            || mode.contains(TermMode::MOUSE_MOTION);
+        any.then_some(mode)
+    }
+
+    /// Viewport cell under the pointer in protocol coordinates (1-based), or
+    /// None over the tab strip or outside the grid.
+    fn mouse_cell(&self, px: f32, py: f32) -> Option<(u16, u16)> {
+        let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
+        if py < strip_h {
+            return None;
+        }
+        let col = (px / self.cell_w).floor() as u16;
+        let row = ((py - strip_h) / self.cell_h).floor() as i32;
+        if col >= self.cols as u16 || row < 0 || row as usize >= self.rows {
+            return None;
+        }
+        Some((col + 1, row as u16 + 1))
+    }
+
+    /// Modifier bits for a mouse report (4 shift, 8 alt, 16 ctrl). Shift can
+    /// never be set here: it bypasses reporting entirely.
+    fn mouse_mods(&self) -> u16 {
+        let mut m = 0u16;
+        if self.modifiers.alt_key() {
+            m |= 8;
+        }
+        if self.modifiers.control_key() {
+            m |= 16;
+        }
+        m
+    }
+
+    fn mouse_button_code(&self, button: MouseButton) -> u16 {
+        let base = match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            _ => 0,
+        };
+        base | self.mouse_mods()
     }
 
     /// Cell under the pointer, in grid coordinates, plus which half of it.
@@ -2175,6 +2247,7 @@ fn draw_overview(
     w: u32,
     h: u32,
     areas: &mut Vec<TextArea>,
+    scale: f32,
 ) {
     let wf = w as f32;
     let hf = h as f32;
@@ -2188,7 +2261,9 @@ fn draw_overview(
         };
 
     let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-    let pool = &mut gpu.pool;
+    // Own pool: the terminal's runs draw in the same frame, and a shared pool
+    // would let the tile headers clobber the runs they alias at prepare time.
+    let pool = &mut gpu.ov_pool;
     let mut slot = 0usize;
 
     let background = config.background_color.to_f32();
@@ -2212,10 +2287,15 @@ fn draw_overview(
     let pad = 10.0;
     let spacing = 12.0;
     let banner_h = 40.0;
-    let thumb_w = (config.tab_overview_thumb_width as f32)
+    // Configured in logical pixels, like every other size in this app: on a
+    // 2x display the tile is double. The preview stays sharp, not stretched:
+    // each tab's frame is rendered at full window resolution into the
+    // offscreen target and the tile merely samples it, so a bigger tile
+    // covers less source per destination pixel.
+    let thumb_w = (config.tab_overview_thumb_width as f32 * scale)
         .min((wf - 100.0) / 4.0 - 20.0)
         .max(60.0);
-    let thumb_h = (config.tab_overview_thumb_height as f32)
+    let thumb_h = (config.tab_overview_thumb_height as f32 * scale)
         .min(thumb_w * 0.75)
         .max(40.0);
     let header_h = tab_text_h + 6.0;
@@ -2276,10 +2356,9 @@ fn draw_overview(
                 [foreground[0], foreground[1], foreground[2], 0.12], radius + 1.0,
             );
         }
-        // Tiles are fully opaque on purpose: all text is drawn in a single pass
-        // after all rects, so a translucent tile had the live terminal's text
-        // bleeding through it. The dim between tiles is where the live terminal
-        // shows; inside a tile you see only that tab's preview.
+        // Tiles are fully opaque on purpose: the terminal text is drawn below
+        // the dim, and the tiles cover it entirely. Between tiles the dimmed
+        // live terminal shows; inside a tile you see only that tab's preview.
         let tile = if selected { theme::mix(config.tablist_background, accent_rgb, 0.16).to_f32() } else { surface };
         let bgc = [tile[0], tile[1], tile[2], 1.0];
         push_rrect(&mut gpu.rects, tx, ty, tile_w, tile_h, bgc, radius);
@@ -2535,6 +2614,19 @@ fn key_bytes(k: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
     }
 }
 
+/// The byte sequence of one mouse report in the protocol the terminal has
+/// enabled. `code` is the xterm button code (0/1/2 press, 3 release, 32
+/// motion, 64/65 wheel) already OR'd with the modifier bits (4 shift, 8 alt,
+/// 16 ctrl); coordinates are 1-based viewport cells.
+fn mouse_report_bytes(mode: TermMode, code: u16, col: u16, row: u16, release: bool) -> Vec<u8> {
+    let tail = if release { 'm' } else { 'M' };
+    if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[{};{};{}{}", code, col, row, tail).into_bytes()
+    } else {
+        format!("\x1b[<{};{};{}{}", code, col, row, tail).into_bytes()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ApplicationHandler
 // ---------------------------------------------------------------------------
@@ -2676,6 +2768,24 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let px = position.x as f32;
                 let py = position.y as f32;
+                // Terminal mouse reporting: all-motion mode reports every move,
+                // drag mode only while a button is held. The protocol has no
+                // sub-cell position, so one event per entered cell.
+                {
+                    let cell = self.mouse_cell(px, py);
+                    if let (Some(mode), Some(cell)) = (self.mouse_mode(), cell) {
+                        let motion = mode.contains(TermMode::MOUSE_MOTION)
+                            || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_button.is_some());
+                        if motion && self.mouse_last != Some(cell) {
+                            self.mouse_last = Some(cell);
+                            let code = match self.mouse_button {
+                                Some(b) => self.mouse_button_code(b) | 32,
+                                None => 32,
+                            };
+                            self.tabs[self.active].write(&mouse_report_bytes(mode, code, cell.0, cell.1, false));
+                        }
+                    }
+                }
                 let in_strip = self.show_tab_strip() && py < self.tab_h;
                 let mut hover = usize::MAX;
                 let mut hover_add = false;
@@ -2711,6 +2821,23 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
                 let at = self.pointer;
+                // While the app owns the mouse (and Shift is not bypassing it)
+                // the click is the app's, not the selection's: no paste, no
+                // word select, no tab-strip click.
+                if matches!(button, MouseButton::Left | MouseButton::Middle | MouseButton::Right) {
+                    if let (Some(cell), Some(mode)) = (self.mouse_cell(at.0, at.1), self.mouse_mode()) {
+                        self.mouse_button = Some(button);
+                        self.mouse_last = Some(cell);
+                        self.tabs[self.active].write(&mouse_report_bytes(
+                            mode,
+                            self.mouse_button_code(button),
+                            cell.0,
+                            cell.1,
+                            false,
+                        ));
+                        return;
+                    }
+                }
                 if button == MouseButton::Middle {
                     // Middle click pastes the primary selection -- the X11
                     // convention the original gets free from VTE.
@@ -2754,12 +2881,27 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if self.drag.take().is_some() {
+            WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
+                // A reported release goes back to the app; the coordinates fall
+                // back to the last reported cell when the pointer left the
+                // terminal area mid-drag.
+                if self.mouse_button.take().is_some() {
+                    if let Some(mode) = self.mouse_mode() {
+                        if let Some(cell) =
+                            self.mouse_cell(self.pointer.0, self.pointer.1).or(self.mouse_last)
+                        {
+                            self.tabs[self.active].write(&mouse_report_bytes(
+                                mode,
+                                3 | self.mouse_mods(),
+                                cell.0,
+                                cell.1,
+                                true,
+                            ));
+                        }
+                    }
+                    self.mouse_last = None;
+                }
+                if button == MouseButton::Left && self.drag.take().is_some() {
                     self.publish_primary();
                     window.request_redraw();
                 }
@@ -2774,6 +2916,23 @@ impl ApplicationHandler for App {
                 }
             },
             WindowEvent::MouseWheel { delta, .. } => {
+                // The wheel is part of the click protocol: while the app owns
+                // the mouse it scrolls the app, not the scrollback. Positive
+                // delta is the content moving down, i.e. wheel up.
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    MouseScrollDelta::PixelDelta(p) => p.y,
+                };
+                if dy != 0.0 {
+                    if let (Some(cell), Some(mode)) = (
+                        self.mouse_cell(self.pointer.0, self.pointer.1),
+                        self.mouse_mode(),
+                    ) {
+                        let code = (if dy > 0.0 { 64 } else { 65 }) | self.mouse_mods();
+                        self.tabs[self.active].write(&mouse_report_bytes(mode, code, cell.0, cell.1, false));
+                        return;
+                    }
+                }
                 if self.cell_at(self.pointer.0, self.pointer.1).is_some() {
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
@@ -3068,5 +3227,33 @@ mod palette_tests {
         assert_eq!(resolve(Color::Indexed(17)), [0.0, 0.0, 95.0 / 255.0]);
         assert_eq!(resolve(Color::Indexed(232)), [8.0 / 255.0; 3]);
         assert_eq!(resolve(Color::Spec(Rgb { r: 1, g: 2, b: 3 })), config::Rgb(1, 2, 3).to_f32());
+    }
+}
+
+#[cfg(test)]
+mod mouse_report_tests {
+    use super::*;
+
+    fn mode_with(modes: &[TermMode]) -> TermMode {
+        modes.iter().copied().fold(TermMode::NONE, |m, x| m | x)
+    }
+
+    #[test]
+    fn x10_press_release_and_wheel() {
+        let mode = mode_with(&[TermMode::MOUSE_REPORT_CLICK]);
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0, 42, 17, false)).unwrap(), "\x1b[<0;42;17M");
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 3, 42, 17, true)).unwrap(), "\x1b[<3;42;17m");
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 64, 1, 1, false)).unwrap(), "\x1b[<64;1;1M");
+        // ctrl + middle press: modifier bits are OR'd into the button code
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 1 | 16, 5, 6, false)).unwrap(), "\x1b[<17;5;6M");
+    }
+
+    #[test]
+    fn sgr_uses_semicolons_and_no_bracket() {
+        let mode = mode_with(&[TermMode::MOUSE_REPORT_CLICK, TermMode::SGR_MOUSE]);
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0, 42, 17, false)).unwrap(), "\x1b[0;42;17M");
+        // motion with the left button held
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0 | 32, 3, 9, false)).unwrap(), "\x1b[32;3;9M");
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 3 | 8, 3, 9, true)).unwrap(), "\x1b[11;3;9m");
     }
 }

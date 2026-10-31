@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use glyphon::{Buffer, Cache, ColorMode, FontSystem, Metrics, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport};
+use glyphon::{Buffer, Cache, ColorMode, FontSystem, Metrics, Resolution, SwashCache, TextAtlas, TextArea, TextRenderer, Viewport};
 use winit::window::Window;
 
 use crate::MAX_RUNS;
@@ -92,6 +92,17 @@ fn fs(@location(0) color: vec4<f32>,
     return vec4<f32>(color.rgb, color.a * smoothstep(0.5, -0.5, d));
 }
 "#;
+
+/// The tab-switcher overlay, drawn above the live terminal. Its dim and tile
+/// rects plus tile text form a second phase after the terminal's own text
+/// pass, so the terminal stays visible (dimmed) behind the switcher. Without
+/// the split, the single text pass would paint terminal text over the opaque
+/// tiles -- and the shared glyph pool would let the tile headers clobber the
+/// terminal runs they alias.
+pub struct OverlayPhase<'a> {
+    pub rects: Vec<RectVertex>,
+    pub areas: Vec<TextArea<'a>>,
+}
 
 /// One offscreen terminal render, sampled into an overview tile.
 struct PreviewSlot {
@@ -183,6 +194,11 @@ pub struct Gpu {
     pub slot_sig: Vec<u64>,
     /// Pooled buffers for tab-strip labels.
     pub tab_pool: Vec<Buffer>,
+    /// Pooled buffers for tab-switcher tile text. Kept separate from `pool`
+    /// because the overview and the terminal draw in the same frame: sharing
+    /// buffers would let the tile headers overwrite terminal runs at prepare
+    /// time.
+    pub ov_pool: Vec<Buffer>,
     /// Single buffer for the inline rename prompt (terminal font metrics).
     pub prompt_buf: Buffer,
     // --- Overview previews: real terminal frames, sampled down -------------
@@ -515,6 +531,9 @@ impl Gpu {
             .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_lh)))
             .collect();
         let prompt_buf = Buffer::new(font_system, Metrics::new(font_px, font_lh));
+        let ov_pool: Vec<Buffer> = (0..64)
+            .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_lh)))
+            .collect();
 
         Gpu {
             device,
@@ -546,8 +565,35 @@ impl Gpu {
             prev_viewport: None,
             prev_size: (0, 0),
             tab_pool,
+            ov_pool,
             prompt_buf,
         }
+    }
+
+    /// Upload and draw one batch of rect vertices.
+    fn draw_rects(&mut self, pass: &mut wgpu::RenderPass<'_>, rects: &[RectVertex]) {
+        if rects.is_empty() {
+            return;
+        }
+        // Stride must come from the type, not a literal: `RectVertex` grew
+        // when rounded corners landed, and a stale 24 here let 1024 vertices
+        // be written into a buffer holding 512.
+        let need = rects.len() * std::mem::size_of::<RectVertex>();
+        if need > self.rect_buffer.size() as usize {
+            self.rect_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rects"),
+                // 2x headroom, rounded up, so a busy overview does not
+                // reallocate on every frame.
+                size: ((need * 2) as u64).next_multiple_of(4096),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.rect_buffer, 0, bytemuck::cast_slice(rects));
+        pass.set_pipeline(&self.rect_pipeline);
+        pass.set_vertex_buffer(0, self.rect_buffer.slice(..));
+        pass.draw(0..rects.len() as u32, 0..1);
     }
 
     /// Render one frame: all rects, then all text areas.
@@ -661,6 +707,7 @@ impl Gpu {
         &mut self,
         font_system: &mut FontSystem,
         areas: Vec<glyphon::TextArea>,
+        overlay: Option<OverlayPhase<'_>>,
         previews: Vec<PreviewJob>,
         window: &Window,
     ) {
@@ -802,73 +849,82 @@ impl Gpu {
                 multiview_mask: None,
             });
 
-            pass.set_pipeline(&self.rect_pipeline);
-            // Stride must come from the type, not a literal: `RectVertex` grew
-            // when rounded corners landed, and a stale 24 here let 1024 vertices
-            // be written into a buffer holding 512.
-            let need = self.rects.len() * std::mem::size_of::<RectVertex>();
-            if need > self.rect_buffer.size() as usize {
-                self.rect_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("rects"),
-                    // 2x headroom, rounded up, so a busy overview does not
-                    // reallocate on every frame.
-                    size: ((need * 2) as u64).next_multiple_of(4096),
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+            // Phase 1: the base rects, then the live terminal text.
+            let rects = std::mem::take(&mut self.rects);
+            self.draw_rects(&mut pass, &rects);
+            if !areas.is_empty() {
+                self.text_renderer
+                    .prepare(
+                        &self.device,
+                        &self.queue,
+                        font_system,
+                        &mut self.atlas,
+                        &self.viewport,
+                        areas,
+                        &mut self.swash_cache,
+                    )
+                    .expect("prepare");
+                self.text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .expect("render");
             }
-            self.queue
-                .write_buffer(&self.rect_buffer, 0, bytemuck::cast_slice(&self.rects));
-            pass.set_vertex_buffer(0, self.rect_buffer.slice(..));
-            pass.draw(0..self.rects.len() as u32, 0..1);
 
-            // Sampled tiles: after the rects, so each tile's own background is
-            // underneath, and before the text, so headers stay on top.
-            let quads = std::mem::take(&mut self.prev_quads);
-            let owners = std::mem::take(&mut self.prev_quad_tab);
-            if !quads.is_empty() {
-                let need = quads.len() * std::mem::size_of::<PrevVertex>();
-                if need > self.prev_buffer.size() as usize {
-                    self.prev_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("preview quads"),
-                        size: ((need * 2) as u64).next_multiple_of(4096),
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                }
-                self.queue
-                    .write_buffer(&self.prev_buffer, 0, bytemuck::cast_slice(&quads));
-                pass.set_pipeline(&self.prev_pipeline);
-                pass.set_vertex_buffer(0, self.prev_buffer.slice(..));
-                for (n, (chunk, tab)) in quads.chunks(6).zip(owners.iter()).enumerate() {
-                    if let Some(Some(slot)) = self.previews.get(*tab) {
-                        // Slice per quad: binding the whole buffer and drawing
-                        // 0..6 every time would paint the first tile's geometry
-                        // once per texture, so only one tile showed anything and
-                        // it showed the wrong tab.
-                        let v = std::mem::size_of::<PrevVertex>() as u64;
-                        let first = (n * 6) as u64 * v;
-                        pass.set_vertex_buffer(0, self.prev_buffer.slice(first..first + 6 * v));
-                        pass.set_bind_group(0, &slot.bind, &[]);
-                        pass.draw(0..chunk.len() as u32, 0..1);
+            // Phase 2 (switcher open): the dim and the tiles above the
+            // terminal text, the sampled thumbnails above the tiles, and the
+            // tile text on top.
+            if let Some(overlay) = overlay {
+                self.draw_rects(&mut pass, &overlay.rects);
+
+                // Sampled tiles: after the rects, so each tile's own background
+                // is underneath, and before the text, so headers stay on top.
+                let quads = std::mem::take(&mut self.prev_quads);
+                let owners = std::mem::take(&mut self.prev_quad_tab);
+                if !quads.is_empty() {
+                    let need = quads.len() * std::mem::size_of::<PrevVertex>();
+                    if need > self.prev_buffer.size() as usize {
+                        self.prev_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("preview quads"),
+                            size: ((need * 2) as u64).next_multiple_of(4096),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                    }
+                    self.queue
+                        .write_buffer(&self.prev_buffer, 0, bytemuck::cast_slice(&quads));
+                    pass.set_pipeline(&self.prev_pipeline);
+                    pass.set_vertex_buffer(0, self.prev_buffer.slice(..));
+                    for (n, (chunk, tab)) in quads.chunks(6).zip(owners.iter()).enumerate() {
+                        if let Some(Some(slot)) = self.previews.get(*tab) {
+                            // Slice per quad: binding the whole buffer and drawing
+                            // 0..6 every time would paint the first tile's geometry
+                            // once per texture, so only one tile showed anything and
+                            // it showed the wrong tab.
+                            let v = std::mem::size_of::<PrevVertex>() as u64;
+                            let first = (n * 6) as u64 * v;
+                            pass.set_vertex_buffer(0, self.prev_buffer.slice(first..first + 6 * v));
+                            pass.set_bind_group(0, &slot.bind, &[]);
+                            pass.draw(0..chunk.len() as u32, 0..1);
+                        }
                     }
                 }
-            }
 
-            self.text_renderer
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    areas,
-                    &mut self.swash_cache,
-                )
-                .expect("prepare");
-            self.text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .expect("render");
+                if !overlay.areas.is_empty() {
+                    self.text_renderer
+                        .prepare(
+                            &self.device,
+                            &self.queue,
+                            font_system,
+                            &mut self.atlas,
+                            &self.viewport,
+                            overlay.areas,
+                            &mut self.swash_cache,
+                        )
+                        .expect("prepare");
+                    self.text_renderer
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                        .expect("render");
+                }
+            }
         }
         // Wayland uses this to request the compositor's next frame callback.
         // Without it a busy PTY can drive redraws as fast as the CPU can submit

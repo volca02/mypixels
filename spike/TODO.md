@@ -17,13 +17,90 @@ Current priorities:
    paths, asynchronous paste with stable destinations, separate primary,
    bracketed paste, scrollback, and real keyboard/mouse tests. Details below.
 3. **Everyday interaction (P1).** Proper editable rename input with selected
-   initial text and clipboard support; IME; terminal mouse reporting with Shift
-   bypass; selection autoscroll at the viewport edge; HiDPI transitions.
+   initial text and clipboard support; IME; selection autoscroll at the
+   viewport edge. Done along the way: terminal mouse reporting with Shift
+   bypass, and HiDPI transitions (every metric is derived from the window
+   scale factor, and `ScaleFactorChanged` re-runs the font rebuilds).
 4. **Tab strip usability (P1).** Keep the active tab reachable with many tabs,
    implement configured wrapping/placement, and verify full title updates and
    consistent hover/focus states. Preserve the compact layout and familiar keys.
 5. **Search (P2).** A reusable inline text input, incremental search, next/previous
    matches, visible match state, and cancellation back to the terminal.
+6. **Multi-window (P2).** The original is multi-window (Gtk.Application):
+   `new_window`, `send_tab_to_window` with a window picker, tab moves between
+   windows. The rewrite is single-window; this needs a window manager in `App`
+   before anything else on this line.
+7. **Small parity gaps (P3).** See the feature-parity audit below: Ctrl+wheel
+   zoom, font selector, `bg_tint_color`, Wayland app-id and window icon, bell.
+
+# Feature parity gaps (audit against the original source)
+
+Everything else is at parity: tabs/groups/entangle/rename/move/goto, strip
+hide and placement, opacity, palette + pywal + themes + live reload, the full
+selection model, async clipboard, scrollback, cursor blink, the Alt-held
+switcher with live real-frame previews, and HiDPI.
+
+Working-tree state (uncommitted as of the audit): two-phase switcher render
+and scale-aware thumbnails, plus the terminal mouse reporting below. The
+last commit is the HiDPI scale fix (`Honor the window scale factor ...`).
+
+## Interaction
+
+- [x] **Terminal mouse reporting.** Done (uncommitted). While any of the
+      `Term.mode` mouse bits (`MOUSE_REPORT_CLICK`/`MOUSE_DRAG`/`MOUSE_MOTION`)
+      is on and Shift is not held, press, release, per-cell motion, and wheel
+      go to the PTY instead of selecting; X10 vs SGR encoding follows
+      `SGR_MOUSE`, modifier bits are 4/8/16, coordinates are 1-based viewport
+      cells. A reported press returns before paste, word-select, and
+      tab-strip handling; a release falls back to the last reported cell when
+      the pointer left the terminal mid-drag; motion is deduped per cell
+      (drag mode only while a button is held, motion mode always). The
+      encoding is unit-tested (`mouse_report_tests`); `tests/ui_smoke.py` has
+      an e2e scenario (the fixture enables 1002+1006 on typing `m`, then
+      asserts the reported SGR sequences, the wheel report, and the Shift
+      bypass) -- it needs a machine with xdotool and xsel, which the
+      headless build box lacks.
+- [ ] **IME.** GTK/VTE give it free; the rewrite has none.
+- [ ] **Selection autoscroll** when dragging outside the viewport; keyboard
+      selection.
+- [ ] **Ctrl+wheel zoom** (original zooms the font; the wheel only scrolls
+      here). Zoom keys already exist.
+- [ ] **Font selector** (Ctrl+Shift+f in the original: a font chooser that
+      rewrites `term_font`).
+
+## Windows
+
+- [ ] **`new_window`** (Ctrl+Shift+n) and **`send_tab_to_window`**
+      (Alt+Shift+w, window-picker dialog): multi-window support, see priority 6.
+- [ ] **TabMonitor** (Alt+Shift+m): a floating window with a live 5fps
+      snapshot of one tab. The offscreen preview machinery already renders a
+      complete frame per tab, so this is a window + a copy of the texture.
+      Note the original relies on compositor rules matching
+      `app-id="mypixels"` -- the app-id gap below goes with this.
+
+## Tab strip
+
+- [ ] **Multiline tab labels** (`multiline_tabs`, original wraps labels; the
+      key is not even parsed here) and **row navigation** for `prev_tab_row`/
+      `next_tab_row` (currently aliased to linear prev/next).
+- [ ] **Drag-to-reorder tabs** (original: `set_tab_reorderable`; here it is
+      keyboard-only).
+
+## Configuration / identity
+
+- [ ] **`bg_tint_color` is parsed and never applied** (the original tints the
+      background with it); dead key in the rewrite.
+- [ ] **Wayland app-id**: the original is `app-id="mypixels"` (Gtk.Application);
+      this binary is `spike`, so compositor rules written for the original do
+      not match. Check what winit 0.30 exposes before promising it.
+- [ ] **Window icon** (the original has a favicon); no bell handling either.
+- [ ] `autohide_delay` is a dead key in *both* versions (the user config
+      carries it); not a gap.
+
+## Known open correctness items (already tracked below)
+
+Titles' live-update cadence and the rename seed; tablist advance width vs
+GTK; damage-driven rendering for the idle-CPU measurement.
 
 Remaining investigations and historical notes follow.
 
@@ -61,15 +138,19 @@ their notes: the causes were rarely where the symptom pointed.
 
 ## Still open
 
-- [ ] **See-through switcher (half done).** The terminal is now painted under the
-      overlay, so the dim backdrop means something and coloured backgrounds show
-      through. Terminal *text* does not, and cannot with the current single render
-      pass: glyphon draws all text after all rects, so live text bled through the
-      tiles. Behind the overview the terminal is therefore drawn as a colour field
-      only. Real transparency needs the overlay in its own render pass (`LoadOp::Load`
-      for rects) *and* a second `TextRenderer` -- calling `TextRenderer::prepare`
-      twice a frame with the same renderer swaps the vertex buffers its earlier
-      draw already referenced, so one renderer cannot serve two passes.
+- [x] **See-through switcher.** The colour-field workaround
+      (`if self.overview.is_some() { break }` in the text loop) is gone:
+      `render_frame` is now two phases in one pass -- base rects, terminal text
+      (`prepare`, then `draw`), then the dim/tile rects, the sampled
+      thumbnails, and the tile text (second `prepare`, `draw`). Drawing *between*
+      the two prepares is what makes one `TextRenderer` safe: the earlier
+      failure mode was preparing twice before the first draw, which swaps the
+      buffers the earlier draw already referenced. The switcher text gets its own
+      pool (`ov_pool`, 64 slots) because terminal runs and tile headers are
+      prepared in the same frame. Thumbnails are the configured
+      `tab_overview_thumb_width/height` times the window scale: bigger tiles on a
+      HiDPI display, still sampling the full-resolution offscreen frame per tab,
+      so they get sharper, not stretched.
 - [x] **Output-flood layout cost.** Reproduced with changing paths on a 4K
       viewport. Trim invisible row padding, use basic shaping for ASCII, and
       notify Wayland before presenting so the compositor can pace frames. See
@@ -186,7 +267,8 @@ row is 80k glyphs a refresh, and the overview took seconds to draw one frame.
 difference between unusable and 4ms.
 
 The same pass also closes the see-through switcher: the reason the tiles are
-opaque today is that overlay text and terminal text share one pass.
+opaque today is that overlay text and terminal text share one pass. (Now
+closed -- the render is two phases, see "Still open" above.)
 
 ## Selection: what works, what is still missing
 
