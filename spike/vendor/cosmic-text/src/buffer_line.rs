@@ -281,6 +281,12 @@ impl BufferLine {
         self.layout_opt.get()
     }
 
+    /// Mutate a completed layout for a caller-owned terminal cell grid.
+    /// Changes remain cached until text or layout settings invalidate it.
+    pub fn layout_opt_mut(&mut self) -> Option<&mut Vec<LayoutLine>> {
+        self.layout_opt.get_mut()
+    }
+
     /// Get the visible layout runs for rendering and other tasks
     pub fn layout_runs(&self, height_opt: Option<f32>, line_height: f32) -> LayoutRunIter<'_> {
         LayoutRunIter::from_lines(core::slice::from_ref(self), height_opt, line_height, 0.0, 0)

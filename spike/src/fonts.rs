@@ -20,8 +20,8 @@
 //! whose name merely looks right is trusted).
 
 use glyphon::cosmic_text::{
-    skrifa, skrifa::prelude::*, Attrs, Fallback, Family, FontSystem, PlatformFallback, Style,
-    Weight,
+    skrifa, skrifa::prelude::*, Attrs, Buffer, Fallback, Family, FeatureTag, FontFeatures,
+    FontSystem, Hinting, PlatformFallback, Shaping, Style, Weight, Wrap,
 };
 use glyphon::fontdb::{Database, ID, Style as DbStyle};
 use std::collections::HashMap;
@@ -217,18 +217,13 @@ pub fn pick_face(db: &Database, family: &str) -> Option<FacePick> {
     best.map(|(_, weight, postscript)| FacePick { postscript, weight })
 }
 
-/// Pin an `Attrs` to the exact face `pick_face` chose for `family`.
-///
-/// The postscript name goes FIRST: cosmic-text matches on it directly, which
-/// takes face selection out of the matcher's hands entirely. The configured
-/// family stays as the second candidate so an unresolvable name degrades to
-/// today's behaviour instead of to a different font.
+/// Resolve the upright weight deliberately, including families with Medium but
+/// no Regular. Keep the family name so SGR bold/italic can select sibling faces.
 pub fn pin_face(db: &Database, attrs: Attrs<'static>, family: &'static str) -> Attrs<'static> {
     match pick_face(db, family) {
         Some(pick) => {
             log::info!("family {family:?} pinned to {:?} (weight {})", pick.postscript, pick.weight);
             attrs
-                .family(Family::Name(Box::leak(pick.postscript.into_boxed_str())))
                 .family(Family::Name(family))
                 .weight(cosmic_weight(pick.weight))
                 .style(Style::Normal)
@@ -386,6 +381,7 @@ pub struct Coverage {
     base: &'static Attrs<'static>,
     by_char: HashMap<char, &'static Attrs<'static>>,
     by_family: HashMap<String, &'static Attrs<'static>>,
+    styled: HashMap<(usize, bool, bool), &'static Attrs<'static>>,
 }
 
 impl Coverage {
@@ -419,6 +415,7 @@ impl Coverage {
             base: Box::leak(Box::new(base.clone())),
             by_char: HashMap::new(),
             by_family: HashMap::new(),
+            styled: HashMap::new(),
         }
     }
 
@@ -430,6 +427,15 @@ impl Coverage {
         }
         if let Some(a) = self.by_char.get(&ch) {
             return a;
+        }
+        // A fallback is only needed when the primary really lacks the glyph.
+        // Previously every non-ASCII character skipped the primary outright,
+        // mixing unrelated designs even for ordinary accented filenames.
+        if self.faces.iter().any(|(id, fam)| {
+            self.primary.iter().any(|p| p == fam) && face_covers(db, *id, ch)
+        }) {
+            self.by_char.insert(ch, self.base);
+            return self.base;
         }
         let hit = self
             .faces
@@ -451,6 +457,19 @@ impl Coverage {
         attrs
     }
 
+    pub fn styled_attrs(&mut self, db: &Database, ch: char, bold: bool, italic: bool) -> &'static Attrs<'static> {
+        let base = self.attrs_for(db, ch);
+        if !bold && !italic {
+            return base;
+        }
+        let key = (base as *const Attrs<'static> as usize, bold, italic);
+        self.styled.entry(key).or_insert_with(|| {
+            Box::leak(Box::new(base.clone()
+                .weight(if bold { Weight::BOLD } else { base.weight })
+                .style(if italic { Style::Italic } else { Style::Normal })))
+        })
+    }
+
     /// One leaked Attrs per fallback family -- bounded by how many a session
     /// needs, typically one or two. Everything from the base attrs is kept
     /// (size, weight, metrics); only the family changes.
@@ -469,6 +488,49 @@ impl Coverage {
     /// Fallback families resolved so far (diagnostics, tests).
     pub fn families(&self) -> Vec<&str> {
         self.by_family.keys().map(|s| s.as_str()).collect()
+    }
+}
+
+/// Shape at the requested font size, then place clusters on the terminal's
+/// existing cell grid. A terminal row must NEVER word-wrap inside a text buffer.
+/// `set_monospace_width` is unsuitable here: cosmic-text rescales glyphs to fit
+/// that width and wraps using their original advances, so fractional advances
+/// can push filename tails onto the next row. It also changes fallback sizes.
+///
+/// `cells` maps UTF-8 byte offsets to columns, including combining marks in the
+/// same cell and wide characters spanning two. Shaping handles accents and
+/// scripts; the terminal remains the authority on where each cluster belongs.
+pub fn shape_terminal_run(
+    buffer: &mut Buffer,
+    fs: &mut FontSystem,
+    text: &str,
+    attrs: &Attrs,
+    cells: &[(usize, u32)],
+    cell_w: f32,
+) {
+    buffer.set_wrap(Wrap::None);
+    buffer.set_hinting(Hinting::Enabled);
+    buffer.set_monospace_width(None);
+    buffer.set_size(None, None);
+    let mut features = FontFeatures::new();
+    for tag in [b"liga", b"clig", b"dlig", b"calt", b"kern"] {
+        features.disable(FeatureTag::new(tag));
+    }
+    buffer.set_text(text, &attrs.clone().font_features(features), Shaping::Advanced, None);
+    buffer.shape_until_scroll(fs, false);
+    for line in &mut buffer.lines {
+        let Some(layout) = line.layout_opt_mut() else { continue };
+        for row in layout {
+            // Glyphs in one cluster retain their relative positioning (marks,
+            // decomposed accents), while cluster origins land on whole pixels.
+            let mut origins = HashMap::new();
+            for glyph in &mut row.glyphs {
+                let source = *origins.entry(glyph.start).or_insert(glyph.x);
+                let i = cells.partition_point(|(byte, _)| *byte <= glyph.start).saturating_sub(1);
+                let column = cells.get(i).map_or(0, |(_, col)| *col);
+                glyph.x = (column as f32 * cell_w).round() + glyph.x - source;
+            }
+        }
     }
 }
 
@@ -536,6 +598,59 @@ mod tests {
                 "ASCII {:?} should draw with the terminal font",
                 ch
             );
+        }
+    }
+
+    #[test]
+    fn ls_columns_never_wrap_or_accumulate_fractional_spacing() {
+        let (mut fs, mut cov) = coverage("Cascadia Code");
+        let attrs = cov.attrs_for(fs.db(), 'a');
+        let text = "drwxr-xr-x  9 volca volca 4096 Oct 31 00:41 .claude";
+        let cells: Vec<_> = text.char_indices().enumerate().map(|(col, (byte, _))| (byte, col as u32)).collect();
+        let mut buffer = Buffer::new(&mut fs, glyphon::Metrics::new(12.0, 15.0));
+        shape_terminal_run(&mut buffer, &mut fs, text, attrs, &cells, 7.0);
+        let rows: Vec<_> = buffer.layout_runs().collect();
+        assert_eq!(rows.len(), 1, "a terminal run must stay on its row");
+        assert_eq!(rows[0].glyphs.len(), text.len());
+        for glyph in rows[0].glyphs {
+            assert_eq!(glyph.x, glyph.start as f32 * 7.0);
+            assert_eq!(glyph.font_size, 12.0, "grid placement must not rescale the font");
+        }
+    }
+
+    #[test]
+    fn wide_and_combining_characters_keep_following_columns_aligned() {
+        let (mut fs, mut cov) = coverage("Cascadia Code");
+        let attrs = cov.attrs_for(fs.db(), 'a');
+        let text = "a\u{301}界b";
+        let cells = [(0, 0), (3, 1), (6, 3)];
+        let mut buffer = Buffer::new(&mut fs, glyphon::Metrics::new(12.0, 15.0));
+        shape_terminal_run(&mut buffer, &mut fs, text, attrs, &cells, 7.0);
+        let rows: Vec<_> = buffer.layout_runs().collect();
+        assert_eq!(rows.len(), 1);
+        let b = rows[0].glyphs.iter().find(|g| g.start == 6).unwrap();
+        assert_eq!(b.x, 21.0);
+    }
+
+    #[test]
+    fn bold_and_italic_are_distinct_from_regular() {
+        let (fs, mut cov) = coverage("Cascadia Code");
+        let regular = cov.styled_attrs(fs.db(), 'd', false, false);
+        let bold = cov.styled_attrs(fs.db(), 'd', true, false);
+        let italic = cov.styled_attrs(fs.db(), 'd', false, true);
+        assert_ne!(regular.weight, bold.weight);
+        assert_eq!(bold.weight, Weight::BOLD);
+        assert_eq!(italic.style, Style::Italic);
+        assert!(std::ptr::eq(bold, cov.styled_attrs(fs.db(), 'd', true, false)));
+    }
+
+    #[test]
+    fn supported_accents_stay_in_the_primary_family() {
+        let (fs, mut cov) = coverage("Cascadia Code");
+        for ch in ['é', 'č', 'ü'] {
+            if cov.faces.iter().any(|(id, fam)| fam == "Cascadia Code" && face_covers(fs.db(), *id, ch)) {
+                assert!(std::ptr::eq(cov.attrs_for(fs.db(), ch), cov.base));
+            }
         }
     }
 

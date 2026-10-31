@@ -173,6 +173,10 @@ fn run_sig(run: &Run, cell_w: f32) -> u64 {
     for b in run.text.as_bytes() {
         mix(*b as u64);
     }
+    for &(byte, column) in &run.cells {
+        mix(byte as u64);
+        mix(column as u64);
+    }
     // Colour is part of the identity: a TUI repaints the same text in different
     // colours, and a stale colour is a visible bug.
     for c in run.fg.iter().chain(run.bg.iter()) {
@@ -210,6 +214,8 @@ struct Run {
     fg: [f32; 3],
     bg: [f32; 3],
     text: String,
+    /// UTF-8 cluster origins mapped to terminal columns within this run.
+    cells: Vec<(usize, u32)>,
     /// Font for this run. Runs split where the required face changes, so a
     /// starship prompt becomes "text | icon | text" instead of "text | tofu".
     attrs: &'static Attrs<'static>,
@@ -743,7 +749,7 @@ impl App {
     /// Built on demand because the startup path sets the font without going
     /// through `rebuild_term_font`; the font-rebuild path replaces it so a font
     /// change cannot leave a stale base behind.
-    fn cell_attrs(&self, ch: char) -> &'static Attrs<'static> {
+    fn cell_attrs(&self, ch: char, flags: Flags) -> &'static Attrs<'static> {
         let mut cov = self.coverage.borrow_mut();
         let cov = cov.get_or_insert_with(|| {
             fonts::Coverage::new(
@@ -752,7 +758,7 @@ impl App {
                 &[self.term_family.to_string()],
             )
         });
-        cov.attrs_for(self.font_system.db(), ch)
+        cov.styled_attrs(self.font_system.db(), ch, flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC))
     }
 
     /// Rebuild the tablist font from config (family + size): attrs, tab
@@ -851,9 +857,12 @@ impl App {
                 continue;
             }
 
-            let fg = palette.resolve_with(&cell.fg, self.fg, self.bg);
-            let bg = palette.resolve_with(&cell.bg, self.fg, self.bg);
-            let attrs = self.cell_attrs(cell.c);
+            let mut fg = palette.resolve_with(&cell.fg, self.fg, self.bg);
+            let mut bg = palette.resolve_with(&cell.bg, self.fg, self.bg);
+            if cell.flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
+            if cell.flags.contains(Flags::DIM) { fg = fg.map(|v| v * 0.66); }
+            let attrs = self.cell_attrs(cell.c, cell.flags);
+            let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
 
             // Continue the current run in place. Building a `String` per cell is
             // ~80k allocations a frame at 4K, and a debug build feels every one.
@@ -864,7 +873,8 @@ impl App {
                     && r.bg == bg
                     && std::ptr::eq(r.attrs, attrs)
                 {
-                    r.width += 1;
+                    r.cells.push((r.text.len(), r.width));
+                    r.width += width;
                     r.text.push(cell.c);
                     if let Some(zw) = cell.zerowidth() {
                         r.text.extend(zw.iter().copied());
@@ -883,7 +893,7 @@ impl App {
             cur = Some(Run {
                 row: row as u32,
                 col: col as u32,
-                width: 1,
+                width,
                 fg,
                 bg,
                 text: glyph,
@@ -895,6 +905,7 @@ impl App {
         }
 
         let cursor = if !show_cursor {
+                cells: vec![(0, 0)],
             None
         } else {
             match content.cursor.shape {
@@ -1208,10 +1219,7 @@ impl App {
                 if !(cache && gpu.slot_sig.get(i) == Some(&sig)) {
                     gpu.slot_sig[i] = sig;
                     let b = &mut pool[i];
-                    b.set_size(Some(run.width as f32 * self.cell_w), None);
-                    b.set_text(&run.text, run.attrs, Shaping::Basic, None);
-                    b.set_monospace_width(Some(self.cell_w));
-                    b.shape_until_scroll(fs, false);
+                    fonts::shape_terminal_run(b, fs, &run.text, run.attrs, &run.cells, self.cell_w);
                 }
                 let buf: &Buffer = unsafe { &*(&pool[i] as *const Buffer) };
                 areas.push(TextArea {
@@ -3017,3 +3025,4 @@ mod preview_tests {
         assert_eq!(again, frame_sig(&fd, 7.0), "same input, same signature");
     }
 }
+            cells: text.char_indices().enumerate().map(|(col, (byte, _))| (byte, col as u32)).collect(),
