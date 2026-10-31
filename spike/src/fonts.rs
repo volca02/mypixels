@@ -512,15 +512,29 @@ pub fn shape_terminal_run(
     buffer.set_hinting(Hinting::Enabled);
     buffer.set_monospace_width(None);
     buffer.set_size(None, None);
-    let mut features = FontFeatures::new();
-    for tag in [b"liga", b"clig", b"dlig", b"calt", b"kern"] {
-        features.disable(FeatureTag::new(tag));
+    let ascii = text.is_ascii();
+    if ascii {
+        // ASCII has no combining clusters or complex scripts. Running every
+        // find/ls path through the complex shaper is expensive on a large grid.
+        // The same explicit cell placement below still prevents spacing drift.
+        buffer.set_text(text, attrs, Shaping::Basic, None);
+    } else {
+        let mut features = FontFeatures::new();
+        for tag in [b"liga", b"clig", b"dlig", b"calt", b"kern"] {
+            features.disable(FeatureTag::new(tag));
+        }
+        buffer.set_text(text, &attrs.clone().font_features(features), Shaping::Advanced, None);
     }
-    buffer.set_text(text, &attrs.clone().font_features(features), Shaping::Advanced, None);
     buffer.shape_until_scroll(fs, false);
     for line in &mut buffer.lines {
         let Some(layout) = line.layout_opt_mut() else { continue };
         for row in layout {
+            if ascii {
+                for glyph in &mut row.glyphs {
+                    glyph.x = cells.get(glyph.start).map_or(0, |(_, col)| *col) as f32 * cell_w;
+                }
+                continue;
+            }
             // Glyphs in one cluster retain their relative positioning (marks,
             // decomposed accents), while cluster origins land on whole pixels.
             let mut origins = HashMap::new();

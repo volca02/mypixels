@@ -30,3 +30,16 @@ Requires data-control support and wl-copy/wl-paste. It checks against independen
 clipboard clients, including Unicode, trailing newlines, primary selection,
 ownership changes, and repeated replacement of native sources. The explicit
 test flag prevents accidentally running it against a normal desktop.
+
+For an unpaced stream of changing paths (without filesystem traversal), launch:
+
+```sh
+SPIKE_TRACE=1 spike/target/release/spike \
+  python3 spike/tests/output_flood.py 10 /tmp/mypixels-flood.json
+```
+
+Use the same window size, compositor and GPU for comparisons. `SPIKE_TRACE`
+reports cumulative frame-build and text-preparation times plus total frame time;
+subtract build from text time to isolate layout. The JSON records lines produced
+and elapsed time. A software renderer's CPU use is not comparable to a desktop
+GPU's, and unpaced input tests throughput as well as rendering.

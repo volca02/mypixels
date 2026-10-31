@@ -200,8 +200,13 @@ fn shaping_cache_enabled() -> bool {
 /// difference between thousands of dead runs and the handful that matter. Runs
 /// carrying a background colour are kept -- that is how a TUI's highlighted row
 /// still shows.
-fn push_run(runs: &mut Vec<Run>, r: Run, def_fg: [f32; 3], def_bg: [f32; 3]) {
-    if r.fg == def_fg && r.bg == def_bg && r.text.chars().all(|c| c == ' ') {
+fn push_run(runs: &mut Vec<Run>, mut r: Run, _def_fg: [f32; 3], def_bg: [f32; 3]) {
+    // Keep the full width for background painting, but never shape invisible
+    // end-of-line padding. A 4K find listing otherwise shapes ~75k glyphs per
+    // refresh, most of them spaces after the path.
+    r.text.truncate(r.text.trim_end_matches(' ').len());
+    r.cells.truncate(r.cells.partition_point(|(byte, _)| *byte < r.text.len()));
+    if r.bg == def_bg && r.text.is_empty() {
         return;
     }
     runs.push(r);
@@ -226,26 +231,18 @@ struct FrameData {
     cursor: Option<(u32, u32)>,
 }
 
-/// Tab overview navigation state (mirrors the Python TabOverview, standalone
-/// mode). `selected` is the highlighted tile; `desired_column` is remembered
-/// so up/down navigation stays in a column even when rows have fewer tabs.
-/// Which overview variant is on screen.
+/// The Alt-held visual tab switcher. Standalone overview is intentionally absent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OverviewMode {
-    /// Full control grid (Alt+o / `show_tab_overview`): nav, move, new, close.
-    Standalone,
     /// Alt-held popup: follows the active tab, dismissed on Alt release.
     Switcher,
 }
 
-/// Overview navigation state. For `Standalone`, `selected`/`desired_column`
-/// are the highlighted tile. For `Switcher`, the selection is the active tab
-/// (`selected` mirrors it) and `desired_column` is kept for vertical nav.
+/// The highlighted tile mirrors the active tab; releasing Alt commits it.
 #[derive(Clone, Copy)]
 struct OverviewState {
     mode: OverviewMode,
     selected: usize,
-    desired_column: usize,
 }
 
 /// Grid columns for a tab overview, matching the original:
@@ -319,10 +316,7 @@ struct App {
     /// terminal; Enter commits, Esc cancels.
     renaming: bool,
     rename_draft: String,
-    /// Tab overview (standalone mode): when Some, the overview overlay is
-    /// shown and keys navigate/select/move tabs instead of reaching the
-    /// terminal. `selected` is the highlighted tab; `desired_column` is kept
-    /// for vertical navigation (like the original TabOverview).
+    /// Alt-held visual switcher. Releasing Alt keeps its selected tab.
     overview: Option<OverviewState>,
     /// Alt-held tab switcher timing, shared with a background clock thread.
     /// `switcher_alt_at` is when Alt went down (None when released); the clock
@@ -463,6 +457,7 @@ impl App {
             let blink = Arc::clone(&cursor_blink);
             let last_act = Arc::clone(&last_activity);
             let delay_ms = config.tab_overview_delay_ms;
+            let enabled = config.tab_overview_on_alt;
             let refresh_ms = 150u32; // thumbnail refresh cadence while open
             let blink_ms = 533u128; // cursor on/off cadence
             std::thread::spawn(move || {
@@ -487,8 +482,10 @@ impl App {
                     if !open.load(Ordering::SeqCst) {
                         // Open after the configured Alt hold delay.
                         if let Some(at) = *alt_at.lock().unwrap() {
-                            if now.duration_since(at).as_millis() >= delay_ms as u128 {
-                                show_req.store(true, Ordering::SeqCst);
+                            if enabled && now.duration_since(at).as_millis() >= delay_ms as u128
+                                && !show_req.swap(true, Ordering::SeqCst)
+                            {
+                                if let Some(w) = ws.lock().unwrap().as_ref() { w.request_redraw(); }
                             }
                         }
                     } else if now.duration_since(last_refresh).as_millis() >= refresh_ms as u128 {
@@ -1462,11 +1459,9 @@ impl App {
                 if self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
                     && !self.tabs.is_empty()
                 {
-                    let cols = grid_cols(self.tabs.len());
                     self.overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
                         selected: self.active,
-                        desired_column: self.active % cols,
                     });
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
@@ -1581,7 +1576,6 @@ impl App {
         if let Some(ov) = &self.overview {
             match ov.mode {
                 OverviewMode::Switcher => self.handle_switcher_key(key),
-                OverviewMode::Standalone => self.handle_overview_key(key, event_loop),
             }
             return;
         }
@@ -1637,155 +1631,6 @@ impl App {
                 self.rename_draft.push_str(c);
             },
             _ => {},
-        }
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-    }
-
-    /// Keyboard handling while the tab overview is open (standalone mode).
-    /// Mirrors the original TabOverview::handle_key: nav/select/move plus
-    /// close_tab, new_tab, and bare number keys for quick switching.
-    fn handle_overview_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
-        let n = self.tabs.len();
-        if n == 0 {
-            self.overview = None;
-            return;
-        }
-        let cols = grid_cols(n);
-        let action = config::find_action(&self.config.bindings, key, self.modifiers, true);
-        match action.as_deref() {
-            Some("overview_exit") => {
-                self.overview = None;
-            },
-            Some("overview_select") => {
-                let sel = self.overview.as_ref().unwrap().selected.min(n - 1);
-                self.active = sel;
-                self.overview = None;
-            },
-            Some("overview_new_tab") | Some("new_tab") => {
-                self.add_tab();
-                let newn = self.tabs.len();
-                let mode = self.overview.map(|o| o.mode).unwrap_or(OverviewMode::Standalone);
-                let ov = self.overview.get_or_insert(OverviewState {
-                    selected: 0,
-                    desired_column: 0,
-                    mode,
-                });
-                ov.selected = newn - 1;
-                ov.desired_column = (newn - 1) % grid_cols(newn);
-            },
-            Some("close_tab") => {
-                let sel = self.overview.as_ref().unwrap().selected.min(n - 1);
-                self.close_tab_at(sel, event_loop);
-                if self.tabs.is_empty() {
-                    self.overview = None;
-                } else {
-                    let newn = self.tabs.len();
-                    let ov = self.overview.as_mut().unwrap();
-                    if ov.selected >= newn {
-                        ov.selected = newn - 1;
-                    }
-                    ov.desired_column = ov.selected % grid_cols(newn);
-                }
-            },
-            Some("overview_nav_left") => {
-                let ov = self.overview.as_mut().unwrap();
-                if ov.selected > 0 {
-                    ov.selected -= 1;
-                    ov.desired_column = ov.selected % cols;
-                }
-            },
-            Some("overview_nav_right") => {
-                let ov = self.overview.as_mut().unwrap();
-                if ov.selected < n - 1 {
-                    ov.selected += 1;
-                    ov.desired_column = ov.selected % cols;
-                }
-            },
-            Some("overview_nav_up") => {
-                let ov = self.overview.as_mut().unwrap();
-                let row = ov.selected / cols;
-                if row > 0 {
-                    ov.selected = ((row - 1) * cols + ov.desired_column).min(n - 1);
-                }
-            },
-            Some("overview_nav_down") => {
-                let ov = self.overview.as_mut().unwrap();
-                let row = ov.selected / cols;
-                let target = (row + 1) * cols + ov.desired_column;
-                if target < n && target / cols > row {
-                    ov.selected = target;
-                }
-            },
-            Some("overview_first") => {
-                let ov = self.overview.as_mut().unwrap();
-                ov.selected = 0;
-                ov.desired_column = 0;
-            },
-            Some("overview_last") => {
-                let ov = self.overview.as_mut().unwrap();
-                ov.selected = n - 1;
-                ov.desired_column = (n - 1) % cols;
-            },
-            Some("overview_move_left") => {
-                let sel = self.overview.as_ref().unwrap().selected;
-                if sel > 0 {
-                    self.tabs.swap(sel, sel - 1);
-                    let ov = self.overview.as_mut().unwrap();
-                    ov.selected = sel - 1;
-                    ov.desired_column = (sel - 1) % cols;
-                }
-            },
-            Some("overview_move_right") => {
-                let sel = self.overview.as_ref().unwrap().selected;
-                if sel < n - 1 {
-                    self.tabs.swap(sel, sel + 1);
-                    let ov = self.overview.as_mut().unwrap();
-                    ov.selected = sel + 1;
-                    ov.desired_column = (sel + 1) % cols;
-                }
-            },
-            Some("overview_move_up") => {
-                let sel = self.overview.as_ref().unwrap().selected;
-                if sel >= cols {
-                    let t = self.tabs.remove(sel);
-                    let newpos = sel - cols;
-                    self.tabs.insert(newpos, t);
-                    let ov = self.overview.as_mut().unwrap();
-                    ov.selected = newpos;
-                    ov.desired_column = newpos % grid_cols(self.tabs.len());
-                }
-            },
-            Some("overview_move_down") => {
-                let sel = self.overview.as_ref().unwrap().selected;
-                if sel + cols < n {
-                    let t = self.tabs.remove(sel);
-                    let newpos = sel + cols;
-                    self.tabs.insert(newpos, t);
-                    let ov = self.overview.as_mut().unwrap();
-                    ov.selected = newpos;
-                    ov.desired_column = newpos % grid_cols(self.tabs.len());
-                }
-            },
-            _ => {
-                // Bare number keys for quick switching (standalone: no mods),
-                // matching the original. Alt+digit (goto_tab_*) has a modifier
-                // and is intentionally ignored while the overview is open.
-                if self.modifiers.is_empty() {
-                    if let Key::Character(c) = key {
-                        if let Some(ch) = c.chars().next() {
-                            if let Some(d) = ch.to_digit(10) {
-                                let idx = if d == 0 { 9 } else { (d - 1) as usize };
-                                if idx < n {
-                                    self.active = idx;
-                                    self.overview = None;
-                                }
-                            }
-                        }
-                    }
-                }
-            },
         }
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1911,19 +1756,6 @@ impl App {
             },
             "first_tab" => self.active = 0,
             "last_tab" => self.active = n.saturating_sub(1),
-            "show_tab_overview" => {
-                // Toggle: close if open, else open (standalone mode).
-                if self.overview.is_some() {
-                    self.overview = None;
-                } else if !self.tabs.is_empty() {
-                    let cols = grid_cols(self.tabs.len());
-                    self.overview = Some(OverviewState {
-                        mode: OverviewMode::Standalone,
-                        selected: self.active,
-                        desired_column: self.active % cols,
-                    });
-                }
-            },
             "move_prev_tab" => {
                 if n > 1 && self.active > 0 {
                     self.tabs.swap(self.active, self.active - 1);
@@ -2272,7 +2104,7 @@ fn draw_overview(
     gpu: &mut Gpu,
     fs: &mut FontSystem,
     tabs: &[Tab],
-    mode: OverviewMode,
+    _mode: OverviewMode,
     selected: usize,
     config: &Config,
     tab_attrs: &Attrs,
@@ -2300,24 +2132,20 @@ fn draw_overview(
     // Dark backdrop over the whole window.
     // The live terminal is painted underneath now, so this is a dim rather than
     // a cover. The Alt-held switcher is a peek over running output, so it stays
-    // lighter than the standalone overview even when the config asks for opaque.
-    let dim = match mode {
-        OverviewMode::Switcher => config.tab_overview_opacity.min(0.7),
-        OverviewMode::Standalone => config.tab_overview_opacity,
-    };
+    // light enough to keep its live terminal context visible.
+    let dim = config.tab_overview_opacity.min(0.7);
     push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [0.0, 0.0, 0.0, dim]);
 
     let n = tabs.len();
     let cols = grid_cols(n);
     let rows = (n + cols - 1) / cols;
 
-    // Banner, using the tab (larger) font. Standalone gets a two-line header
-    // with the key hints; the Alt-held switcher gets a single quiet label.
+    // A quiet heading above the live previews.
 
     // Grid geometry.
     let pad = 10.0;
     let spacing = 12.0;
-    let banner_h = if mode == OverviewMode::Standalone { 58.0 } else { 40.0 };
+    let banner_h = 40.0;
     let thumb_w = (config.tab_overview_thumb_width as f32)
         .min((wf - 100.0) / 4.0 - 20.0)
         .max(60.0);
@@ -2334,15 +2162,9 @@ fn draw_overview(
 
     // Headers sit on a dark pill: the live tab strip shows through now, and bare
     // text over it was unreadable.
-    let title = if mode == OverviewMode::Standalone { "TAB OVERVIEW MODE" } else { "Tab Switcher" };
-    let title_col: [f32; 3] =
-        if mode == OverviewMode::Standalone { [1.0, 1.0, 1.0] } else { [0.36, 0.75, 0.75] };
-    let (bx, by) = if mode == OverviewMode::Standalone {
-        (16.0, 12.0)
-    } else {
-        // Just above the tiles, which keeps it clear of the tab strip.
-        (grid_x, (grid_y - tab_text_h - 14.0).max(4.0))
-    };
+    let title = "Tab Switcher";
+    let title_col = [0.36, 0.75, 0.75];
+    let (bx, by) = (grid_x, (grid_y - tab_text_h - 14.0).max(4.0));
     push_rrect(
         &mut gpu.rects, bx - 8.0, by - 5.0,
         title.len() as f32 * tab_char_w + 16.0, tab_text_h + 10.0,
@@ -2350,17 +2172,6 @@ fn draw_overview(
     );
     push_ov_text(pool, slot, fs, tab_attrs, title, bx, by, 1.0, title_col, None, None, areas, bounds);
     slot += 1;
-    if mode == OverviewMode::Standalone {
-        let hint = "ESC exit | Enter select | Alt+Return new | Arrows move | Shift+Arrows reorder | Ctrl+Alt+X close";
-        push_rrect(
-            &mut gpu.rects, 8.0, 31.0,
-            hint.len() as f32 * tab_char_w + 16.0, tab_text_h + 10.0,
-            [0.0, 0.0, 0.0, 0.62], 5.0,
-        );
-        push_ov_text(pool, slot, fs, tab_attrs, hint, 16.0, 36.0, 1.0, [0.72, 0.72, 0.72], None, None, areas, bounds);
-        slot += 1;
-    }
-
     let radius = 8.0f32;
     let chip = tab_text_h.max(14.0);
     // Tiles that sample a real frame, collected during the loop and pushed to
@@ -2740,11 +2551,9 @@ impl ApplicationHandler for App {
                     && !self.tabs.is_empty()
                     && self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
                 {
-                    let cols = grid_cols(self.tabs.len());
                     self.overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
                         selected: self.active,
-                        desired_column: self.active % cols,
                     });
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
@@ -2831,6 +2640,12 @@ impl ApplicationHandler for App {
                         self.add_tab();
                         window.request_redraw();
                     } else if let Some((pt, side)) = self.cell_at(at.0, at.1) {
+                        // Alt+drag is a rectangular selection gesture. It must
+                        // not open the Alt-held switcher halfway through a drag.
+                        if self.modifiers.alt_key() {
+                            *self.switcher_alt_at.lock().unwrap() = None;
+                            self.switcher_show_req.store(false, Ordering::SeqCst);
+                        }
                         // One click starts a run, two take the word, three take
                         // whole rows: what VTE does, and why the clicks have to be
                         // counted by hand.
@@ -3065,6 +2880,24 @@ mod preview_tests {
 
     fn joined(spans: &[(String, Attrs<'static>)]) -> String {
         spans.iter().map(|(s, _)| s.as_str()).collect()
+    }
+
+    #[test]
+    fn padding_is_not_shaped_but_background_width_is_preserved() {
+        let mut runs = Vec::new();
+        let mut padded = run(0, 0, "path.js      ");
+        padded.bg = [0.2, 0.1, 0.0];
+        push_run(&mut runs, padded, [1.0; 3], [0.0; 3]);
+        assert_eq!(runs[0].text, "path.js");
+        assert_eq!(runs[0].width, 13);
+        assert_eq!(runs[0].cells.len(), 7);
+    }
+
+    #[test]
+    fn invisible_padding_with_colored_foreground_is_discarded() {
+        let mut runs = Vec::new();
+        push_run(&mut runs, run(0, 0, "      "), [0.5; 3], [0.0; 3]);
+        assert!(runs.is_empty());
     }
 
     #[test]

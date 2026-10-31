@@ -88,7 +88,19 @@ try:
     wait(lambda:payload.encode() in capture.read_bytes(), 'paste lost its requesting tab')
     other = next(p for p in work.glob('input-*') if p != capture)
     assert other.read_bytes()==b'', 'paste was redirected into the new tab'
-    print('PASS: real keyboard copy/paste, Unicode, bracketed paste, independent primary, middle click, single-character/word/line selection, and scrollback')
+    # The useful Alt-held visual switcher stays. Only standalone overview was
+    # retired. Keep a visual artifact, and exercise selecting on Alt release.
+    run('xdotool','keydown','Alt_L')
+    time.sleep(.8)
+    run('import','-window',wid,str(work/'switcher.png'))
+    run('xdotool','key','Left')
+    run('xdotool','keyup','Alt_L')
+    key('z')
+    wait(lambda:capture.read_bytes().endswith(b'z'), 'Alt-held switcher did not select the first tab')
+    assert other.read_bytes()==b'', 'switcher typed into the wrong tab'
+    key('alt+o')
+    wait(lambda:capture.read_bytes().endswith(b'\x1bo'), 'retired standalone overview still swallowed Alt+O')
+    print('PASS: keyboard copy/paste, Unicode, bracketed paste, primary, selection, scrollback, delayed paste destination, and Alt-held visual switcher')
     print('Artifacts:',work)
 finally:
     app.terminate()

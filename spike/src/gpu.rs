@@ -870,6 +870,10 @@ impl Gpu {
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("render");
         }
+        // Wayland uses this to request the compositor's next frame callback.
+        // Without it a busy PTY can drive redraws as fast as the CPU can submit
+        // them, even when those frames can never be displayed.
+        window.pre_present_notify();
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame_tex);
         let _ = (w, h);

@@ -255,3 +255,45 @@ feel under load on the real (non-Xvfb) GPU.
 - `spike/src/gpu.rs` — wgpu surface, rect + glyphon text pipelines
 - `spike/stress.py` — the stress test
 - `spike/cpusample.sh` — CPU sampler (not used in final protocol)
+
+## 2026-10-31: fonts, clipboard, and scrolling regression
+
+`ls -la` exposed a layout bug: terminal runs used a word-wrapping text buffer,
+while their width was rounded to a terminal grid. Fractional font advances made
+filename tails wrap onto the following row. Runs now disable text wrapping and
+place shaped clusters on the terminal's own columns, without resizing the font.
+SGR bold/italic, wide characters, combining marks, and primary-font accents are
+covered by regression tests. The bitmap raster source remains enabled.
+
+Changing find-style paths exposed the next problem: every visible row carried
+hundreds of invisible padding spaces through complex shaping. At 4K this meant
+roughly 75k glyphs per refresh. Padding is now removed from text shaping while its
+background width stays intact; ASCII takes the basic shaper and Unicode retains
+complex shaping. The main presentation path also calls `pre_present_notify`,
+which supplies winit's missing Wayland frame callback for compositor pacing.
+
+Isolated Sway, ~548x140 cells, **release**, changing paths for 10 seconds:
+
+| Measurement (median while changing) | Before | After |
+| --- | ---: | ---: |
+| Build viewport runs | 1.72 ms | 1.52 ms |
+| Text layout/preparation, excluding build | 45.17 ms | 2.88 ms |
+| Complete frame | 66.79 ms | 21.70 ms |
+
+The after viewport had two extra rows (548x142). Rendering used **llvmpipe**,
+so these totals include software GPU work and must not be presented as desktop
+GPU CPU measurements. This controlled workload establishes the layout fix;
+it is not a claim that the user's exact filesystem scan has identical timings.
+
+Clipboard checks passed against independent wl-copy/wl-paste clients under
+isolated Sway, including UTF-8, trailing newlines, primary, ownership changes,
+and repeated source replacement. The Xvfb UI test uses real key/mouse events and
+xsel, including delayed paste followed by tab switching. It also captures the
+Alt-held visual switcher, navigates it and commits on Alt release. Only standalone
+overview was retired; the visual switcher and its live thumbnails remain.
+
+A separate bounded run of the actual `find /` command in the same isolated 4K
+release window also maintained roughly 20–23 ms frame times while output changed.
+The CPU breakdown was deliberately not compared to the user's desktop: llvmpipe
+runs GPU work on CPU threads. The regression tests address frame cadence and text
+layout; saturated parser throughput is a separate measurement.

@@ -158,20 +158,6 @@ impl Default for Config {
         bind("search_prev", &["MOD1+SHIFT+a"]);
         bind("search_next", &["MOD1+SHIFT+d"]);
         bind("config_reload", &["CONTROL+SHIFT+r"]);
-        bind("show_tab_overview", &["MOD1+o"]);
-        bind("overview_exit", &["Escape"]);
-        bind("overview_select", &["Return"]);
-        bind("overview_new_tab", &["MOD1+Return"]);
-        bind("overview_nav_left", &["Left"]);
-        bind("overview_nav_right", &["Right"]);
-        bind("overview_nav_up", &["Up"]);
-        bind("overview_nav_down", &["Down"]);
-        bind("overview_move_left", &["SHIFT+Left"]);
-        bind("overview_move_right", &["SHIFT+Right"]);
-        bind("overview_move_up", &["SHIFT+Up"]);
-        bind("overview_move_down", &["SHIFT+Down"]);
-        bind("overview_first", &["Home"]);
-        bind("overview_last", &["End"]);
         for (i, d) in (0..10).zip(["_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "_0"]) {
             bind(&format!("goto_tab_{i}"), &[&format!("MOD1+{d}")]);
         }
@@ -501,6 +487,8 @@ fn merge_bindings(bindings: &mut Vec<(String, Vec<Binding>)>, val: &serde_yaml::
         let Some(action) = k.as_str() else {
             continue;
         };
+        // Standalone overview was retired; old bindings must not swallow keys.
+        if action == "show_tab_overview" || action.starts_with("overview_") { continue; }
         let specs: Vec<String> = match v {
             serde_yaml::Value::String(s) => vec![s.clone()],
             serde_yaml::Value::Sequence(seq) => {
@@ -663,6 +651,16 @@ mod tests {
         assert_eq!(find_action(&cfg.bindings, &Key::Character("C".into()), M::CONTROL | M::SHIFT, false).as_deref(), Some("copy"));
         assert_eq!(find_action(&cfg.bindings, &Key::Character("V".into()), M::CONTROL | M::SHIFT, false).as_deref(), Some("paste"));
         assert_eq!(find_action(&cfg.bindings, &Key::Named(NamedKey::Insert), M::SHIFT, false).as_deref(), Some("paste_primary"));
+    }
+
+    #[test]
+    fn retired_standalone_overview_bindings_do_not_swallow_keys() {
+        let mut cfg = Config::default();
+        let legacy: serde_yaml::Value = serde_yaml::from_str("show_tab_overview: MOD1+o\noverview_exit: Escape\noverview_nav_left: Left\n").unwrap();
+        merge_bindings(&mut cfg.bindings, &legacy);
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("o".into()), M::ALT, false), None);
+        assert_eq!(find_action(&cfg.bindings, &Key::Named(NamedKey::Escape), M::empty(), false), None);
+        assert!(cfg.tab_overview_on_alt, "the Alt-held visual switcher remains enabled");
     }
 
     #[test]

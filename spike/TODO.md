@@ -1,4 +1,33 @@
-# Spike polish TODO
+# Rust rewrite priorities
+
+Scope: preserve the **Alt-held visual tab switcher**. The unused standalone
+`Alt+O` overview is retired; legacy overview bindings are ignored.
+
+Every feature should pass three gates: correct terminal behavior, responsive
+interaction under output load, and a visual check with the configured fonts.
+Performance measurements below use release builds unless marked otherwise.
+
+Current priorities:
+
+1. **Readable and responsive terminal (P0).** Fixed filename wrapping/overlap,
+   fractional grid drift, ignored bold/italic, non-ASCII fallback replacing a
+   font's own glyphs, invisible padding being shaped, and unpaced Wayland
+   redraws. Keep `ls -la`, mixed Unicode, and sustained scrolling as regressions.
+2. **Clipboard and selection (P0, completed).** Native Wayland plus compatibility
+   paths, asynchronous paste with stable destinations, separate primary,
+   bracketed paste, scrollback, and real keyboard/mouse tests. Details below.
+3. **Everyday interaction (P1).** Proper editable rename input with selected
+   initial text and clipboard support; IME; terminal mouse reporting with Shift
+   bypass; selection autoscroll at the viewport edge; HiDPI transitions.
+4. **Tab strip usability (P1).** Keep the active tab reachable with many tabs,
+   implement configured wrapping/placement, and verify full title updates and
+   consistent hover/focus states. Preserve the compact layout and familiar keys.
+5. **Search (P2).** A reusable inline text input, incremental search, next/previous
+   matches, visible match state, and cancellation back to the terminal.
+
+Remaining investigations and historical notes follow.
+
+# Spike polish notes
 
 Look/feel gaps against the original (Python/GTK/VTE) mypixels. Done items keep
 their notes: the causes were rarely where the symptom pointed.
@@ -41,7 +70,11 @@ their notes: the causes were rarely where the symptom pointed.
       for rects) *and* a second `TextRenderer` -- calling `TextRenderer::prepare`
       twice a frame with the same renderer swaps the vertex buffers its earlier
       draw already referenced, so one renderer cannot serve two passes.
-- [ ] **Debug-build CPU.** Not reproducible offscreen: debug idles at 2 fps /
+- [x] **Output-flood layout cost.** Reproduced with changing paths on a 4K
+      viewport. Trim invisible row padding, use basic shaping for ASCII, and
+      notify Wayland before presenting so the compositor can pace frames. See
+      RESULTS.md for the measured improvement.
+- [ ] **Other debug-build CPU.** Earlier measurements were not reproducible offscreen: debug idles at 2 fps /
       4.2% CPU on Xvfb, and coverage resolution is cheap (11 tests including 7
       codepoint scans run in 0.43s unoptimised). Needs a measurement from the real
       Wayland session. The correct fix is damage-driven rendering -- `Term::damage()`
@@ -54,8 +87,9 @@ their notes: the causes were rarely where the symptom pointed.
       `shellworktree` -- the draft appears to append rather than replace).
 - [ ] **Tablist font is not the original's metrics.** The family resolves, but the
       strip's advance width still reads slightly different from GTK's Terminus.
-- [ ] Terminal cell height is 14px where VTE measures 15. skrifa exposes hhea
-      metrics; Pango uses OS/2 win metrics. One row per ~15 rows of density.
+- [x] Terminal cell height now matches the measured Pango row (15px for
+      Cascadia Code 9pt). The hhea ascent/descent each round upward; regression
+      checks cover the configured terminal and tab fonts.
 - [ ] Search panel (deprioritised).
 - [x] Scrollback view, selection, and copy/paste. Mouse wheel, Shift+PageUp/Down,
       and Ctrl+Shift+End; terminal-owned selection tracks output. IME is still open.
