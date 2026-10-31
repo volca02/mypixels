@@ -280,6 +280,15 @@ struct App {
     tab_char_w: f32,
     tab_h: f32,
     tab_text_h: f32,
+    /// Window scale factor, applied to every metric above. The whole render
+    /// pipeline is in *physical* pixels (surface size, pointer and wheel
+    /// events all are), so point sizes are converted to pixels with this
+    /// factor: on a 2x display a 10pt font rasterises at double the physical
+    /// size and a cell is double, while the grid and hit-testing work in the
+    /// same units as before. `App::new` computes the metrics at 1.0 because
+    /// no window exists yet; `resumed` applies the real factor before the
+    /// window is created and `ScaleFactorChanged` keeps it current.
+    scale: f32,
     /// Vertical metrics of the term/tablist fonts, read from the fonts
     /// themselves -- line height differs a lot per family (Cascadia 9pt lands on
     /// 15px, Terminus 12 on 17px) and one guessed factor fit neither.
@@ -529,6 +538,7 @@ impl App {
             tab_char_w,
             tab_h,
             tab_text_h: tab_lh,
+            scale: 1.0,
             term_metrics,
             tab_metrics,
             tab_hits: Vec::new(),
@@ -572,11 +582,12 @@ impl App {
 
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
         // Live sizes, not the config's: `term_pt` carries any zoom applied this
-        // session, and cell_h/tab_text_h are the rounded line heights we lay
-        // the grid out with, so the glyph buffers must match them exactly.
-        let term_px = self.term_pt * 96.0 / 72.0;
+        // session, `self.scale` the display's factor, and cell_h/tab_text_h
+        // are the rounded line heights we lay the grid out with, so the glyph
+        // buffers must match them exactly.
+        let term_px = self.term_pt * 96.0 / 72.0 * self.scale;
         let (_, tab_pt) = config::parse_font(&self.config.tablist_font);
-        let tab_px = tab_pt * 96.0 / 72.0;
+        let tab_px = tab_pt * 96.0 / 72.0 * self.scale;
         self.gpu = Some(Gpu::init(
             event_loop,
             window,
@@ -724,9 +735,11 @@ impl App {
     /// Rebuild the terminal font from the live state (`term_family` +
     /// `term_pt`): attrs, cell metrics, the term glyph pool, and the grid.
     /// The base Metrics are baked into each pooled Buffer, so a change needs
-    /// new buffers.
+    /// new buffers. Everything comes out in physical pixels: shaping happens
+    /// at the size the glyphs are actually rasterised at, so HiDPI screens
+    /// get the rounded cell of their real size, not a 1x cell doubled.
     fn rebuild_term_font(&mut self) {
-        let font_px = self.term_pt * 96.0 / 72.0;
+        let font_px = self.term_pt * 96.0 / 72.0 * self.scale;
         self.term_metrics = fonts::line_metrics(&mut self.font_system, self.term_family)
             .unwrap_or(fonts::LineMetrics::DEFAULT);
         let term_lh = self.term_metrics.height_at(font_px);
@@ -801,7 +814,7 @@ impl App {
     /// metrics, and the tab glyph pool.
     fn rebuild_tab_font(&mut self) {
         let (tab_family, tab_pt) = config::parse_font(&self.config.tablist_font);
-        let tab_font_px = tab_pt * 96.0 / 72.0;
+        let tab_font_px = tab_pt * 96.0 / 72.0 * self.scale;
         let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
         self.tab_metrics = fonts::line_metrics(&mut self.font_system, tab_family)
             .unwrap_or(fonts::LineMetrics::DEFAULT);
@@ -852,6 +865,20 @@ impl App {
         let (term_family, term_pt) = config::parse_font(&self.config.term_font);
         self.term_family = Box::leak(term_family.into_boxed_str());
         self.term_pt = term_pt;
+        self.rebuild_term_font();
+        self.rebuild_tab_font();
+    }
+
+    /// Change the window scale factor. Every pixel metric is derived from
+    /// point sizes, so rescaling is just re-running the two rebuilds, which
+    /// also re-fit the grid to the surface. The compositor keeps the window's
+    /// *physical* size across a scale change, so the grid shrinks to the
+    /// bigger cells rather than the window growing.
+    fn set_scale(&mut self, s: f32) {
+        if s <= 0.0 || (s - self.scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.scale = s;
         self.rebuild_term_font();
         self.rebuild_tab_font();
     }
@@ -2515,6 +2542,12 @@ fn key_bytes(k: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
+            // The metrics were computed at scale 1.0 and the window is
+            // created in physical pixels, so apply the display's factor
+            // first (a no-op on a 1x screen).
+            if let Some(m) = event_loop.primary_monitor() {
+                self.set_scale(m.scale_factor() as f32);
+            }
             let size = winit::dpi::PhysicalSize::new(
                 (self.cols as f32 * self.cell_w) as u32,
                 (self.rows as f32 * self.cell_h + self.tab_h) as u32,
@@ -2532,6 +2565,17 @@ impl ApplicationHandler for App {
                     )
                     .expect("window"),
             );
+            // The window may have landed on a monitor with a different factor
+            // than the primary (or the backend still reports 1.0 before the
+            // first configure); the first frame must already be right.
+            let sf = window.scale_factor() as f32;
+            if sf != self.scale {
+                self.set_scale(sf);
+                let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                    (self.cols as f32 * self.cell_w).round() as u32,
+                    (self.rows as f32 * self.cell_h + self.tab_h).round() as u32,
+                ));
+            }
             // Never keep a window larger than its monitor (the configured
             // size is usually the whole screen; nested/test displays are
             // smaller).
@@ -2768,6 +2812,10 @@ impl ApplicationHandler for App {
                 if let Some(tab) = self.tabs.get(self.active) {
                     tab.term.lock().is_focused = focused;
                 }
+                window.request_redraw();
+            },
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.set_scale(scale_factor as f32);
                 window.request_redraw();
             },
             WindowEvent::Resized(size) => {
