@@ -13,9 +13,10 @@ impl Rgb {
 }
 
 impl Rgb {
-    /// Strict #rgb / #rrggbb parse (Gdk.RGBA.parse compatible).
+    /// Legacy GDK configs also use #rrrrggggbbbb (16 bits per channel).
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim().trim_start_matches('#');
+        if !s.is_ascii() { return None; }
         if s.len() == 3 {
             let v = u32::from_str_radix(s, 16).ok()?;
             let (r, g, b) = ((v >> 8 & 0xf) as u8, (v >> 4 & 0xf) as u8, (v & 0xf) as u8);
@@ -24,6 +25,10 @@ impl Rgb {
         if s.len() == 6 {
             let v = u32::from_str_radix(s, 16).ok()?;
             return Some(Rgb((v >> 16 & 0xff) as u8, (v >> 8 & 0xff) as u8, (v & 0xff) as u8));
+        }
+        if s.len() == 12 {
+            let channel = |part| u16::from_str_radix(part, 16).ok().map(|v| ((v as u32 + 128) / 257) as u8);
+            return Some(Rgb(channel(&s[0..4])?, channel(&s[4..8])?, channel(&s[8..12])?));
         }
         None
     }
@@ -49,20 +54,9 @@ pub fn parse_font(s: &str) -> (String, f32) {
 /// Colon-separated hex colors (terminator/wal format). Takes the first 16;
 /// more than 16 (256-color palettes) is fine. Requires at least 16 so a
 /// truncated palette doesn't silently pad the rest with black.
+#[cfg(test)]
 fn parse_palette(s: &str) -> Option<[Rgb; 16]> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() < 16 {
-        return None;
-    }
-    let mut out = [Rgb(0, 0, 0); 16];
-    for (slot, part) in out.iter_mut().zip(&parts).take(16) {
-        *slot = Rgb::parse(part)?;
-    }
-    Some(out)
+    crate::theme::parse_palette(&serde_yaml::Value::String(s.to_string())).ok()
 }
 
 #[derive(Clone)]
@@ -83,6 +77,10 @@ pub struct Config {
     pub foreground_color: Rgb,
     pub background_color: Rgb,
     pub selection_color: Rgb,
+    pub cursor_color: Rgb,
+    pub accent_color: Rgb,
+    /// External color sources monitored by the theme worker, never by draw().
+    pub theme_files: Vec<std::path::PathBuf>,
     /// 16-color palette (None = alacritty defaults). Terminal runtime OSC 4
     /// changes override these per color.
     pub palette: Option<[Rgb; 16]>,
@@ -177,6 +175,9 @@ impl Default for Config {
             foreground_color: parse_hex("#bbbbbb"),
             background_color: parse_hex("#000000"),
             selection_color: parse_hex("#3584e4"),
+            cursor_color: Rgb(140, 140, 153),
+            accent_color: Rgb(92, 191, 191),
+            theme_files: Vec::new(),
             palette: None,
             term_font: "Terminus 8".to_string(),
             tablist_font: "Liberation Mono 7".to_string(),
@@ -218,37 +219,35 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load the config from `~/.mypixels` (YAML) merged over the defaults.
-    /// Same semantics as the Python version: `bindings` merge per action,
-    /// every other key replaces the default when present in the file.
+    /// Startup can fall back; explicit/live reload uses try_load to keep the
+    /// last valid configuration when a file is incomplete or invalid.
     pub fn load() -> Config {
-        let mut cfg = Config::default();
-        // $SPIKE_CONFIG overrides the path (used for testing reloads without
-        // touching the real ~/.mypixels).
-        let path = match std::env::var("SPIKE_CONFIG") {
-            Ok(p) => std::path::PathBuf::from(p),
-            Err(_) => {
-                let Some(home) = dirs::home_dir() else {
-                    return cfg;
-                };
-                home.join(".mypixels")
-            }
+        Self::try_load().unwrap_or_else(|e| { log::warn!("{e}; using defaults"); Self::default() })
+    }
+
+    pub fn try_load() -> Result<Config, String> {
+        let path = std::env::var_os("SPIKE_CONFIG").map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|p| p.join(".mypixels")))
+            .ok_or("Cannot determine configuration path")?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("no config file at {}, using defaults", path.display());
-            return cfg;
-        };
-        // The Python dumper tags multiple bindings `!!python/tuple`; the
-        // block list underneath is plain YAML, so strip the tag.
-        let text = text.replace("!!python/tuple", "");
-        // Real-world configs can repeat a key (Python keeps the last
-        // occurrence; serde_yaml rejects duplicates), so dedupe.
-        let text = dedupe_top_level(&text);
-        match serde_yaml::from_str::<serde_yaml::Value>(&text) {
-            Ok(v) => merge(&mut cfg, &v),
-            Err(e) => eprintln!("config parse error in {}: {e}", path.display()),
-        }
-        cfg
+        Self::from_text(&text, path.parent().unwrap_or(std::path::Path::new(".")))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub fn from_text(text: &str, base: &std::path::Path) -> Result<Config, String> {
+        let text = dedupe_top_level(&text.replace("!!python/tuple", ""));
+        let mut value: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| format!("Invalid config YAML: {e}"))?;
+        if value.is_null() { value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new()); }
+        if !value.is_mapping() { return Err("Configuration must be a YAML mapping".into()); }
+        let mut cfg = Self::default();
+        crate::theme::configure(&mut cfg, &value, base)?;
+        cfg.theme_files.sort();
+        cfg.theme_files.dedup();
+        Ok(cfg)
     }
 }
 
@@ -305,7 +304,7 @@ fn dedupe_top_level(text: &str) -> String {
     out
 }
 
-    fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
+pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
         let Some(map) = v.as_mapping() else {
             return;
         };
@@ -326,16 +325,23 @@ fn dedupe_top_level(text: &str) -> String {
                 "foreground_color" => set_rgb(&mut cfg.foreground_color, val),
                 "background_color" => set_rgb(&mut cfg.background_color, val),
                 "selection_color" => set_rgb(&mut cfg.selection_color, val),
+                "cursor_color" => set_rgb(&mut cfg.cursor_color, val),
+                "accent_color" => set_rgb(&mut cfg.accent_color, val),
                 "bg_tint_color" => set_rgb(&mut cfg.bg_tint_color, val),
-                key if key.starts_with("col_") && key.len() == 5 => {
+                key if key.starts_with("col_") && key.len() == 5 && matches!(key.as_bytes()[4], b'0'..=b'7') => {
                     let i = (key.as_bytes()[4] as u8 - b'0') as usize;
                     if i < 8 {
                         set_rgb(&mut cfg.col[i], val);
                     }
                 },
                 "palette" => {
-                    if let Some(s) = val.as_str() {
-                        cfg.palette = parse_palette(s);
+                    if val.as_str().is_some_and(|s| s.trim().is_empty()) {
+                        cfg.palette = None;
+                    } else {
+                        match crate::theme::parse_palette(val) {
+                            Ok(palette) => cfg.palette = Some(palette),
+                            Err(e) => log::warn!("{e}"),
+                        }
                     }
                 },
                 "term_font" => {
@@ -670,6 +676,9 @@ mod tests {
         // #rgb shorthand expands each nibble to x17.
         assert_eq!(Rgb::parse("#f00"), Some(Rgb(255, 0, 0)));
         assert_eq!(Rgb::parse("#fff"), Some(Rgb(255, 255, 255)));
+        assert_eq!(Rgb::parse("#ffff2c2c4b4b"), Some(Rgb(255, 44, 75)));
+        assert_eq!(Rgb::parse("#ffff00000000"), Some(Rgb(255, 0, 0)));
+        assert_eq!(Rgb::parse("#éééééé"), None);
         // invalid: wrong length / non-hex.
         assert_eq!(Rgb::parse("#12345"), None);
         assert_eq!(Rgb::parse("#zzzzzz"), None);

@@ -9,6 +9,7 @@ mod config;
 mod fonts;
 mod gpu;
 mod tab;
+mod theme;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +41,6 @@ const MAX_RUNS: usize = 4096;
 const TAB_PAD: f32 = 8.0;
 /// Gap between tabs -- the original gets it from `margin-right: 1px`.
 const TAB_GAP: f32 = 1.0;
-/// The original's `clock()` prepend stamps HH:MM in this colour.
-const CLOCK_COLOR: [f32; 3] = [0.6, 0.4, 0.4];
 /// Vertical padding inside a tab. The original gets 21px for Terminus 12 from
 /// GTK (`padding: 2px 8px` plus 2px label margins); we reproduce the 2+2.
 const TAB_VPAD: f32 = 2.0;
@@ -57,7 +56,7 @@ const PALETTE: [[f32; 3]; 16] = [
 fn cube_color(i: u8) -> [f32; 3] {
     let i = (i - 16) as usize;
     let (r, g, b) = (i / 36, (i / 6) % 6, i % 6);
-    let c = |v: usize| if v == 0 { 0.0 } else { (95.0 + 40.0 * v as f32) / 255.0 };
+    let c = |v: usize| if v == 0 { 0.0 } else { (55.0 + 40.0 * v as f32) / 255.0 };
     [c(r), c(g), c(b)]
 }
 
@@ -105,7 +104,7 @@ impl Palette {
 
     // Resolve a cell color; fg/bg supplied from config for the default
     // foreground/background/cursor named colors.
-    fn resolve_with(&self, c: &alacritty_terminal::vte::ansi::Color, fg: [f32; 3], bg: [f32; 3]) -> [f32; 3] {
+    fn resolve_with(&self, c: &alacritty_terminal::vte::ansi::Color, fg: [f32; 3], bg: [f32; 3], cursor: [f32; 3]) -> [f32; 3] {
         use alacritty_terminal::vte::ansi::{Color, NamedColor};
         match c {
             Color::Spec(rgb) => [rgb.r as f32 / 255.0, rgb.g as f32 / 255.0, rgb.b as f32 / 255.0],
@@ -126,13 +125,20 @@ impl Palette {
                 } else if i == NamedColor::Background as usize {
                     bg
                 } else if i == NamedColor::Cursor as usize {
-                    CURSOR_COLOR
+                    cursor
+                } else if *n == NamedColor::BrightForeground {
+                    fg
+                } else if *n == NamedColor::DimForeground {
+                    fg.map(|v| v * 0.66)
+                } else if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&i) {
+                    let slot = i - NamedColor::DimBlack as usize;
+                    self.cfg16.as_ref().unwrap_or(&PALETTE)[slot].map(|v| v * 0.66)
                 } else {
-                    PALETTE[i % 16]
+                    fg
                 }
             },
             Color::Indexed(i) => {
-                let j = 16 + *i as usize;
+                let j = *i as usize;
                 if j < 269 {
                     if let Some(rgb) = &self.colors[j] {
                         return *rgb;
@@ -154,7 +160,6 @@ impl Palette {
     }
 }
 
-const CURSOR_COLOR: [f32; 3] = [0.55, 0.55, 0.6];
 
 // ---------------------------------------------------------------------------
 // Draw list (owned data copied out of the terminal under the lock)
@@ -226,7 +231,11 @@ struct Run {
     attrs: &'static Attrs<'static>,
 }
 
+#[derive(Default)]
 struct FrameData {
+    fg: [f32; 3],
+    bg: [f32; 3],
+    cursor_color: [f32; 3],
     runs: Vec<Run>,
     cursor: Option<(u32, u32)>,
 }
@@ -291,6 +300,7 @@ struct App {
     /// winit 0.30 reports press counts for keys but not for mouse buttons.
     click: Option<(u8, u32, (f32, f32), std::time::Instant)>,
     clipboard: Option<clipboard::Clipboard>,
+    theme_watcher: Option<theme::Watcher>,
     notice: Option<(String, Instant)>,
     wheel_pixels: f32,
     /// Tab under the pointer, or usize::MAX for none.
@@ -527,6 +537,7 @@ impl App {
             drag: None,
             click: None,
             clipboard: None,
+            theme_watcher: None,
             notice: None,
             wheel_pixels: 0.0,
             hover_tab: usize::MAX,
@@ -683,9 +694,31 @@ impl App {
     fn apply_config(&mut self, font_changed: bool) {
         self.fg = self.config.foreground_color.to_f32();
         self.bg = self.config.background_color.to_f32();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.slot_sig.fill(0);
+            gpu.prev_sigs.fill(0);
+        }
         if font_changed {
             self.apply_fonts();
         }
+    }
+
+    fn reload_config(&mut self) {
+        match Config::try_load() {
+            Ok(config) => {
+                let font_changed = config.term_font != self.config.term_font || config.tablist_font != self.config.tablist_font;
+                self.config = config;
+                self.apply_config(font_changed);
+                if let Some(watcher) = &self.theme_watcher { watcher.set_paths(self.config.theme_files.clone()); }
+                if let Some(window) = &self.window { window.request_redraw(); }
+                log::info!("configuration and colors reloaded");
+            }
+            Err(e) => self.show_error(format!("Theme/config reload: {e}")),
+        }
+    }
+
+    fn check_theme_files(&mut self) {
+        if self.theme_watcher.as_ref().is_some_and(|w| w.take_changed()) { self.reload_config(); }
     }
 
     /// Rebuild the terminal font from the live state (`term_family` +
@@ -840,6 +873,11 @@ impl App {
         let term = tab.term.lock();
         let content = term.renderable_content();
         let palette = Palette::from_colors(content.colors, &self.config.palette);
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let resolve = |color: &Color| palette.resolve_with(color, self.fg, self.bg, self.config.cursor_color.to_f32());
+        let fg = resolve(&Color::Named(NamedColor::Foreground));
+        let bg = resolve(&Color::Named(NamedColor::Background));
+        let cursor_color = resolve(&Color::Named(NamedColor::Cursor));
         let rows = self.rows;
         let cols = self.cols;
 
@@ -862,8 +900,8 @@ impl App {
                 continue;
             }
 
-            let mut fg = palette.resolve_with(&cell.fg, self.fg, self.bg);
-            let mut bg = palette.resolve_with(&cell.bg, self.fg, self.bg);
+            let mut fg = resolve(&cell.fg);
+            let mut bg = resolve(&cell.bg);
             if cell.flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
             if cell.flags.contains(Flags::DIM) { fg = fg.map(|v| v * 0.66); }
             let attrs = self.cell_attrs(cell.c, cell.flags);
@@ -888,7 +926,7 @@ impl App {
                 }
             }
             if let Some(r) = cur.take() {
-                push_run(&mut runs, r, self.fg, self.bg);
+                push_run(&mut runs, r, fg, bg);
             }
             let mut glyph = String::with_capacity(4);
             glyph.push(cell.c);
@@ -907,7 +945,7 @@ impl App {
             });
         }
         if let Some(r) = cur.take() {
-            push_run(&mut runs, r, self.fg, self.bg);
+            push_run(&mut runs, r, fg, bg);
         }
 
         let cursor = if !show_cursor {
@@ -923,10 +961,10 @@ impl App {
             }
         };
 
-        FrameData { runs, cursor }
+        FrameData { runs, cursor, fg, bg, cursor_color }
     }
 
-    /// Render the standalone tab overview. Builds a frame per tab (before the
+    /// Render the terminal and, while Alt is held, the visual tab switcher. Builds a frame per tab (before the
     /// mutable gpu borrow), then hands off to `draw_overview`.
     fn draw(&mut self, window: &Window) {
         if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.notice = None; }
@@ -998,7 +1036,7 @@ impl App {
                 gpu.config.alpha_mode
             );
         });
-        push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, h as f32, [self.bg[0], self.bg[1], self.bg[2], bg_a]);
+        push_rect(&mut gpu.rects, 0.0, 0.0, w as f32, h as f32, [frame.bg[0], frame.bg[1], frame.bg[2], bg_a]);
 
         // --- Text areas (tab labels + terminal runs), one prepare() per frame ---
         let mut areas: Vec<TextArea> = Vec::new();
@@ -1078,7 +1116,7 @@ impl App {
 
                 if let Some(label) = clock_label.as_deref() {
                     if slot < tpool.len() {
-                        push_tab_label(tpool, slot, fs, attrs, label, x + 1.0, text_y, CLOCK_COLOR, &mut areas, self.tab_char_w, bounds);
+                        push_tab_label(tpool, slot, fs, attrs, label, x + 1.0, text_y, self.config.accent_color.to_f32(), &mut areas, self.tab_char_w, bounds);
                         slot += 1;
                     }
                     x += clock_w;
@@ -1151,9 +1189,9 @@ impl App {
 
         // --- Terminal: cell backgrounds ---
         for run in &frame.runs {
-            let same_bg = (run.bg[0] - self.bg[0]).abs() < 0.004
-                && (run.bg[1] - self.bg[1]).abs() < 0.004
-                && (run.bg[2] - self.bg[2]).abs() < 0.004;
+            let same_bg = (run.bg[0] - frame.bg[0]).abs() < 0.004
+                && (run.bg[1] - frame.bg[1]).abs() < 0.004
+                && (run.bg[2] - frame.bg[2]).abs() < 0.004;
             if !same_bg {
                 push_rect(
                     &mut gpu.rects,
@@ -1189,7 +1227,7 @@ impl App {
                     strip_h + cy as f32 * self.cell_h,
                     self.cell_w,
                     self.cell_h,
-                    [CURSOR_COLOR[0], CURSOR_COLOR[1], CURSOR_COLOR[2], 0.35],
+                    [frame.cursor_color[0], frame.cursor_color[1], frame.cursor_color[2], 0.55],
                 );
             }
         }
@@ -1217,8 +1255,8 @@ impl App {
                 if self.notice.is_some() && run.row as usize == self.rows.saturating_sub(1) { continue; }
                 let blank = run.text.chars().all(|c| c == ' ');
                 let default_fg =
-                    (run.fg[0] - self.fg[0]).abs() + (run.fg[1] - self.fg[1]).abs()
-                        + (run.fg[2] - self.fg[2]).abs()
+                    (run.fg[0] - frame.fg[0]).abs() + (run.fg[1] - frame.fg[1]).abs()
+                        + (run.fg[2] - frame.fg[2]).abs()
                         < 0.01;
                 if blank && default_fg {
                     continue;
@@ -1346,12 +1384,12 @@ impl App {
                     idx: i,
                     top: strip_h,
                     bounds,
-                    default_fg: self.fg,
+                    default_fg: fd.fg,
                     rects: preview_rects(
                         fd,
-                        &self.bg,
+                        &fd.bg,
                         &self.config.tablist_background.to_f32(),
-                        &self.fg,
+                        &fd.cursor_color,
                         self.cell_w,
                         self.cell_h,
                         strip_h,
@@ -1534,7 +1572,7 @@ impl App {
         }
     }
 
-    fn clipboard_error(&mut self, error: String) {
+    fn show_error(&mut self, error: String) {
         log::warn!("{error}");
         self.notice = Some((error, Instant::now()));
         if let Some(window) = &self.window { window.request_redraw(); }
@@ -1542,13 +1580,13 @@ impl App {
 
     fn copy_text(&mut self, kind: clipboard::Kind, text: String) {
         let result = self.clipboard.as_ref().ok_or_else(|| "Clipboard unavailable".to_string()).and_then(|c| c.set(kind, text));
-        if let Err(e) = result { self.clipboard_error(e); }
+        if let Err(e) = result { self.show_error(e); }
     }
 
     fn request_paste(&mut self, kind: clipboard::Kind) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let result = self.clipboard.as_ref().ok_or_else(|| "Clipboard unavailable".to_string()).and_then(|c| c.paste(kind, tab.id));
-        if let Err(e) = result { self.clipboard_error(e); }
+        if let Err(e) = result { self.show_error(e); }
     }
 
     fn drain_clipboard(&mut self) {
@@ -1558,7 +1596,7 @@ impl App {
                 clipboard::Event::Paste { target, result: Ok(text) } => {
                     if let Some(tab) = self.tabs.iter().find(|t| t.id == target) { tab.paste(&text); }
                 }
-                clipboard::Event::Paste { result: Err(e), .. } | clipboard::Event::Error(e) => self.clipboard_error(e),
+                clipboard::Event::Paste { result: Err(e), .. } | clipboard::Event::Error(e) => self.show_error(e),
             }
         }
     }
@@ -1802,13 +1840,7 @@ impl App {
                 self.sync_term_size();
             },
             "config_reload" => {
-                let old_term = self.config.term_font.clone();
-                let old_tab = self.config.tablist_font.clone();
-                self.config = Config::load();
-                let font_changed =
-                    old_term != self.config.term_font || old_tab != self.config.tablist_font;
-                self.apply_config(font_changed);
-                log::info!("config reloaded");
+                self.reload_config();
             },
             "goto_tab_0" | "goto_tab_1" | "goto_tab_2" | "goto_tab_3" | "goto_tab_4"
             | "goto_tab_5" | "goto_tab_6" | "goto_tab_7" | "goto_tab_8" | "goto_tab_9" => {
@@ -1981,6 +2013,9 @@ fn frame_sig(fd: &FrameData, cell_w: f32) -> u64 {
             .map(|c| (c.0 as u64) << 32 | c.1 as u64)
             .unwrap_or(u64::MAX),
     );
+    for color in fd.fg.iter().chain(fd.bg.iter()).chain(fd.cursor_color.iter()) {
+        mix(&mut h, color.to_bits() as u64);
+    }
     mix(&mut h, fd.runs.len() as u64);
     for run in &fd.runs {
         mix(&mut h, run.row as u64);
@@ -2129,12 +2164,16 @@ fn draw_overview(
     let pool = &mut gpu.pool;
     let mut slot = 0usize;
 
+    let background = config.background_color.to_f32();
+    let foreground = config.foreground_color.to_f32();
+    let surface = config.tablist_background.to_f32();
+    // The theme's background also works as a wash for light palettes.
     // Dark backdrop over the whole window.
     // The live terminal is painted underneath now, so this is a dim rather than
     // a cover. The Alt-held switcher is a peek over running output, so it stays
     // light enough to keep its live terminal context visible.
     let dim = config.tab_overview_opacity.min(0.7);
-    push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [0.0, 0.0, 0.0, dim]);
+    push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [background[0], background[1], background[2], dim]);
 
     let n = tabs.len();
     let cols = grid_cols(n);
@@ -2163,12 +2202,12 @@ fn draw_overview(
     // Headers sit on a dark pill: the live tab strip shows through now, and bare
     // text over it was unreadable.
     let title = "Tab Switcher";
-    let title_col = [0.36, 0.75, 0.75];
+    let title_col = config.accent_color.to_f32();
     let (bx, by) = (grid_x, (grid_y - tab_text_h - 14.0).max(4.0));
     push_rrect(
         &mut gpu.rects, bx - 8.0, by - 5.0,
         title.len() as f32 * tab_char_w + 16.0, tab_text_h + 10.0,
-        [0.0, 0.0, 0.0, 0.62], 5.0,
+        [surface[0], surface[1], surface[2], 1.0], 5.0,
     );
     push_ov_text(pool, slot, fs, tab_attrs, title, bx, by, 1.0, title_col, None, None, areas, bounds);
     slot += 1;
@@ -2184,11 +2223,8 @@ fn draw_overview(
         let tx = grid_x + col as f32 * (tile_w + spacing);
         let ty = grid_y + row as f32 * (tile_h + spacing);
         let selected = idx == selected;
-        let accent = if t.group < 8 {
-            config.col[t.group].to_f32()
-        } else {
-            [0.36, 0.75, 0.75]
-        };
+        let accent_rgb = if t.group < 8 { config.col[t.group] } else { config.accent_color };
+        let accent = accent_rgb.to_f32();
 
         // Depth: three expanding, fading rounded rects behind the tile. A real
         // blur needs a second render pass; stacked rects read the same at this
@@ -2210,14 +2246,15 @@ fn draw_overview(
         } else {
             push_rrect(
                 &mut gpu.rects, tx - 1.0, ty - 1.0, tile_w + 2.0, tile_h + 2.0,
-                [1.0, 1.0, 1.0, 0.12], radius + 1.0, 
+                [foreground[0], foreground[1], foreground[2], 0.12], radius + 1.0,
             );
         }
         // Tiles are fully opaque on purpose: all text is drawn in a single pass
         // after all rects, so a translucent tile had the live terminal's text
         // bleeding through it. The dim between tiles is where the live terminal
         // shows; inside a tile you see only that tab's preview.
-        let bgc = if selected { [0.13, 0.30, 0.30, 1.0] } else { [0.09, 0.09, 0.09, 1.0] };
+        let tile = if selected { theme::mix(config.tablist_background, accent_rgb, 0.16).to_f32() } else { surface };
+        let bgc = [tile[0], tile[1], tile[2], 1.0];
         push_rrect(&mut gpu.rects, tx, ty, tile_w, tile_h, bgc, radius);
 
         // Header: index chip in the accent colour, then the title.
@@ -2231,13 +2268,13 @@ fn draw_overview(
         let num_x = hx + (chip - digits as f32 * tab_char_w) / 2.0;
         push_ov_text(
             pool, slot, fs, tab_attrs, &format!("{}", idx + 1),
-            num_x, hy - 1.0, 1.0, [0.05, 0.05, 0.05], None, None, areas, bounds,
+            num_x, hy - 1.0, 1.0, theme::on_color(accent_rgb).to_f32(), None, None, areas, bounds,
         );
         slot += 1;
 
         let room = ((tile_w - pad * 2.0 - chip - 6.0) / tab_char_w).max(1.0) as usize;
         let title: String = t.display_title().chars().take(room).collect();
-        let header_color: [f32; 3] = if selected { [1.0, 1.0, 1.0] } else { [0.78, 0.78, 0.78] };
+        let header_color: [f32; 3] = if selected { config.tab_color_fg_selected.to_f32() } else { config.tab_color_fg.to_f32() };
         push_ov_text(
             pool, slot, fs, tab_attrs, &title,
             hx + chip + 6.0, hy - 1.0, 1.0, header_color, None, None, areas, bounds,
@@ -2249,7 +2286,7 @@ fn draw_overview(
         let thy = ty + pad + header_h;
         push_rrect(
             &mut gpu.rects, thx - 1.0, thy - 1.0, thumb_w + 2.0, thumb_h + 2.0,
-            [0.03, 0.03, 0.03, 1.0], 4.0,
+            [background[0], background[1], background[2], 1.0], 4.0,
         );
         // Preview: a real render of the tab, sampled down. Every tile has one.
         // A tile whose frame was not rebuilt this tick simply keeps showing its
@@ -2275,7 +2312,7 @@ fn draw_overview(
             push_ov_text(
                 pool, slot, fs, tab_attrs, "* entangled",
                 thx, thy + thumb_h - tab_text_h, 1.0,
-                [1.0, 0.35, 0.35], None, None, areas, bounds,
+                config.tab_color_entangle.to_f32(), None, None, areas, bounds,
             );
             slot += 1;
         }
@@ -2512,11 +2549,18 @@ impl ApplicationHandler for App {
             }
             self.init_gpu(event_loop, &window);
             let weak = Arc::downgrade(&window);
+            match theme::Watcher::new(self.config.theme_files.clone(), move || {
+                if let Some(window) = weak.upgrade() { window.request_redraw(); }
+            }) {
+                Ok(watcher) => self.theme_watcher = Some(watcher),
+                Err(e) => self.show_error(format!("Theme watcher unavailable: {e}")),
+            }
+            let weak = Arc::downgrade(&window);
             match clipboard::Clipboard::new(clipboard::Backend::for_window(&window), move || {
                 if let Some(w) = weak.upgrade() { w.request_redraw(); }
             }) {
                 Ok(clipboard) => self.clipboard = Some(clipboard),
-                Err(e) => self.clipboard_error(format!("Clipboard unavailable: {e}")),
+                Err(e) => self.show_error(format!("Clipboard unavailable: {e}")),
             }
             *self.window_slot.lock().unwrap() = Some(Arc::clone(&window));
             self.window = Some(window);
@@ -2529,6 +2573,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.check_theme_files();
         self.drain_clipboard();
         self.drain_test_keys(event_loop);
     }
@@ -2542,6 +2587,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             },
             WindowEvent::RedrawRequested => {
+                self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_test_keys(event_loop);
                 // Open the Alt-held switcher if the clock asked and Alt is
@@ -2905,6 +2951,7 @@ mod preview_tests {
         let fd = FrameData {
             runs: vec![run(0, 0, "ab   "), run(2, 4, "cd")],
             cursor: None,
+            ..FrameData::default()
         };
         // Trailing padding is invisible in a thumbnail and expensive to shape, so
         // it is gone; leading spaces stay because they place the text.
@@ -2916,15 +2963,17 @@ mod preview_tests {
         let fd = FrameData {
             runs: vec![],
             cursor: None,
+            ..FrameData::default()
         };
         assert_eq!(joined(&preview_spans(&fd, 3, &Attrs::new())), " \n \n \n");
     }
 
     #[test]
-    fn signatures_see_text_and_cursor_but_nothing_else() {
+    fn signatures_see_text_cursor_and_default_colors() {
         let mut fd = FrameData {
             runs: vec![run(0, 0, "x")],
             cursor: None,
+            ..FrameData::default()
         };
         let base = frame_sig(&fd, 7.0);
         fd.cursor = Some((1, 0));
@@ -2932,7 +2981,44 @@ mod preview_tests {
         fd.cursor = None;
         fd.runs[0].text = "y".into();
         assert_ne!(base, frame_sig(&fd, 7.0), "so is the text");
+        let old = frame_sig(&fd, 7.0);
+        fd.bg = [1.0; 3];
+        assert_ne!(old, frame_sig(&fd, 7.0), "blank previews also follow background changes");
         let again = frame_sig(&fd, 7.0);
         assert_eq!(again, frame_sig(&fd, 7.0), "same input, same signature");
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+    use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+
+    #[test]
+    fn osc_overrides_use_the_same_slots_for_named_and_indexed_colors() {
+        let mut colors = alacritty_terminal::term::color::Colors::default();
+        colors[1] = Some(Rgb { r: 24, g: 48, b: 72 });
+        colors[17] = Some(Rgb { r: 12, g: 34, b: 56 });
+        colors[256] = Some(Rgb { r: 255, g: 128, b: 0 });
+        let palette = Palette::from_colors(&colors, &None);
+        let resolve = |c| palette.resolve_with(&c, [0.8; 3], [0.1; 3], [0.4; 3]);
+        assert_eq!(resolve(Color::Named(NamedColor::Red)), resolve(Color::Indexed(1)));
+        assert_eq!(resolve(Color::Indexed(1)), config::Rgb(24, 48, 72).to_f32());
+        assert_eq!(resolve(Color::Indexed(17)), config::Rgb(12, 34, 56).to_f32());
+        assert_eq!(resolve(Color::Named(NamedColor::Foreground)), config::Rgb(255, 128, 0).to_f32());
+        assert_eq!(resolve(Color::Named(NamedColor::Background)), [0.1; 3]);
+        assert_eq!(resolve(Color::Named(NamedColor::Cursor)), [0.4; 3]);
+    }
+
+    #[test]
+    fn theme_palette_leaves_the_256_color_cube_and_truecolor_intact() {
+        let cfg = Config::from_text("theme: dracula", std::path::Path::new(".")).unwrap();
+        let palette = Palette::from_colors(&Default::default(), &cfg.palette);
+        let resolve = |c| palette.resolve_with(&c, [0.8; 3], [0.1; 3], [0.4; 3]);
+        assert_eq!(resolve(Color::Indexed(1)), cfg.palette.unwrap()[1].to_f32());
+        assert_eq!(resolve(Color::Indexed(196)), [1.0, 0.0, 0.0]);
+        assert_eq!(resolve(Color::Indexed(17)), [0.0, 0.0, 95.0 / 255.0]);
+        assert_eq!(resolve(Color::Indexed(232)), [8.0 / 255.0; 3]);
+        assert_eq!(resolve(Color::Spec(Rgb { r: 1, g: 2, b: 3 })), config::Rgb(1, 2, 3).to_f32());
     }
 }
