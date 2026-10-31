@@ -26,7 +26,7 @@ use glyphon::{
     Attrs, Buffer, Family, FontSystem, Metrics, Resolution, Shaping, TextArea, TextBounds,
 };
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -289,10 +289,13 @@ struct App {
     pointer: (f32, f32),
     /// Cell a left-drag last covered; the selection only moves when a new cell
     /// is entered, which keeps dragging from repainting every pixel step.
-    drag: Option<Point>,
+    drag: Option<(Point, Side)>,
     /// Click counting for word/line selection: (button, count, position, when).
     /// winit 0.30 reports press counts for keys but not for mouse buttons.
     click: Option<(u8, u32, (f32, f32), std::time::Instant)>,
+    clipboard: Option<clipboard::Clipboard>,
+    notice: Option<(String, Instant)>,
+    wheel_pixels: f32,
     /// Tab under the pointer, or usize::MAX for none.
     hover_tab: usize,
     hover_add: bool,
@@ -526,6 +529,9 @@ impl App {
             pointer: (0.0, 0.0),
             drag: None,
             click: None,
+            clipboard: None,
+            notice: None,
+            wheel_pixels: 0.0,
             hover_tab: usize::MAX,
             hover_add: false,
             tablist_hidden,
@@ -844,7 +850,9 @@ impl App {
         let mut cur: Option<Run> = None;
 
         for indexed in content.display_iter {
-            let row = indexed.point.line.0 as usize;
+            let row = indexed.point.line.0 + content.display_offset as i32;
+            if row < 0 { continue; }
+            let row = row as usize;
             if row >= rows {
                 break;
             }
@@ -897,6 +905,7 @@ impl App {
                 fg,
                 bg,
                 text: glyph,
+                cells: vec![(0, 0)],
                 attrs,
             });
         }
@@ -905,15 +914,15 @@ impl App {
         }
 
         let cursor = if !show_cursor {
-                cells: vec![(0, 0)],
             None
         } else {
             match content.cursor.shape {
                 alacritty_terminal::vte::ansi::CursorShape::Hidden => None,
-                _ => Some((
+                _ if content.cursor.point.line.0 + (content.display_offset as i32) < self.rows as i32 => Some((
                     content.cursor.point.column.0 as u32,
-                    content.cursor.point.line.0 as u32,
+                    (content.cursor.point.line.0 + content.display_offset as i32) as u32,
                 )),
+                _ => None,
             }
         };
 
@@ -923,6 +932,7 @@ impl App {
     /// Render the standalone tab overview. Builds a frame per tab (before the
     /// mutable gpu borrow), then hands off to `draw_overview`.
     fn draw(&mut self, window: &Window) {
+        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.notice = None; }
         let t_start = Instant::now();
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -1170,7 +1180,7 @@ impl App {
                 self.cell_h,
                 // Adwaita's selection blue, at the alpha terminals like VTE use
                 // for an overlay rather than a colour swap.
-                [0.208, 0.518, 0.894, 0.35],
+                { let c = self.config.selection_color.to_f32(); [c[0], c[1], c[2], 0.35] },
             );
         }
         // Cursor (hidden on row 0 while renaming; the prompt owns that line)
@@ -1207,6 +1217,7 @@ impl App {
                 if self.renaming && run.row == 0 {
                     continue;
                 }
+                if self.notice.is_some() && run.row as usize == self.rows.saturating_sub(1) { continue; }
                 let blank = run.text.chars().all(|c| c == ' ');
                 let default_fg =
                     (run.fg[0] - self.fg[0]).abs() + (run.fg[1] - self.fg[1]).abs()
@@ -1239,16 +1250,18 @@ impl App {
         }
 
         // --- Inline rename prompt (overlays terminal row 0) ---
-        if self.renaming {
+        if self.renaming || self.notice.is_some() {
+            let prompt_y = if self.renaming { strip_h } else { strip_h + self.rows.saturating_sub(1) as f32 * self.cell_h };
             push_rect(
                 &mut gpu.rects,
                 0.0,
-                strip_h,
+                prompt_y,
                 w as f32,
                 self.cell_h,
                 [self.bg[0], self.bg[1], self.bg[2], 1.0],
             );
-            let prompt = format!("Rename: {}", self.rename_draft);
+            let prompt = if self.renaming { format!("Rename: {}", self.rename_draft) }
+                else { format!("  {}", self.notice.as_ref().unwrap().0) };
             {
                 let fs = &mut self.font_system;
                 let b = &mut gpu.prompt_buf;
@@ -1261,7 +1274,7 @@ impl App {
                 areas.push(TextArea {
                     buffer: buf,
                     left: 0.0,
-                    top: strip_h,
+                    top: prompt_y,
                     scale: 1.0,
                     bounds,
                     default_color: glyphon::Color::rgb(
@@ -1522,11 +1535,41 @@ impl App {
     /// text *is* copying it, and middle click is the paste.
     fn publish_primary(&mut self) {
         if let Some(text) = self.tabs.get(self.active).and_then(|t| t.selected_text()) {
-            clipboard::set(clipboard::Kind::Primary, &text);
+            self.copy_text(clipboard::Kind::Primary, text);
+        }
+    }
+
+    fn clipboard_error(&mut self, error: String) {
+        log::warn!("{error}");
+        self.notice = Some((error, Instant::now()));
+        if let Some(window) = &self.window { window.request_redraw(); }
+    }
+
+    fn copy_text(&mut self, kind: clipboard::Kind, text: String) {
+        let result = self.clipboard.as_ref().ok_or_else(|| "Clipboard unavailable".to_string()).and_then(|c| c.set(kind, text));
+        if let Err(e) = result { self.clipboard_error(e); }
+    }
+
+    fn request_paste(&mut self, kind: clipboard::Kind) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let result = self.clipboard.as_ref().ok_or_else(|| "Clipboard unavailable".to_string()).and_then(|c| c.paste(kind, tab.id));
+        if let Err(e) = result { self.clipboard_error(e); }
+    }
+
+    fn drain_clipboard(&mut self) {
+        let events: Vec<_> = self.clipboard.as_ref().map(|c| c.events().collect()).unwrap_or_default();
+        for event in events {
+            match event {
+                clipboard::Event::Paste { target, result: Ok(text) } => {
+                    if let Some(tab) = self.tabs.iter().find(|t| t.id == target) { tab.paste(&text); }
+                }
+                clipboard::Event::Paste { result: Err(e), .. } | clipboard::Event::Error(e) => self.clipboard_error(e),
+            }
         }
     }
 
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+        if self.drag.take().is_some() { self.publish_primary(); }
         // 0. Rename mode eats keys (Enter commits, Esc cancels, Backspace and
         //    characters edit the draft). Nothing reaches the terminal.
         if self.renaming {
@@ -1556,6 +1599,7 @@ impl App {
             // moved on, and leaving the wash over new output would be a lie.
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 tab.clear_selection();
+                tab.scroll(alacritty_terminal::grid::Scroll::Bottom);
             }
             if let Some(tab) = self.tabs.get(self.active) {
                 // Entanglement: type into all entangled tabs
@@ -1841,14 +1885,17 @@ impl App {
             "new_tab" => self.add_tab(),
             "copy" => {
                 if let Some(text) = self.tabs.get(self.active).and_then(|t| t.selected_text()) {
-                    clipboard::set(clipboard::Kind::Clipboard, &text);
+                    self.copy_text(clipboard::Kind::Clipboard, text);
                 }
             },
             "paste" => {
-                if let Some(text) = clipboard::get(clipboard::Kind::Clipboard) {
-                    if let Some(tab) = self.tabs.get(self.active) {
-                        tab.paste(&text);
-                    }
+                self.request_paste(clipboard::Kind::Clipboard);
+            },
+            "paste_primary" => self.request_paste(clipboard::Kind::Primary),
+            "scroll_page_up" | "scroll_page_down" | "scroll_bottom" => {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    use alacritty_terminal::grid::Scroll;
+                    tab.scroll(match action { "scroll_page_up" => Scroll::PageUp, "scroll_page_down" => Scroll::PageDown, _ => Scroll::Bottom });
                 }
             },
             "close_tab" => self.close_tab_at(self.active, event_loop),
@@ -1934,7 +1981,7 @@ impl App {
             "goto_tab_0" | "goto_tab_1" | "goto_tab_2" | "goto_tab_3" | "goto_tab_4"
             | "goto_tab_5" | "goto_tab_6" | "goto_tab_7" | "goto_tab_8" | "goto_tab_9" => {
                 let i = action.chars().last().unwrap().to_digit(10).unwrap() as usize;
-                let target = if i == 0 { n.saturating_sub(1) } else { i - 1 };
+                let target = i;
                 if target < n {
                     self.active = target;
                 }
@@ -2653,6 +2700,13 @@ impl ApplicationHandler for App {
                 }
             }
             self.init_gpu(event_loop, &window);
+            let weak = Arc::downgrade(&window);
+            match clipboard::Clipboard::new(clipboard::Backend::for_window(&window), move || {
+                if let Some(w) = weak.upgrade() { w.request_redraw(); }
+            }) {
+                Ok(clipboard) => self.clipboard = Some(clipboard),
+                Err(e) => self.clipboard_error(format!("Clipboard unavailable: {e}")),
+            }
             *self.window_slot.lock().unwrap() = Some(Arc::clone(&window));
             self.window = Some(window);
             self.sync_term_size();
@@ -2664,6 +2718,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.drain_clipboard();
         self.drain_test_keys(event_loop);
     }
 
@@ -2676,6 +2731,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             },
             WindowEvent::RedrawRequested => {
+                self.drain_clipboard();
                 self.drain_test_keys(event_loop);
                 // Open the Alt-held switcher if the clock asked and Alt is
                 // still held (guards against the press/release race).
@@ -2744,8 +2800,8 @@ impl ApplicationHandler for App {
                 // pixel step would spend a frame per mouse sample.
                 if self.drag.is_some() {
                     if let Some((pt, side)) = self.cell_at(px, py) {
-                        if self.drag != Some(pt) {
-                            self.drag = Some(pt);
+                        if self.drag != Some((pt, side)) {
+                            self.drag = Some((pt, side));
                             if let Some(tab) = self.tabs.get_mut(self.active) {
                                 tab.update_selection(pt, side);
                             }
@@ -2759,18 +2815,19 @@ impl ApplicationHandler for App {
                 if button == MouseButton::Middle {
                     // Middle click pastes the primary selection -- the X11
                     // convention the original gets free from VTE.
-                    if let Some(text) = clipboard::get(clipboard::Kind::Primary) {
-                        if let Some(tab) = self.tabs.get(self.active) {
-                            tab.paste(&text);
-                        }
-                    }
+                    if self.cell_at(at.0, at.1).is_some() { self.request_paste(clipboard::Kind::Primary); }
                 } else if button == MouseButton::Left {
                     if self.hover_tab < self.tabs.len() {
+                        self.drag = None;
+                        self.tabs[self.active].clear_selection();
+                        window.request_redraw();
                         if self.hover_tab != self.active {
                             self.active = self.hover_tab;
                             window.request_redraw();
                         }
                     } else if self.hover_add {
+                        self.drag = None;
+                        if let Some(tab) = self.tabs.get_mut(self.active) { tab.clear_selection(); }
                         self.add_tab();
                         window.request_redraw();
                     } else if let Some((pt, side)) = self.cell_at(at.0, at.1) {
@@ -2779,6 +2836,7 @@ impl ApplicationHandler for App {
                         // counted by hand.
                         let count = self.count_click(0, at);
                         let ty = match count {
+                            _ if self.modifiers.alt_key() => SelectionType::Block,
                             3 => SelectionType::Lines,
                             2 => SelectionType::Semantic,
                             _ => SelectionType::Simple,
@@ -2786,7 +2844,7 @@ impl ApplicationHandler for App {
                         if let Some(tab) = self.tabs.get_mut(self.active) {
                             tab.begin_selection(pt, side, ty);
                         }
-                        self.drag = Some(pt);
+                        self.drag = Some((pt, side));
                         window.request_redraw();
                     }
                 }
@@ -2802,8 +2860,27 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
-                if key.state == ElementState::Pressed && !key.repeat {
-                    self.handle_key(&key.logical_key, event_loop);
+                if key.state == ElementState::Pressed {
+                    let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
+                    let repeatable = action.as_deref().is_none_or(|action| matches!(action,
+                        "prev_tab" | "next_tab" | "prev_tab_row" | "next_tab_row" |
+                        "scroll_page_up" | "scroll_page_down" | "enlarge_font" | "shrink_font"));
+                    if !key.repeat || repeatable { self.handle_key(&key.logical_key, event_loop); }
+                }
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.cell_at(self.pointer.0, self.pointer.1).is_some() {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
+                        MouseScrollDelta::PixelDelta(p) => {
+                            self.wheel_pixels += p.y as f32;
+                            let lines = (self.wheel_pixels / self.cell_h) as i32;
+                            self.wheel_pixels -= lines as f32 * self.cell_h;
+                            lines
+                        }
+                    };
+                    if let Some(tab) = self.tabs.get(self.active) { tab.scroll(alacritty_terminal::grid::Scroll::Delta(lines)); }
+                    window.request_redraw();
                 }
             },
             WindowEvent::ModifiersChanged(m) => {
@@ -2981,6 +3058,7 @@ mod preview_tests {
             fg: [1.0, 1.0, 1.0],
             bg: [0.0, 0.0, 0.0],
             text: text.into(),
+            cells: text.char_indices().enumerate().map(|(col, (byte, _))| (byte, col as u32)).collect(),
             attrs: Box::leak(Box::new(Attrs::new())),
         }
     }
@@ -3025,4 +3103,3 @@ mod preview_tests {
         assert_eq!(again, frame_sig(&fd, 7.0), "same input, same signature");
     }
 }
-            cells: text.char_indices().enumerate().map(|(col, (byte, _))| (byte, col as u32)).collect(),

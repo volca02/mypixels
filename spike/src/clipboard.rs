@@ -1,25 +1,24 @@
-//! Clipboard and primary selection.
-//!
-//! winit 0.30 exposes neither, so text moves through the same helpers the rest
-//! of the desktop uses: `wl-copy`/`wl-paste` on Wayland, `xsel` on X11. Those
-//! tools speak the primary-selection protocol too, which is the part that is
-//! genuinely awkward to do in process -- it needs a second protocol device and a
-//! seat handshake inside the compositor event loop that winit owns. `wl-copy`
-//! also keeps owning the selection after the writer exits, which is what makes a
-//! drag-and-let-go primary selection work at all.
-//!
-//! A future in-process client can replace this module without touching callers.
+//! Clipboard work never runs on the window thread. Native Wayland ownership
+//! lives on one worker; X11 and desktops without data-control use bounded helper
+//! transfers. Clipboard contents never appear in logs.
+mod native;
+mod transfer;
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Command as Process, Stdio};
+use std::sync::{Arc, mpsc};
+use std::time::Instant;
 
-/// Which X11-style selection buffer. Two buffers is the point: VTE (and every
-/// terminal built on GTK) fills the primary one just by selecting text, and
-/// middle click pastes from it, while Ctrl+Shift+C/V move the clipboard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Clipboard,
     Primary,
+}
+impl Kind {
+    fn index(self) -> usize {
+        if self == Self::Clipboard { 0 } else { 1 }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,149 +27,346 @@ pub enum Backend {
     X11,
     None,
 }
-
-/// Wayland wins when both exist: an X11 client under XWayland has a primary
-/// selection that is invisible to Wayland-native clients, and this app runs
-/// natively on Wayland whenever it can.
-pub fn backend() -> Backend {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        Backend::Wayland
-    } else if std::env::var_os("DISPLAY").is_some() {
-        Backend::X11
-    } else {
-        Backend::None
+impl Backend {
+    pub fn for_window(window: &winit::window::Window) -> Self {
+        use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        match window.display_handle().map(|h| h.as_raw()) {
+            Ok(RawDisplayHandle::Wayland(_)) => Self::Wayland,
+            Ok(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_)) => Self::X11,
+            _ => Self::None,
+        }
     }
 }
 
-/// The command for a backend and buffer, and whether it writes or reads. Pure,
-/// so the mapping is testable without a display server.
-pub fn argv(be: Backend, kind: Kind, write: bool) -> Option<Vec<&'static str>> {
-    let primary = matches!(kind, Kind::Primary);
-    match (be, write) {
+pub enum Event {
+    Paste {
+        target: usize,
+        result: Result<String, String>,
+    },
+    Error(String),
+}
+enum Command {
+    Set(Kind, Arc<str>),
+    Get(Kind, usize),
+}
+
+#[derive(Clone)]
+struct Reply {
+    tx: mpsc::Sender<Event>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+impl Reply {
+    fn send(&self, event: Event) {
+        if self.tx.send(event).is_ok() {
+            (self.wake)();
+        }
+    }
+}
+
+pub struct Clipboard {
+    tx: mpsc::SyncSender<Command>,
+    wake: UnixStream,
+    events: mpsc::Receiver<Event>,
+}
+impl Clipboard {
+    pub fn new(backend: Backend, wake_ui: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(32);
+        let (events_tx, events) = mpsc::channel();
+        let (wake, mut reader) = UnixStream::pair()?;
+        wake.set_nonblocking(true)?;
+        reader.set_nonblocking(true)?;
+        let reply = Reply {
+            tx: events_tx,
+            wake: Arc::new(wake_ui),
+        };
+        std::thread::Builder::new()
+            .name("clipboard".into())
+            .spawn(move || {
+                let mut native = if backend == Backend::Wayland {
+                    native::Native::new(reply.clone())
+                        .map_err(|e| {
+                            log::info!("native clipboard unavailable ({e}); using wl-clipboard");
+                        })
+                        .ok()
+                } else {
+                    None
+                };
+                loop {
+                    if let Some(client) = &mut native {
+                        if let Err(e) = client.dispatch() {
+                            log::warn!("clipboard connection lost: {e}");
+                            native = None;
+                            continue;
+                        }
+                        // Drain wake bytes before commands: an enqueue racing with
+                        // this drain is either consumed below or leaves a wake byte.
+                        let mut buf = [0; 128];
+                        while reader.read(&mut buf).is_ok_and(|n| n > 0) {}
+                        loop {
+                            match rx.try_recv() {
+                                Ok(cmd) => {
+                                    if let Err(cmd) = client.command(cmd) {
+                                        helper(backend, cmd, &reply);
+                                    }
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => return,
+                            }
+                        }
+                        if let Err(e) = client.wait(&reader) {
+                            log::warn!("clipboard connection lost: {e}");
+                            native = None;
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(cmd) => helper(backend, cmd, &reply),
+                            Err(_) => return,
+                        }
+                    }
+                }
+            })?;
+        Ok(Self { tx, wake, events })
+    }
+
+    fn send(&self, command: Command) -> Result<(), String> {
+        self.tx.try_send(command).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => "Clipboard busy; try again".to_string(),
+            mpsc::TrySendError::Disconnected(_) => "Clipboard unavailable".to_string(),
+        })?;
+        let _ = (&self.wake).write(&[1]); // WouldBlock means it is already awake.
+        Ok(())
+    }
+
+    pub fn set(&self, kind: Kind, text: String) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if text.len() > transfer::MAX_BYTES {
+            return Err("Selection exceeds the 16 MiB clipboard limit".into());
+        }
+        self.send(Command::Set(kind, text.into()))
+    }
+    pub fn paste(&self, kind: Kind, target: usize) -> Result<(), String> {
+        self.send(Command::Get(kind, target))
+    }
+    pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
+        self.events.try_iter()
+    }
+}
+
+fn argv(backend: Backend, kind: Kind, write: bool) -> Option<Vec<&'static str>> {
+    let primary = kind == Kind::Primary;
+    match (backend, write) {
         (Backend::None, _) => None,
         (Backend::Wayland, true) => {
-            let mut v = vec!["wl-copy"];
+            let mut args = vec!["wl-copy", "--type", "text/plain;charset=utf-8"];
             if primary {
-                v.push("--primary");
+                args.push("--primary");
             }
-            Some(v)
+            Some(args)
         }
         (Backend::Wayland, false) => {
-            let mut v = vec!["wl-paste", "--no-newline"];
+            let mut args = vec!["wl-paste", "--no-newline", "--type", "text"];
             if primary {
-                v.push("--primary");
+                args.push("--primary");
             }
-            Some(v)
+            Some(args)
         }
-        (Backend::X11, true) => Some(vec!["xsel", if primary { "-p" } else { "-b" }, "-i"]),
-        (Backend::X11, false) => Some(vec!["xsel", if primary { "-p" } else { "-b" }, "-o"]),
+        (Backend::X11, write) => Some(vec![
+            "xsel",
+            if primary { "-p" } else { "-b" },
+            if write { "-i" } else { "-o" },
+        ]),
     }
 }
 
-/// Publish text. Never blocks the caller: the selection owner may not read the
-/// pipe until someone asks for it, and the UI thread cannot wait on that.
-pub fn set(kind: Kind, text: &str) {
-    if text.is_empty() {
-        return;
+struct Helper(Child);
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    let Some(argv) = argv(backend(), kind, true) else {
-        log::debug!("no clipboard backend; ignoring copy");
-        return;
-    };
-    let text = text.to_string();
-    let spawned = Command::new(argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+}
+
+fn execute(backend: Backend, kind: Kind, text: Option<&str>) -> Result<String, String> {
+    let args =
+        argv(backend, kind, text.is_some()).ok_or("Clipboard unavailable on this display")?;
+    let deadline = Instant::now() + transfer::TIMEOUT;
+    let child = Process::new(args[0])
+        .args(&args[1..])
+        .stdin(if text.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if text.is_none() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null())
-        .spawn();
-    match spawned {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
-                    let _ = stdin.flush();
-                }
-                // Reap it. `wl-copy` forks a watcher and exits, so this returns
-                // quickly; xsel holds the selection until it loses ownership.
-                let _ = child.wait();
-            });
+        .spawn()
+        .map_err(|e| {
+            log::warn!("{} failed: {e}", args[0]);
+            if e.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "Clipboard unavailable: install {}",
+                    if backend == Backend::Wayland {
+                        "wl-clipboard"
+                    } else {
+                        "xsel"
+                    }
+                )
+            } else {
+                "Could not start clipboard helper".into()
+            }
+        })?;
+    let mut child = Helper(child);
+    let result = if let Some(text) = text {
+        transfer::write(child.0.stdin.take().unwrap(), text.as_bytes(), deadline)
+            .map(|()| String::new())
+    } else {
+        transfer::read(child.0.stdout.take().unwrap(), deadline)
+    }
+    .map_err(|e| e.to_string())?;
+    loop {
+        match child.0.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => return Ok(result),
+            Some(status) => return Err(format!("Clipboard helper exited with {status}")),
+            None if Instant::now() >= deadline => return Err("Clipboard transfer timed out".into()),
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
-        Err(e) => log::warn!("{} failed to start: {e}", argv[0]),
     }
 }
 
-/// Paste-safe text. Some tools end lines with `\r\n`, and feeding that to a
-/// shell runs the line and then rings the bell.
-fn clean(raw: &[u8]) -> String {
-    String::from_utf8_lossy(raw).replace('\r', "")
-}
-
-/// Read text back, blocking the caller for a few milliseconds. Only used on a
-/// paste keypress or a middle click, where that is exactly what a terminal does.
-pub fn get(kind: Kind) -> Option<String> {
-    let argv = argv(backend(), kind, false)?;
-    match Command::new(argv[0]).args(&argv[1..]).stderr(Stdio::null()).output() {
-        Ok(out) if out.status.success() => Some(clean(&out.stdout)),
-        Ok(out) => {
-            log::debug!("{} exited with {}", argv[0], out.status);
-            None
+fn helper(backend: Backend, command: Command, reply: &Reply) {
+    match command {
+        Command::Set(kind, text) => {
+            if let Err(e) = execute(backend, kind, Some(&text)) {
+                reply.send(Event::Error(e));
+            }
         }
-        Err(e) => {
-            log::warn!("{} failed to start: {e}", argv[0]);
-            None
-        }
+        Command::Get(kind, target) => reply.send(Event::Paste {
+            target,
+            result: execute(backend, kind, None),
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn primary_and_clipboard_are_different_targets() {
-        assert_ne!(
-            argv(Backend::Wayland, Kind::Clipboard, true),
-            argv(Backend::Wayland, Kind::Primary, true)
-        );
-        assert_ne!(
-            argv(Backend::X11, Kind::Clipboard, true),
-            argv(Backend::X11, Kind::Primary, true)
-        );
-    }
-
-    #[test]
-    fn wayland_uses_the_primary_protocol_flag() {
-        assert_eq!(
-            argv(Backend::Wayland, Kind::Primary, true),
-            Some(vec!["wl-copy", "--primary"])
-        );
-        assert_eq!(
-            argv(Backend::Wayland, Kind::Primary, false),
-            Some(vec!["wl-paste", "--no-newline", "--primary"])
-        );
-        // No stray empty argument on the clipboard path.
-        assert_eq!(argv(Backend::Wayland, Kind::Clipboard, true), Some(vec!["wl-copy"]));
-    }
-
-    #[test]
-    fn x11_uses_the_selection_flags() {
-        assert_eq!(argv(Backend::X11, Kind::Primary, true), Some(vec!["xsel", "-p", "-i"]));
-        assert_eq!(argv(Backend::X11, Kind::Clipboard, false), Some(vec!["xsel", "-b", "-o"]));
-    }
-
-    #[test]
-    fn no_display_server_means_no_command() {
-        for kind in [Kind::Clipboard, Kind::Primary] {
-            for write in [true, false] {
-                assert_eq!(argv(Backend::None, kind, write), None);
+    fn compatibility_paths_keep_the_buffers_separate() {
+        for backend in [Backend::Wayland, Backend::X11] {
+            for write in [false, true] {
+                assert_ne!(
+                    argv(backend, Kind::Primary, write),
+                    argv(backend, Kind::Clipboard, write)
+                );
             }
         }
+        assert_eq!(argv(Backend::None, Kind::Clipboard, false), None);
+    }
+    #[test]
+    fn unavailable_clipboard_returns_an_asynchronous_error() {
+        let clipboard = Clipboard::new(Backend::None, || {}).unwrap();
+        clipboard.paste(Kind::Clipboard, 42).unwrap();
+        let Event::Paste { target, result } = clipboard
+            .events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(target, 42);
+        assert!(result.is_err());
     }
 
+    /// Run only under a disposable compositor. This changes that display's
+    /// clipboard and verifies against independent wl-copy/wl-paste clients.
     #[test]
-    fn reading_strips_the_carriage_returns_paste_machinery_adds() {
-        assert_eq!(clean(b"a\r\nb\r"), "a\nb");
-        assert_eq!(clean(b"plain"), "plain");
+    #[ignore = "requires an isolated Wayland compositor and wl-clipboard"]
+    fn wayland_interoperability() {
+        assert_eq!(
+            std::env::var("MYPIXELS_ISOLATED_CLIPBOARD_TEST").as_deref(),
+            Ok("1")
+        );
+        let (tx, _rx) = mpsc::channel();
+        let native = native::Native::new(Reply {
+            tx,
+            wake: Arc::new(|| {}),
+        })
+        .expect("native data-control required");
+        drop(native);
+        let clipboard = Clipboard::new(Backend::Wayland, || {}).unwrap();
+        let text = "žluťoučký 🦀\nsecond line\n";
+        clipboard.set(Kind::Clipboard, text.into()).unwrap();
+        clipboard
+            .set(Kind::Primary, "different primary".into())
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if execute(Backend::Wayland, Kind::Primary, None).as_deref() == Ok("different primary")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native copy never became available"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            execute(Backend::Wayland, Kind::Clipboard, None).unwrap(),
+            text
+        );
+        clipboard.paste(Kind::Clipboard, 42).unwrap();
+        match clipboard
+            .events
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+        {
+            Event::Paste { target, result } => {
+                assert_eq!(target, 42);
+                assert_eq!(result.unwrap(), text);
+            }
+            Event::Error(e) => panic!("{e}"),
+        }
+        let external = "external text\r\nincluding CRLF\n";
+        execute(Backend::Wayland, Kind::Clipboard, Some(external)).unwrap();
+        clipboard.paste(Kind::Clipboard, 43).unwrap();
+        match clipboard
+            .events
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+        {
+            Event::Paste { target, result } => {
+                assert_eq!(target, 43);
+                assert_eq!(result.unwrap(), external);
+            }
+            Event::Error(e) => panic!("{e}"),
+        }
+        assert_eq!(
+            execute(Backend::Wayland, Kind::Primary, None).unwrap(),
+            "different primary"
+        );
+        for i in 0..16 {
+            clipboard
+                .set(Kind::Clipboard, format!("replacement {i}"))
+                .unwrap();
+        }
+        clipboard.paste(Kind::Clipboard, 44).unwrap();
+        match clipboard
+            .events
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+        {
+            Event::Paste { target, result } => {
+                assert_eq!(target, 44);
+                assert_eq!(result.unwrap(), "replacement 15");
+            }
+            Event::Error(e) => panic!("{e}"),
+        }
     }
 }

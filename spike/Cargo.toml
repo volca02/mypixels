@@ -19,6 +19,9 @@ arc-swap = "1"
 # we implement the very same trait cosmic-text calls.
 unicode-script = "0.5"
 libc = "0.2"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 
 [profile.release]
 # Terminal emulator: throughput matters, and the default release profile leaves
@@ -29,8 +32,8 @@ strip = true
 debug = false
 
 # --- patched dependency -------------------------------------------------------
-# The only change is one extra entry in the raster source list of
-# vendor/cosmic-text/src/swash.rs: swash's `Source::Bitmap`, which makes a
+# Local changes: mutable completed line layouts for terminal cell placement,
+# and one extra entry in the raster source list of vendor/cosmic-text/src/swash.rs: swash's `Source::Bitmap`, which makes a
 # font's embedded alpha bitmap strikes (EBLC/EBDT) usable. Upstream omits it, so
 # a bitmap terminal font such as Terminus is drawn as an unhinted outline and
 # looks blurry. The vendored copy is trimmed of tests/docs otherwise.

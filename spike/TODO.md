@@ -57,8 +57,8 @@ their notes: the causes were rarely where the symptom pointed.
 - [ ] Terminal cell height is 14px where VTE measures 15. skrifa exposes hhea
       metrics; Pango uses OS/2 win metrics. One row per ~15 rows of density.
 - [ ] Search panel (deprioritised).
-- [ ] Scrollback view, selection, IME, copy/paste -- the spike is still not a full
-      terminal.
+- [x] Scrollback view, selection, and copy/paste. Mouse wheel, Shift+PageUp/Down,
+      and Ctrl+Shift+End; terminal-owned selection tracks output. IME is still open.
 
 ## Notes
 
@@ -164,54 +164,33 @@ paste, `Ctrl+Shift+C` / `Ctrl+Shift+v` for the clipboard. Selecting text fills t
 
 Still open:
 
-- The selection is limited to the visible viewport. There is no scrollback to
-  scroll into yet; when it lands, `Selection::rotate` is what keeps a selection
-  anchored to its text as the view moves.
-- `Selection::is_empty` covers the click-without-drag case, but a click in the tab
-  strip leaves a terminal selection standing. VTE clears it.
-- The wash colour is a constant (Adwaita's selection blue at 0.35). It should be a
-  `selection_color` config option, since the original inherits its theme's.
-- Text moves through `wl-copy`/`wl-paste` and `xsel` rather than in process,
-  because winit 0.30 has no clipboard and the primary-selection protocol needs a
-  device plus a seat handshake inside the event loop winit owns. See
-  `src/clipboard.rs`; swapping in a protocol client changes only that file.
+Completed in the clipboard pass: scrollback selection; terminal-owned selection
+rotation; clearing on a tab-strip click; configurable `selection_color`; single-cell
+and rectangular copies; whole-line copies including their final newline.
 
-## Clipboard: replace the helper tools with wlr-data-control (open)
+Still open: selection autoscroll when dragging outside the viewport, and keyboard
+selection. Alt+drag already makes a rectangular selection.
 
-`src/clipboard.rs` forks `wl-copy`/`wl-paste` (Wayland) and `xsel` (X11). That
-works, and it is the wrong shape: a process per selection change, nothing at all
-happens if the binary is missing, and a paste waits on whoever owns the buffer
-instead of on us. In process is the right answer and it needs no new dependency:
-`wayland-client` 0.31.15 and `wayland-protocols-wlr` 0.3.12 are already in the
-tree via winit.
+## Clipboard (done)
 
-The protocol to speak, pinned from
-`wlr-protocols/unstable/wlr-data-control-unstable-v1.xml` in the crate source:
+- Native Wayland ownership on a private worker connection: prefer ext-data-control,
+  fall back to wlr-data-control, then wl-clipboard when neither is advertised.
+  X11 retains xsel. The backend comes from the actual window, not environment guesses.
+- Copy and paste never wait on the UI thread. Transfers have a two-second deadline,
+  a 16 MiB limit, bounded queues and bounded writer threads. Failed helpers are
+  killed/reaped; failures appear briefly in the terminal rather than disappearing.
+- Paste remembers the requesting tab's stable ID. Closing/reordering/switching tabs
+  cannot redirect a delayed paste. Clipboard and primary remain independent.
+- UTF-8 and trailing newlines survive transport. PTY paste normalizes CRLF/lone CR,
+  uses CR for plain Enter, and protects bracketed paste from embedded ESC/ETX.
+- Real Ctrl+Shift+C/V work with winit's uppercase shifted keys; Shift+Insert pastes
+  primary. Default tab-strip visibility moved to Ctrl+Alt+V to avoid the paste clash.
+  Legacy explicit bindings are still loaded.
+- Verified in isolated Sway against independent wl-copy/wl-paste clients, and in
+  Xvfb with real xdotool keyboard/mouse events and xsel. Single-character, word,
+  line/newline, primary middle-click, Unicode bracketed paste, and history selection
+  were exercised through the window.
 
-- `zwlr_data_control_manager_v1`: `create_data_source`, `get_data_device(seat)`.
-- `zwlr_data_control_device_v1`: requests `set_selection(source)` and, since
-  version 2, `set_primary_selection(source)`; events `data_offer(id)`,
-  `selection`, `primary_selection`, `finished`.
-- `zwlr_data_control_source_v1`: request `offer(mime_type)`; events
-  `send(mime_type, fd)` (fill that pipe with our text) and `cancelled` (drop it).
-- `zwlr_data_control_offer_v1`: request `receive(mime_type, fd)`; event
-  `offer(mime_type)`. `data_offer` arrives *before* the `selection` or
-  `primary_selection` event that says which buffer it belongs to, so offers have
-  to be held unattributed until that arrives.
-
-Why a private connection is legitimate here: wlr-data-control asks for no pointer
-serial to take ownership. The spec `wl_data_device` protocol does ask for the
-serial of a user event delivered on the same connection, and a connection with no
-surfaces never gets pointer focus -- which is why the helper binaries need their
-`--foreground` dance at all. Compositors without this protocol (GNOME, Weston)
-keep the fallback path.
-
-Shape worth keeping from the draft: one worker thread owning the connection and an
-`EventQueue`, the UI thread posting over a `sync_channel` and waking the queue with
-`EventQueueHandle::wake()`; reads return the read end of a pipe so the caller sets
-its own deadline rather than blocking on a stranger's client.
-
-Verification: `weston` is installed here, and Weston does *not* implement
-wlr-data-control, so a headless Weston run proves the fallback and the global
-enumeration but not the happy path. The happy path needs a wlroots compositor;
-running the user's own niri session is not an option for tests.
+Compatibility limits: X11 still needs xsel; Wayland desktops without data-control
+need wl-clipboard. Native clipboard persistence after the app exits depends on a
+clipboard manager. IME and terminal mouse reporting remain separate parity work.

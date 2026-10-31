@@ -82,6 +82,7 @@ pub struct Config {
     // terminal
     pub foreground_color: Rgb,
     pub background_color: Rgb,
+    pub selection_color: Rgb,
     /// 16-color palette (None = alacritty defaults). Terminal runtime OSC 4
     /// changes override these per color.
     pub palette: Option<[Rgb; 16]>,
@@ -141,9 +142,13 @@ impl Default for Config {
         // text feeds the *primary* buffer separately and needs no key.
         bind("copy", &["CONTROL+SHIFT+c"]);
         bind("paste", &["CONTROL+SHIFT+v"]);
+        bind("paste_primary", &["SHIFT+Insert"]);
+        bind("scroll_page_up", &["SHIFT+Page_Up"]);
+        bind("scroll_page_down", &["SHIFT+Page_Down"]);
+        bind("scroll_bottom", &["CONTROL+SHIFT+End"]);
         bind("shrink_font", &["MOD1+SHIFT+KP_Subtract"]);
         bind("enlarge_font", &["MOD1+SHIFT+KP_Add"]);
-        bind("toggle_hide_tabs", &["CONTROL+SHIFT+v"]);
+        bind("toggle_hide_tabs", &["CONTROL+ALT+v"]);
         bind("prev_color", &["MOD1+SHIFT+braceleft"]);
         bind("next_color", &["MOD1+SHIFT+braceright"]);
         bind("toggle_entangle", &["MOD1+SHIFT+KP_Multiply"]);
@@ -185,6 +190,7 @@ impl Default for Config {
             tab_shorten_str: "\u{2026}".to_string(),
             foreground_color: parse_hex("#bbbbbb"),
             background_color: parse_hex("#000000"),
+            selection_color: parse_hex("#3584e4"),
             palette: None,
             term_font: "Terminus 8".to_string(),
             tablist_font: "Liberation Mono 7".to_string(),
@@ -333,6 +339,7 @@ fn dedupe_top_level(text: &str) -> String {
                 "add_button_color" => set_rgb(&mut cfg.add_button_color, val),
                 "foreground_color" => set_rgb(&mut cfg.foreground_color, val),
                 "background_color" => set_rgb(&mut cfg.background_color, val),
+                "selection_color" => set_rgb(&mut cfg.selection_color, val),
                 "bg_tint_color" => set_rgb(&mut cfg.bg_tint_color, val),
                 key if key.starts_with("col_") && key.len() == 5 => {
                     let i = (key.as_bytes()[4] as u8 - b'0') as usize;
@@ -613,7 +620,11 @@ impl Binding {
         }
         match &self.key {
             BoundKey::Named(n) => matches!(key, Key::Named(k) if k == n),
-            BoundKey::Char(c) => matches!(key, Key::Character(k) if k == c),
+            // winit reports Shift+C as "C", while legacy GTK binding files
+            // spell CONTROL+SHIFT+c. Caps Lock must not break shortcuts either.
+            BoundKey::Char(c) => matches!(key, Key::Character(k) if k == c ||
+                (self.mods.intersects(ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT)
+                    && k.eq_ignore_ascii_case(c))),
         }
     }
 
@@ -645,6 +656,14 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
 mod tests {
     use super::*;
     use winit::keyboard::ModifiersState as M;
+
+    #[test]
+    fn clipboard_shortcuts_accept_the_shifted_keys_winit_reports() {
+        let cfg = Config::default();
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("C".into()), M::CONTROL | M::SHIFT, false).as_deref(), Some("copy"));
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("V".into()), M::CONTROL | M::SHIFT, false).as_deref(), Some("paste"));
+        assert_eq!(find_action(&cfg.bindings, &Key::Named(NamedKey::Insert), M::SHIFT, false).as_deref(), Some("paste_primary"));
+    }
 
     #[test]
     fn rgb_parse_forms() {

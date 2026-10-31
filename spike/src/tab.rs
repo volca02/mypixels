@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
@@ -92,9 +92,6 @@ pub struct Tab {
     pub entangled: bool,
     /// User rename (None = use terminal title)
     pub name: Option<String>,
-    /// Mouse selection, in grid coordinates, the way alacritty stores it. Kept
-    /// per tab because a selection belongs to the text it was made in.
-    pub selection: Option<Selection>,
 }
 
 impl Tab {
@@ -154,7 +151,6 @@ impl Tab {
             group: 8,
             entangled: false,
             name: None,
-            selection: None,
         }
     }
 
@@ -171,35 +167,24 @@ impl Tab {
             // what `to_range` needs to see the whole word or row.
             sel.include_all();
         }
-        self.selection = Some(sel);
+        self.term.lock().selection = Some(sel);
     }
 
     /// Grow the selection to a cell while dragging.
     pub fn update_selection(&mut self, at: Point, side: Side) {
-        if let Some(sel) = self.selection.as_mut() {
+        if let Some(sel) = self.term.lock().selection.as_mut() {
             sel.update(at, side);
         }
     }
 
     pub fn clear_selection(&mut self) {
-        self.selection = None;
+        self.term.lock().selection = None;
     }
 
     /// The text under the selection, or None if nothing is really selected.
     pub fn selected_text(&self) -> Option<String> {
-        let sel = self.selection.as_ref()?;
         let term = self.term.lock();
-        let range = sel.to_range(&term)?;
-        if range.start == range.end {
-            return None;
-        }
-        let mut text = term.bounds_to_string(range.start, range.end);
-        if sel.ty == SelectionType::Semantic {
-            // A semantic expansion swallows the space in front of the word --
-            // alacritty groups whitespace with what follows it. A double-click
-            // should hand over the word, which is what every other terminal does.
-            text = text.trim().to_string();
-        }
+        let text = term.selection_to_string()?;
         (!text.is_empty()).then_some(text)
     }
 
@@ -209,7 +194,8 @@ impl Tab {
     /// that is negative -- so the scroll offset comes off here.
     pub fn selection_rows(&self) -> Vec<(usize, usize, usize)> {
         let mut out = Vec::new();
-        let Some(sel) = self.selection.as_ref() else {
+        let term = self.term.lock();
+        let Some(sel) = term.selection.as_ref() else {
             return out;
         };
         // A click with no drag is an empty selection, not a one-cell one: it must
@@ -217,7 +203,6 @@ impl Tab {
         if sel.is_empty() {
             return out;
         }
-        let term = self.term.lock();
         let Some(range) = sel.to_range(&term) else {
             return out;
         };
@@ -251,16 +236,17 @@ impl Tab {
         if text.is_empty() {
             return;
         }
-        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        let mut bytes = Vec::new();
-        if bracketed {
-            bytes.extend_from_slice(b"\x1b[200~");
-        }
-        bytes.extend_from_slice(text.as_bytes());
-        if bracketed {
-            bytes.extend_from_slice(b"\x1b[201~");
-        }
+        let mut term = self.term.lock();
+        let bracketed = term.mode().contains(TermMode::BRACKETED_PASTE);
+        term.selection = None;
+        term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        drop(term);
+        let bytes = paste_bytes(text, bracketed);
         self.write(&bytes);
+    }
+
+    pub fn scroll(&self, scroll: alacritty_terminal::grid::Scroll) {
+        self.term.lock().scroll_display(scroll);
     }
 
     /// Tab label, matching the original's precedence: an explicit rename wins,
@@ -299,6 +285,31 @@ impl Tab {
         } else {
             Some(c.0.clone())
         }
+    }
+}
+
+/// Preserve newlines while normalizing foreign line endings. A plain PTY wants
+/// CR for Enter; bracketed paste wants LF. Embedded ESC/ETX cannot terminate a
+/// bracketed paste early and turn the remainder into shell keypresses.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = text.replace(['\x1b', '\x03'], "");
+    if bracketed { format!("\x1b[200~{text}\x1b[201~").into_bytes() }
+    else { text.replace('\n', "\r").into_bytes() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn paste_line_endings_match_the_terminal_mode() {
+        assert_eq!(paste_bytes("a\r\nb\rc\n", false), b"a\rb\rc\r");
+        assert_eq!(paste_bytes("a\r\nb\rc\n", true), b"\x1b[200~a\nb\nc\n\x1b[201~");
+    }
+    #[test]
+    fn clipboard_cannot_end_bracketed_paste_early() {
+        assert_eq!(paste_bytes("x\x1b[201~\x03echo bad", true), b"\x1b[200~x[201~echo bad\x1b[201~");
+        assert_eq!(paste_bytes("č 🦀\t", false), "č 🦀\t".as_bytes());
     }
 }
 

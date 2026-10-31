@@ -2257,6 +2257,9 @@ dependencies = [
  "portable-pty",
  "serde_yaml",
  "unicode-script",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "wgpu",
  "winit",
 ]
