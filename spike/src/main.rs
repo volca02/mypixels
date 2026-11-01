@@ -2251,6 +2251,10 @@ fn draw_overview(
 ) {
     let wf = w as f32;
     let hf = h as f32;
+    // The overlay rects draw through the "src over" alpha pipeline:
+    // straight colours in, the layer equation keeps the window's own alpha
+    // (a translucent rect darkens the live terminal beneath it instead of
+    // making the window more transparent).
     let push_rect =
         |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
             v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, 0.0, wf, hf));
@@ -2273,7 +2277,9 @@ fn draw_overview(
     // Dark backdrop over the whole window.
     // The live terminal is painted underneath now, so this is a dim rather than
     // a cover. The Alt-held switcher is a peek over running output, so it stays
-    // light enough to keep its live terminal context visible.
+    // light enough to keep its live terminal context visible. Drawn with the
+    // "src over" alpha blend: it darkens the terminal and, like a real
+    // translucent layer, only ever makes the window a touch *less* see-through.
     let dim = config.tab_overview_opacity.min(0.7);
     push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [background[0], background[1], background[2], dim]);
 

@@ -99,9 +99,49 @@ fn fs(@location(0) color: vec4<f32>,
 /// the split, the single text pass would paint terminal text over the opaque
 /// tiles -- and the shared glyph pool would let the tile headers clobber the
 /// terminal runs they alias.
+///
+/// The rects draw through `overlay_rect_pipeline`, whose "src over" alpha
+/// equation never drops the window's own alpha -- the dim darkens the
+/// terminal, it does not make the window more transparent.
 pub struct OverlayPhase<'a> {
     pub rects: Vec<RectVertex>,
     pub areas: Vec<TextArea<'a>>,
+}
+
+/// Stage `rects` into `buffer` (growing it if needed) and draw them through
+/// `pipeline`. Each call site owns its buffer: the base and the switcher
+/// phases must never share one, because both writes land at offset 0 and the
+/// draws only execute at the frame's single submit -- a shared buffer would
+/// make both draws read the last write.
+fn draw_rects(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pass: &mut wgpu::RenderPass<'_>,
+    buffer: &mut wgpu::Buffer,
+    pipeline: &wgpu::RenderPipeline,
+    rects: &[RectVertex],
+) {
+    if rects.is_empty() {
+        return;
+    }
+    // Stride must come from the type, not a literal: `RectVertex` grew
+    // when rounded corners landed, and a stale 24 here let 1024 vertices
+    // be written into a buffer holding 512.
+    let need = rects.len() * std::mem::size_of::<RectVertex>();
+    if need > buffer.size() as usize {
+        // 2x headroom, rounded up, so a busy overview does not
+        // reallocate on every frame.
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rects"),
+            size: ((need * 2) as u64).next_multiple_of(4096),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+    queue.write_buffer(buffer, 0, bytemuck::cast_slice(rects));
+    pass.set_pipeline(pipeline);
+    pass.set_vertex_buffer(0, buffer.slice(..));
+    pass.draw(0..rects.len() as u32, 0..1);
 }
 
 /// One offscreen terminal render, sampled into an overview tile.
@@ -180,11 +220,23 @@ pub struct Gpu {
     /// background is possible at all.
     pub alpha_ok: bool,
     pub rect_pipeline: wgpu::RenderPipeline,
+    /// Rect pipeline for the tab-switcher overlay phase: premultiplied
+    /// "src over" instead of the plain alpha blending (see init).
+    pub overlay_rect_pipeline: wgpu::RenderPipeline,
     pub rect_buffer: wgpu::Buffer,
+    /// Vertex storage for the switcher phase. Must not share `rect_buffer`
+    /// with the base phase: both phases write at offset 0 of their buffer and
+    /// both draws encode before the single frame submit, so a shared buffer
+    /// would make the base draw read the switcher's vertices (the base
+    /// background rect would be replaced by a double-drawn dim).
+    pub overlay_rect_buffer: wgpu::Buffer,
     pub viewport: Viewport,
     pub atlas: TextAtlas,
     pub swash_cache: SwashCache,
     pub text_renderer: TextRenderer,
+    /// Separate vertex storage: preparing overlay labels must not overwrite
+    /// terminal glyphs whose draw is encoded but has not been submitted yet.
+    overlay_text_renderer: TextRenderer,
     pub rects: Vec<RectVertex>,
     /// Pooled cosmic_text buffers for terminal runs (stable addresses).
     pub pool: Vec<Buffer>,
@@ -452,77 +504,116 @@ impl Gpu {
         let swash_cache = SwashCache::new();
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let overlay_text_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let mut viewport = Viewport::new(&device, &cache);
         viewport.update(&queue, Resolution { width, height });
 
-        let rect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rects"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor::default()),
-            ),
-            vertex: wgpu::VertexState {
-                module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rect.vs"),
-                    source: wgpu::ShaderSource::Wgsl(RECT_VS_WGSL.into()),
+        // One layout/shader, two blend states. The base rects use the plain
+        // SRC_ALPHA/ONE_MINUS_SRC_ALPHA blending the app was tuned against; the
+        // overlay rects are pushed premultiplied and need "src over" in
+        // premultiplied space (see below).
+        let make_rect_pipeline = |label: &str, blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor::default()),
+                ),
+                vertex: wgpu::VertexState {
+                    module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("rect.vs"),
+                        source: wgpu::ShaderSource::Wgsl(RECT_VS_WGSL.into()),
+                    }),
+                    compilation_options: Default::default(),
+                    entry_point: Some("vs"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<RectVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 8,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x4,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 24,
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 32,
+                                shader_location: 3,
+                                format: wgpu::VertexFormat::Float32x4,
+                            },
+                        ],
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("rect.fs"),
+                        source: wgpu::ShaderSource::Wgsl(RECT_FS_WGSL.into()),
+                    }),
+                    compilation_options: Default::default(),
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
                 }),
-                compilation_options: Default::default(),
-                entry_point: Some("vs"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<RectVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x4,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 24,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 32,
-                            shader_location: 3,
-                            format: wgpu::VertexFormat::Float32x4,
-                        },
-                    ],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rect.fs"),
-                    source: wgpu::ShaderSource::Wgsl(RECT_FS_WGSL.into()),
-                }),
-                compilation_options: Default::default(),
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let rect_pipeline = make_rect_pipeline("rects", Some(wgpu::BlendState::ALPHA_BLENDING));
+        // "src over" alpha for the overlay layer. The surface is
+        // premultiplied, and straight-colour rects over a premultiplied
+        // target composite correctly with the usual
+        // SRC_ALPHA/ONE_MINUS_SRC_ALPHA colour equation. The alpha channel
+        // must follow the layer equation `src_a + (1 - src_a) * dst_a` --
+        // i.e. factors (One, OneMinusSrcAlpha). Plain ALPHA_BLENDING would
+        // compute `src_a * src_a + (1 - src_a) * dst_a`: the layer's own
+        // alpha attenuated by itself, so the two transparencies (dim and
+        // terminal background) combined multiplicatively and the window
+        // came out *more* transparent than both -- exactly what the old
+        // switcher did. "Src over" only ever adds opacity, like a real
+        // translucent layer in a compositor.
+        let overlay_rect_pipeline = make_rect_pipeline(
+            "overlay rects",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    operation: wgpu::BlendOperation::Add,
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                },
+                alpha: wgpu::BlendComponent {
+                    operation: wgpu::BlendOperation::Add,
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                },
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let rect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rects"),
-            size: (1024 * std::mem::size_of::<RectVertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        );
+        let make_rect_buffer = |device: &wgpu::Device, label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (1024 * std::mem::size_of::<RectVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let rect_buffer = make_rect_buffer(&device, "rects");
+        let overlay_rect_buffer = make_rect_buffer(&device, "overlay rects");
 
         let pool: Vec<Buffer> = (0..MAX_RUNS)
             .map(|_| Buffer::new(font_system, Metrics::new(font_px, font_lh)))
@@ -541,11 +632,14 @@ impl Gpu {
             surface,
             config,
             rect_pipeline,
+            overlay_rect_pipeline,
             rect_buffer,
+            overlay_rect_buffer,
             viewport,
             atlas,
             swash_cache,
             text_renderer,
+            overlay_text_renderer,
             rects: Vec::with_capacity(1024),
             pool,
             slot_sig: vec![0u64; MAX_RUNS],
@@ -572,28 +666,27 @@ impl Gpu {
 
     /// Upload and draw one batch of rect vertices.
     fn draw_rects(&mut self, pass: &mut wgpu::RenderPass<'_>, rects: &[RectVertex]) {
-        if rects.is_empty() {
-            return;
-        }
-        // Stride must come from the type, not a literal: `RectVertex` grew
-        // when rounded corners landed, and a stale 24 here let 1024 vertices
-        // be written into a buffer holding 512.
-        let need = rects.len() * std::mem::size_of::<RectVertex>();
-        if need > self.rect_buffer.size() as usize {
-            self.rect_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rects"),
-                // 2x headroom, rounded up, so a busy overview does not
-                // reallocate on every frame.
-                size: ((need * 2) as u64).next_multiple_of(4096),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        self.queue
-            .write_buffer(&self.rect_buffer, 0, bytemuck::cast_slice(rects));
-        pass.set_pipeline(&self.rect_pipeline);
-        pass.set_vertex_buffer(0, self.rect_buffer.slice(..));
-        pass.draw(0..rects.len() as u32, 0..1);
+        let pipeline = self.rect_pipeline.clone();
+        draw_rects(
+            &self.device,
+            &self.queue,
+            pass,
+            &mut self.rect_buffer,
+            &pipeline,
+            rects,
+        );
+    }
+
+    fn draw_overlay_rects(&mut self, pass: &mut wgpu::RenderPass<'_>, rects: &[RectVertex]) {
+        let pipeline = self.overlay_rect_pipeline.clone();
+        draw_rects(
+            &self.device,
+            &self.queue,
+            pass,
+            &mut self.overlay_rect_buffer,
+            &pipeline,
+            rects,
+        );
     }
 
     /// Render one frame: all rects, then all text areas.
@@ -777,11 +870,15 @@ impl Gpu {
                                 mapped_at_creation: false,
                             });
                     }
-                    self.queue
-                        .write_buffer(&self.rect_buffer, 0, bytemuck::cast_slice(&job.rects));
-                    ppass.set_pipeline(&self.rect_pipeline);
-                    ppass.set_vertex_buffer(0, self.rect_buffer.slice(..));
-                    ppass.draw(0..job.rects.len() as u32, 0..1);
+                    let pipeline = self.rect_pipeline.clone();
+                    draw_rects(
+                        &self.device,
+                        &self.queue,
+                        &mut ppass,
+                        &mut self.rect_buffer,
+                        &pipeline,
+                        &job.rects,
+                    );
                 }
                 if size.0 > 0 && size.1 > 0 {
                     let area = glyphon::TextArea {
@@ -849,7 +946,9 @@ impl Gpu {
                 multiview_mask: None,
             });
 
-            // Phase 1: the base rects, then the live terminal text.
+            // Phase 1: the base rects, then the live terminal text. The
+            // pipelines are cloned out first: draw_rects mutably borrows
+            // `self`, which the &self pipeline fields are still borrowed from.
             let rects = std::mem::take(&mut self.rects);
             self.draw_rects(&mut pass, &rects);
             if !areas.is_empty() {
@@ -873,7 +972,7 @@ impl Gpu {
             // terminal text, the sampled thumbnails above the tiles, and the
             // tile text on top.
             if let Some(overlay) = overlay {
-                self.draw_rects(&mut pass, &overlay.rects);
+                self.draw_overlay_rects(&mut pass, &overlay.rects);
 
                 // Sampled tiles: after the rects, so each tile's own background
                 // is underneath, and before the text, so headers stay on top.
@@ -909,7 +1008,7 @@ impl Gpu {
                 }
 
                 if !overlay.areas.is_empty() {
-                    self.text_renderer
+                    self.overlay_text_renderer
                         .prepare(
                             &self.device,
                             &self.queue,
@@ -920,7 +1019,7 @@ impl Gpu {
                             &mut self.swash_cache,
                         )
                         .expect("prepare");
-                    self.text_renderer
+                    self.overlay_text_renderer
                         .render(&self.atlas, &self.viewport, &mut pass)
                         .expect("render");
                 }
@@ -934,4 +1033,5 @@ impl Gpu {
         self.queue.present(frame_tex);
         let _ = (w, h);
     }
+
 }
