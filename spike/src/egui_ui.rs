@@ -22,6 +22,9 @@ pub struct Egui {
     pub ui_state: UiState,
     /// The card the pointer clicked on the previous frame (one-shot).
     pub switcher_pick: Option<usize>,
+    /// The installed fonts the font popup can preview, from the app's own
+    /// font database (see `fonts::font_choices`).
+    pub font_choices: Vec<crate::fonts::FontChoice>,
 }
 
 /// One frame of egui output, ready for `Gpu::render_frame`: tessellated
@@ -43,13 +46,63 @@ pub struct ConfigEvents {
     pub revert: bool,
 }
 
-/// Ephemeral UI state that must survive across frames: in-progress text
-/// drafts. egui's TextEdit takes its `&mut String` as the source of truth
-/// (only the cursor lives in widget state), so a draft re-created per frame
-/// would lose every keystroke.
+/// Ephemeral UI state that must survive across frames.
 pub struct UiState {
-    pub term_font_draft: String,
-    pub tab_font_draft: String,
+    /// The open font popup, if any (at most one at a time).
+    pub font_popup: Option<FontPopup>,
+}
+
+/// The font selector popup, opened from one of the two font rows.
+pub struct FontPopup {
+    /// The row it belongs to; the chosen family is written there.
+    pub which: FontWhich,
+    /// egui's open flag; click-outside (or a pick) flips it to false.
+    pub open: bool,
+    /// The filter box contents, persisted per frame while open.
+    pub search: String,
+}
+
+/// Which font row a [`FontPopup`] belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FontWhich {
+    Term,
+    Tablist,
+}
+
+/// Serves the installed font files to egui's text layout, on first use.
+///
+/// The font popup previews families egui does not ship; this provider is
+/// where their bytes come from. `fonts_for_family` is asked once per family
+/// at layout time, so each previewed file is read exactly once per session
+/// and only when it is actually shown.
+struct FontPreviewProvider {
+    fonts: std::sync::Mutex<std::collections::HashMap<String, (std::path::PathBuf, u32)>>,
+}
+
+impl egui::FontProvider for FontPreviewProvider {
+    fn fonts_for_family(&self, family: &egui::FontFamily) -> Vec<egui::FontInsert> {
+        // Match ergonomics: `name` is a `&Arc<str>`.
+        let egui::FontFamily::Name(name) = family else {
+            return Vec::new();
+        };
+        let Some((path, face)) = self.fonts.lock().unwrap().remove(name.as_ref()) else {
+            return Vec::new();
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => vec![egui::FontInsert {
+                name: name.to_string(),
+                data: egui::FontData::from_blob(std::sync::Arc::new(bytes), face),
+                families: vec![egui::InsertFontFamily {
+                    family: egui::FontFamily::Name(std::sync::Arc::from(&**name)),
+                    priority: egui::FontPriority::Highest,
+                }],
+            }],
+            Err(err) => {
+                log::warn!("font preview: cannot read {path:?}: {err}");
+                Vec::new()
+            }
+        }
+    }
 }
 
 impl Egui {
@@ -59,9 +112,20 @@ impl Egui {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         scale: f32,
+        font_choices: Vec<crate::fonts::FontChoice>,
     ) -> Self {
         let ctx = Context::default();
         ctx.set_visuals(egui::Visuals::dark());
+        // The font popup previews any installed family; this provider hands
+        // the bytes over to egui's layout when a preview is first drawn.
+        ctx.add_font_provider(std::sync::Arc::new(FontPreviewProvider {
+            fonts: std::sync::Mutex::new(
+                font_choices
+                    .iter()
+                    .map(|c| (c.name.clone(), (c.path.clone(), c.face)))
+                    .collect(),
+            ),
+        }));
         let state = egui_winit::State::new(
             ctx.clone(),
             ViewportId::ROOT,
@@ -85,15 +149,12 @@ impl Egui {
         );
         // Warm the font atlas now. egui loads and rasterises its bundled
         // fonts lazily on the first pass that lays out text, which would
-        // hitch the first config open by well over a frame. Lay the whole
+        // hitch the first config open by well over a frame. Lay the whole panel
         // window out once against a default config and upload the font
         // textures, so the first real open is ordinary UI work.
         {
             let mut warm_cfg = crate::config::Config::default();
-            let mut warm_st = UiState {
-                term_font_draft: String::new(),
-                tab_font_draft: String::new(),
-            };
+            let mut warm_st = UiState { font_popup: None };
             let mut open = true;
             let mut full = ctx.run_ui(
                 egui::RawInput {
@@ -104,7 +165,7 @@ impl Egui {
                     ..Default::default()
                 },
                 |ui| {
-                    config_window(ui.ctx(), &mut open, &mut warm_cfg, &mut warm_st);
+                    config_window(ui, &mut open, &mut warm_cfg, &mut warm_st, &[]);
                 },
             );
             apply_textures(device, queue, &mut renderer, &mut full);
@@ -118,11 +179,9 @@ impl Egui {
             config_changed: false,
             save_requested: false,
             revert_requested: false,
-            ui_state: UiState {
-                term_font_draft: String::new(),
-                tab_font_draft: String::new(),
-            },
+            ui_state: UiState { font_popup: None },
             switcher_pick: None,
+            font_choices,
         }
     }
 
@@ -552,40 +611,61 @@ pub fn apply_textures(
     full.textures_delta.clear();
 }
 
-/// The configuration window. Edits `cfg` live; `ConfigEvents` tells the
-/// caller whether to re-apply, save to disk, or revert to the file.
+/// The configuration panel: docked to the right edge, full window height,
+/// resized by dragging its edge — nothing to drag around. Edits `cfg` live;
+/// `ConfigEvents` tells the caller whether to re-apply, save to disk, or
+/// revert to the file.
 pub fn config_window(
-    ctx: &Context,
+    ui: &mut egui::Ui,
     open: &mut bool,
     cfg: &mut crate::config::Config,
     st: &mut UiState,
+    choices: &[crate::fonts::FontChoice],
 ) -> ConfigEvents {
     let mut ev = ConfigEvents { apply: false, save: false, revert: false };
     if !*open {
-        // Closed: build nothing. Drafts were cleared on the close frame and
-        // the first open re-mirrors them from the config.
+        // Closed: build nothing. Any open popup was dropped on the close
+        // frame, so a reopen starts clean.
         return ev;
     }
 
-    egui::Window::new("Configuration")
-        .open(open)
+    egui::Panel::right("config_panel")
         .resizable(true)
-        .default_size([400.0, 640.0])
-        .scroll([true, false])
-        .show(ctx, |ui| {
+        .default_size(380.0)
+        .min_size(300.0)
+        .max_size(640.0)
+        .show(ui, |ui| {
             // Sliders have no per-widget width in 0.37; size them through
             // the spacing style (this Ui and its children only).
             ui.style_mut().spacing.slider_width = 140.0;
 
+            // The header is pinned (outside the scroll area) so the close
+            // button stays reachable however far down the user has scrolled.
+            ui.horizontal(|ui| {
+                ui.heading("Configuration");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("×").clicked() {
+                        *open = false;
+                    }
+                });
+            });
+            ui.separator();
+
             // Each section is a grid whose label column is sized by the
             // widest label (see `row`), so the controls line up in a single
             // column across all sections.
-
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Terminal");
             egui::Grid::new("terminal").show(ui, |ui| {
-                row(ui, "Font", |ui| {
-                    font_field(ui, &mut cfg.term_font, &mut st.term_font_draft, &mut ev);
-                });
+                font_row(
+                    ui,
+                    "Font",
+                    &mut cfg.term_font,
+                    FontWhich::Term,
+                    st,
+                    choices,
+                    &mut ev,
+                );
                 row(ui, "See-through", |ui| {
                     if ui.add(egui::Slider::new(&mut cfg.term_opacity, 0.0..=1.0)).changed() {
                         ev.apply = true;
@@ -607,20 +687,31 @@ pub fn config_window(
                 color_row(ui, "Accent", &mut cfg.accent_color, &mut ev);
                 color_row(ui, "Background tint", &mut cfg.bg_tint_color, &mut ev);
                 row(ui, "Palette", |ui| {
-                    // Each button is its own grid cell.
-                    for c in cfg.col.iter_mut() {
-                        if color_cell(ui, c) {
-                            ev.apply = true;
-                        }
+                    // Two rows of eight: one row of sixteen is wider than
+                    // the narrowest panel.
+                    for chunk in cfg.col.chunks_mut(8) {
+                        ui.horizontal(|ui| {
+                            for c in chunk.iter_mut() {
+                                if color_cell(ui, c) {
+                                    ev.apply = true;
+                                }
+                            }
+                        });
                     }
                 });
 
             });
             ui.heading("Tabs");
             egui::Grid::new("tabs").show(ui, |ui| {
-                row(ui, "Font", |ui| {
-                    font_field(ui, &mut cfg.tablist_font, &mut st.tab_font_draft, &mut ev);
-                });
+                font_row(
+                    ui,
+                    "Font",
+                    &mut cfg.tablist_font,
+                    FontWhich::Tablist,
+                    st,
+                    choices,
+                    &mut ev,
+                );
                 color_row(ui, "Strip", &mut cfg.tablist_background, &mut ev);
                 color_row(ui, "Tab", &mut cfg.tab_color_bg, &mut ev);
                 color_row(ui, "Tab (active)", &mut cfg.tab_color_bg_selected, &mut ev);
@@ -684,8 +775,11 @@ pub fn config_window(
                 });
                 checkbox_row(ui, "Start maximized", &mut cfg.default_maximize, &mut ev);
 
-            
-            });ui.separator();
+            });
+            }); // ScrollArea contents
+
+            // Pinned at the panel bottom, outside the scroll area.
+            ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Revert").clicked() {
                     ev.revert = true;
@@ -694,14 +788,11 @@ pub fn config_window(
                     ev.save = true;
                 }
             });
-        // The window's own close button (title-bar X) flips *open; no extra
-        // Close button here -- it would also re-borrow `open` under .open().
         });
     if !*open {
-        // Closed by the title-bar X this frame: discard uncommitted drafts;
-        // the next open re-mirrors the config.
-        st.term_font_draft.clear();
-        st.tab_font_draft.clear();
+        // Closed by the × button this frame: drop any open popup with the
+        // panel, so a reopen does not resurrect it anchored to a button.
+        st.font_popup = None;
     }
     ev
 }
@@ -715,24 +806,97 @@ fn row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) 
     ui.end_row();
 }
 
-fn font_field(ui: &mut egui::Ui, cfg_value: &mut String, draft: &mut String, ev: &mut ConfigEvents) {
-    // The draft persists across frames (see UiState); egui writes the
-    // user's keystrokes into it. Commit to `cfg` only on Enter or loss of
-    // focus -- a font change rebuilds the whole font system and glyph
-    // pools, far too heavy per keystroke. While idle the field mirrors the
-    // live config value.
-    let r = ui.add(egui::TextEdit::singleline(draft).desired_width(200.0));
-    // 0.37 has no Response::succeeded: Enter with focus is the commit.
-    let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-    if r.lost_focus() || enter {
-        if *draft != *cfg_value {
-            cfg_value.clone_from(draft);
-            ev.apply = true;
+/// The sample text a font popup row is previewed with.
+const FONT_PREVIEW_TEXT: &str = "AaBbCcDd 0123456789";
+/// A popup previews at most this many families. Each previewed family loads
+/// one font file into the atlas on first use, so this is a memory bound as
+/// well as a UI one.
+const FONT_POPUP_MAX: usize = 60;
+
+/// A font row: a button showing the current family that opens a popup of
+/// the installed fonts, each previewed in its own face. The pick is written
+/// straight into the config (a font change re-shapes the terminal, so there
+/// is no draft stage).
+fn font_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    cfg_value: &mut String,
+    which: FontWhich,
+    st: &mut UiState,
+    choices: &[crate::fonts::FontChoice],
+    ev: &mut ConfigEvents,
+) {
+    row(ui, label, |ui| {
+        let shown: String = cfg_value.chars().take(30).collect();
+        let r = ui.add(egui::Button::new(shown).min_size(egui::vec2(160.0, 0.0)));
+        if r.clicked() && st.font_popup.is_none() {
+            st.font_popup = Some(FontPopup { which, open: true, search: String::new() });
         }
-        *draft = cfg_value.clone();
-    } else if !r.has_focus() {
-        *draft = cfg_value.clone();
-    }
+        // The popup belongs to this row only; it must be re-shown every
+        // frame while open, so it is driven here rather than at the panel
+        // level.
+        if st.font_popup.as_ref().is_some_and(|p| p.which == which) {
+            let mut search = std::mem::take(&mut st.font_popup.as_mut().unwrap().search);
+            // The current family first (if it survives the filter), then
+            // the filtered list in name order, capped.
+            let needle = search.to_lowercase();
+            let mut list: Vec<&crate::fonts::FontChoice> = choices
+                .iter()
+                .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
+                .collect();
+            list.sort_by(|a, b| {
+                (*cfg_value == b.name).cmp(&(*cfg_value == a.name)).then_with(|| {
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                })
+            });
+            list.truncate(FONT_POPUP_MAX);
+            {
+                let popup = st.font_popup.as_mut().unwrap();
+                // The content closure returns the picked family (if any);
+                // applying it happens outside, so it does not fight the
+                // `&mut popup.open` borrow of `open_bool`.
+                let inner = egui::Popup::from_response(&r)
+                    .open_bool(&mut popup.open)
+                    .width(300.0)
+                    .show(|ui| -> Option<String> {
+                        ui.add_space(4.0);
+                        ui.add(egui::TextEdit::singleline(&mut search).hint_text("Filter…"));
+                        ui.separator();
+                        let mut picked = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(400.0)
+                            .show(ui, |ui| {
+                                for c in &list {
+                                    let rt = egui::RichText::new(FONT_PREVIEW_TEXT)
+                                        .font(egui::FontId::new(
+                                            15.0,
+                                            egui::FontFamily::Name(std::sync::Arc::from(
+                                                &*c.name,
+                                            )),
+                                        ));
+                                    let selected = c.name == *cfg_value;
+                                    if ui.selectable_label(selected, rt).clicked() {
+                                        picked = Some(c.name.clone());
+                                    }
+                                }
+                            });
+                        ui.add_space(4.0);
+                        picked
+                    });
+                if let Some(name) = inner.and_then(|i| i.inner) {
+                    if *cfg_value != name {
+                        *cfg_value = name;
+                        ev.apply = true;
+                    }
+                    popup.open = false;
+                }
+            }
+            st.font_popup.as_mut().unwrap().search = search;
+            if !st.font_popup.as_ref().is_some_and(|p| p.open) {
+                st.font_popup = None;
+            }
+        }
+    });
 }
 
 fn color_row(ui: &mut egui::Ui, label: &str, c: &mut crate::config::Rgb, ev: &mut ConfigEvents) {
@@ -769,9 +933,9 @@ fn checkbox_row(ui: &mut egui::Ui, label: &str, v: &mut bool, ev: &mut ConfigEve
 mod regression {
     use super::*;
 
-    /// One layout pass of the config window at a given screen size.
-    fn pass(ctx: &Context, w: f32, h: f32, open: bool) {
-        let mut st = UiState { term_font_draft: String::new(), tab_font_draft: String::new() };
+    /// One layout pass of the config panel at a given screen size.
+    fn pass(ctx: &Context, w: f32, h: f32, open: bool) -> egui::FullOutput {
+        let mut st = UiState { font_popup: None };
         let mut cfg = crate::config::Config::default();
         let mut open_local = open;
         let mut full = ctx.run_ui(
@@ -779,9 +943,10 @@ mod regression {
                 screen_rect: Some(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(w, h))),
                 ..Default::default()
             },
-            |ui| { config_window(ui.ctx(), &mut open_local, &mut cfg, &mut st); },
+            |ui| { config_window(ui, &mut open_local, &mut cfg, &mut st, &[]); },
         );
         full.textures_delta.clear();
+        full
     }
 
     // Regression: a row that requested an infinite size blew the layout up
@@ -793,11 +958,115 @@ mod regression {
         let ctx = Context::default();
         ctx.set_visuals(egui::Visuals::dark());
         pass(&ctx, 1200.0, 800.0, true); // warm-up
-        pass(&ctx, 1280.0, 720.0, true); // first live open
+        // Open pass: the panel is a full-height frame docked at the right
+        // edge (this is what catches a layout that slides it off-screen).
+        let full = pass(&ctx, 1280.0, 720.0, true);
+        let docked = full.shapes.iter().any(|cs| {
+            matches!(
+                cs,
+                egui::epaint::ClippedShape {
+                    shape: egui::Shape::Rect(r),
+                    ..
+                } if r.rect.size().y > 720.0 * 0.9
+                    && (r.rect.max.x - 1280.0).abs() < 1.0
+                    && r.rect.size().x > 200.0
+            )
+        });
+        assert!(docked, "panel is not full-height and docked right");
         pass(&ctx, 1280.0, 720.0, true);
         pass(&ctx, 900.0, 600.0, true); // resize
         pass(&ctx, 900.0, 600.0, false); // close
         pass(&ctx, 900.0, 600.0, true); // reopen
+    }
+
+    // The font popup: opens from a row, previews installed fonts through the
+    // FontPreviewProvider (which reads a real font file into egui's atlas on
+    // first use), and stays on screen across passes.
+    #[test]
+    fn font_popup_layout() {
+        let ctx = Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        // A real database so the provider has a real file to read (the same
+        // construction the app's FontSystem uses).
+        let mut db = glyphon::fontdb::Database::new();
+        db.load_system_fonts();
+        let choices = crate::fonts::font_choices(&db);
+        assert!(!choices.is_empty(), "no installed fonts on the test machine");
+        let previewed = choices[0].clone();
+        // Register the same provider Egui::init does.
+        ctx.add_font_provider(std::sync::Arc::new(FontPreviewProvider {
+            fonts: std::sync::Mutex::new(
+                choices
+                    .iter()
+                    .map(|c| (c.name.clone(), (c.path.clone(), c.face)))
+                    .collect(),
+            ),
+        }));
+
+        let mut st = UiState { font_popup: None };
+        let mut cfg = crate::config::Config::default();
+        let mut open = true;
+        // The popup, opened from the terminal font row.
+        st.font_popup = Some(FontPopup {
+            which: FontWhich::Term,
+            open: true,
+            search: String::new(),
+        });
+        for _ in 0..3 {
+            let mut full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1280.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| { config_window(ui, &mut open, &mut cfg, &mut st, &choices); },
+            );
+            full.textures_delta.clear();
+        }
+
+        // The previewed family made it into egui's font system: the provider
+        // read the file and epaint installed it into the family's fallback
+        // chain when the preview row laid out (this is the whole point of
+        // the popup). The chain is observable through the family's
+        // character map: non-empty, and carrying our face under its name.
+        let chars = ctx
+            .fonts_mut(|f| {
+                f.characters(&egui::FontFamily::Name(std::sync::Arc::from(
+                    previewed.name.as_str(),
+                )))
+                .clone()
+            });
+        assert!(
+            !chars.is_empty(),
+            "previewed family {previewed:?} has no installed face in egui"
+        );
+        let faces: std::collections::HashSet<String> =
+            chars.values().flatten().cloned().collect();
+        assert!(
+            faces.contains(&previewed.name),
+            "face {previewed:?} not in the family chain: {faces:?}"
+        );
+
+        // The popup drew its preview rows: well above the ~30 galleys the
+        // panel alone produces.
+        let full = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1280.0, 720.0),
+                )),
+                ..Default::default()
+            },
+            |ui| { config_window(ui, &mut open, &mut cfg, &mut st, &choices); },
+        );
+        let galleys = full
+            .shapes
+            .iter()
+            .filter(|cs| matches!(cs, egui::epaint::ClippedShape { shape: egui::Shape::Text(_), .. }))
+            .count();
+        assert!(galleys >= 60, "popup preview rows missing: {galleys} galleys");
     }
 
     // The switcher is a full-viewport CentralPanel with a row of cards whose

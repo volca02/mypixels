@@ -631,12 +631,16 @@ impl App {
             tab_px,
             self.tab_text_h,
         );
+        // The font popup previews from the app's own database, so the list
+        // is exactly what the terminal can actually load.
+        let font_choices = fonts::font_choices(self.font_system.db());
         self.egui = Some(egui_ui::Egui::init(
             event_loop,
             &gpu.device,
             &gpu.queue,
             gpu.config.format,
             self.scale,
+            font_choices,
         ));
         self.gpu = Some(gpu);
     }
@@ -1149,10 +1153,11 @@ impl App {
                 let ctx = egui.ctx.clone();
                 let full = ctx.run_ui(raw, |ui| {
                     let ev = egui_ui::config_window(
-                        ui.ctx(),
+                        ui,
                         &mut egui.config_open,
                         &mut self.config,
                         &mut egui.ui_state,
+                        &egui.font_choices,
                     );
                     egui.config_changed = ev.apply;
                     egui.save_requested = ev.save;
@@ -1200,7 +1205,7 @@ impl App {
         }
         if save {
             match self.config.save() {
-                // Done on purpose: saving closes the window, so the user
+                // Done on purpose: saving closes the panel, so the user
                 // sees the result on the terminal, not in the dialog.
                 Ok(()) => {
                     log::info!("configuration saved");

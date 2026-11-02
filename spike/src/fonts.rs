@@ -249,6 +249,57 @@ fn installed_families(db: &Database) -> Vec<String> {
     out
 }
 
+/// One selectable installed font for the configuration panel's font popup:
+/// the family name and the file that carries its regular face.
+#[derive(Clone, Debug)]
+pub struct FontChoice {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    /// Face index within the file (matters for `.ttc` collections).
+    pub face: u32,
+}
+
+/// One choice per installed family: the upright face nearest weight 400,
+/// because that is the face a terminal actually uses for its default text.
+/// Sorted by family name, case-insensitive.
+pub fn font_choices(db: &Database) -> Vec<FontChoice> {
+    #[derive(Clone, Copy, PartialEq, PartialOrd)]
+    struct Score(u32, bool); // (distance from weight 400, not upright)
+    let mut best: std::collections::HashMap<String, (Score, u32, std::path::PathBuf)> =
+        std::collections::HashMap::new();
+    for face in db.faces() {
+        let Some((name, _)) = face.families.first() else {
+            continue;
+        };
+        let Some(path) = source_path(&face.source) else {
+            continue;
+        };
+        let score = Score(face.weight.0.abs_diff(400) as u32, face.style != DbStyle::Normal);
+        let entry = best.get_mut(name);
+        match entry {
+            Some((cur, _, _)) if *cur <= score => {}
+            _ => {
+                best.insert(name.clone(), (score, face.index, path));
+            }
+        }
+    }
+    let mut out: Vec<FontChoice> = best
+        .into_iter()
+        .map(|(name, (_, face, path))| FontChoice { name, path, face })
+        .collect();
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+fn source_path(source: &glyphon::fontdb::Source) -> Option<std::path::PathBuf> {
+    match source {
+        glyphon::fontdb::Source::File(path) => Some(path.clone()),
+        glyphon::fontdb::Source::SharedFile(path, _) => Some(path.clone()),
+        // Memory-only sources carry no readable path.
+        glyphon::fontdb::Source::Binary(_) => None,
+    }
+}
+
 /// Icon-font families available for `primary`, best match first.
 pub fn icon_families(primary: &str, db: &Database) -> Vec<String> {
     let fams = installed_families(db);
