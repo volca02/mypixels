@@ -68,8 +68,8 @@ pump() { # steady frame pump: "spy" lines as fast as the loop allows
 }
 stpump() { kill "$PUMP" 2>/dev/null; wait "$PUMP" 2>/dev/null; PUMP=""; }
 
-scenario() { # name setup-shell-code
-    local name=$1 setup=$2
+scenario() { # name setup-shell-code [teardown-shell-code]
+    local name=$1 setup=$2 teardown=${3:-:}
     local before after tbefore tafter
     before=$(grep -c "SPY active=" "$LOG")
     tbefore=$(grep -c "frame build" "$LOG")
@@ -83,6 +83,8 @@ scenario() { # name setup-shell-code
     kill -INT "$PREC"
     wait "$PREC" 2>/dev/null
     stpump
+    eval "$teardown"
+    sleep 0.3
     after=$(grep -c "SPY active=" "$LOG")
     tafter=$(grep -c "frame build" "$LOG")
     echo "BENCH $name  pump_lines=$((after - before))/${SECS}s"
@@ -106,6 +108,7 @@ want() { [ "$RUN" = all ] || [ "$RUN" = "$1" ]; }
 want terminal     && scenario terminal     "sendkeys 'yes'"
 want config       && scenario config       "say alt+shift+c"
 want config-idle  && scenario config-idle  "say ctrl+c"
+want switcher     && scenario switcher     "say switcher" "say alt_up"
 
 stpump
 say ctrl+c

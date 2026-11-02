@@ -249,6 +249,10 @@ pub(crate) struct FrameCache {
     /// Fingerprint of the inputs that invalidate everything (geometry,
     /// fonts, palette, alt screen, scroll offset). 0 = never built.
     fp: u64,
+    /// Cursor point (grid space) the runs were last rebuilt with. `damage()`
+    /// always damages the cursor cell, so damage that touches *only* this
+    /// row and hasn't moved the cursor means no cell actually changed.
+    cur: Option<(i64, i64)>,
 }
 
 /// One built frame: the (usually shared, unchanged) run data, plus the
@@ -1033,17 +1037,10 @@ impl App {
     /// * geometry/font/palette/alt-screen/scroll-offset changed -> full
     ///   rebuild (runs reference leaked `Attrs` and table-resolved colors
     ///   from the inputs that built them).
-    ///
-    /// Cursor blink and selection never invalidate anything: the cursor is
-    /// drawn as a rect and the selection wash rides over the runs.
     fn build_frame(&self, tab: &Tab, show_cursor: bool) -> FrameOut {
         use alacritty_terminal::term::TermDamage;
         use alacritty_terminal::vte::ansi::{Color, NamedColor};
         let mut term = tab.term.lock();
-        // The activity stamp is bumped by the PTY listener and by local key
-        // input (both can change cells). Unchanged stamp => no bytes since
-        // this tab was last built => its runs are provably current.
-        let last_act = *self.last_activity.lock().unwrap();
         let content = term.renderable_content();
         let palette = Palette::from_colors(content.colors, &self.config.palette);
         let resolve = |color: &Color| palette.resolve_with(color, self.fg, self.bg, self.config.cursor_color.to_f32());
@@ -1068,6 +1065,14 @@ impl App {
             }
         };
 
+        // The raw cursor point in grid space, visible or not: `damage()`
+        // damages the cursor cell every call, and that alone must not read
+        // as a content change.
+        let cur_grid = (
+            (content.cursor.point.line.0 + content.display_offset as i32) as i64,
+            content.cursor.point.column.0 as i64,
+        );
+
         // Fingerprint of the inputs that would silently change every row.
         let mut h: u64 = 0xcbf29ce484222325;
         let mut mix = |v: u64| {
@@ -1091,19 +1096,19 @@ impl App {
 
         let mut cache_rc = tab.frame_cache.borrow().clone();
         let cache_current = cache_rc.fp == fp && cache_rc.spans.len() == rows;
-        if tab.out_seen.get() == Some(last_act) && cache_current {
-            // Fastest path: no bytes since this tab's runs were built.
-            return FrameOut { cache: cache_rc, fg, bg, cursor_color, cursor };
-        }
-
-        // Everything read off `content` above is computed; release the
-        // borrow, because reading damage needs `term` mutably. The walk
-        // below takes a fresh content (free -- it is a lazy view, and the
-        // terminal is still locked throughout).
+        // Everything read off `content` is computed; release the borrow,
+        // because reading damage needs `term` mutably. The walk below takes
+        // a fresh content (free -- it is a lazy view, and the terminal is
+        // still locked throughout).
         drop(content);
-        // ---- output happened: ask the terminal which rows it changed ----
-        // Damage is consume-and-reset, per terminal. A tab nobody drew just
-        // accumulates it (bounded, in-place per row) until it is built next.
+
+        // Ask the terminal what moved. This is a scan of a small per-line
+        // dirty table (plus a cursor-position hash), not a cell walk, so it
+        // runs EVERY frame -- gating it on the activity stamp once let a
+        // byte that landed after this frame's stamp read go unconsumed, and
+        // its row stayed stale until the next change. `damage()` also
+        // consumes the cursor damage it synthesizes, which is why it must
+        // not be skipped: a skipped read silently swallows one cursor hop.
         let mut rebuild_all;
         let mut dirty: Vec<u32> = Vec::new();
         match term.damage() {
@@ -1114,10 +1119,19 @@ impl App {
             }
         }
         term.reset_damage();
-        // Remember the stamp as of BEFORE reading damage: output racing in
-        // during this frame bumped the stamp past it, so next frame reads
-        // damage again and nothing is missed.
-        tab.out_seen.set(Some(last_act));
+        // Damage touching only the row under an unmoved cursor is alacritty's
+        // synthetic cursor damage, not a cell change: the cached runs are
+        // still exact. (The cursor itself is drawn as a rect from `FrameOut`,
+        // never baked into a run.)
+        let only_cursor =
+            !rebuild_all && dirty.iter().all(|l| *l as i64 == cur_grid.0);
+        if only_cursor && cache_current && cache_rc.cur == Some(cur_grid) {
+            // Fastest path: the terminal reports nothing moved since the
+            // last build, and nothing that would move rows invisibly
+            // (fonts, geometry, palette, scroll offset) has changed.
+            return FrameOut { cache: cache_rc, fg, bg, cursor_color, cursor };
+        }
+
         let content = term.renderable_content();
 
         // Damage arrives in grid space (viewport line + display offset);
@@ -1329,7 +1343,7 @@ impl App {
             close_row!(r);
         }
 
-        let new = Rc::new(FrameCache { runs, spans, fp });
+        let new = Rc::new(FrameCache { runs, spans, fp, cur: Some(cur_grid) });
         *tab.frame_cache.borrow_mut() = Rc::clone(&new);
         FrameOut { cache: new, fg, bg, cursor_color, cursor }
     }
@@ -3072,6 +3086,10 @@ fn parse_key_spec(spec: &str) -> Option<(ModifiersState, Key)> {
         "space" => Key::Named(NamedKey::Space),
         // "+" can't be written literally (it's the modifier separator).
         "plus" => Key::Character("+".into()),
+        // "+" and "-" are also how the zoom bindings match the numpad
+        // (NumLock on => winit delivers characters), so the harness can
+        // reach enlarge/shrink with alt+shift+plus / alt+shift+minus.
+        "minus" => Key::Character("-".into()),
         "braceleft" => Key::Character("{".into()),
         "braceright" => Key::Character("}".into()),
         "f1" => Key::Named(NamedKey::F1),
@@ -3751,6 +3769,7 @@ mod preview_tests {
                 runs: vec![run(0, 0, "x")],
                 spans: vec![(0, 1)],
                 fp: 1,
+                cur: None,
             }),
             ..FrameOut::default()
         };

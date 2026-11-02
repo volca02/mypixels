@@ -96,10 +96,6 @@ pub struct Tab {
     /// the rows the terminal reports as changed is what keeps an idle tab
     /// under an open config panel at zero terminal-walk cost per redraw.
     pub frame_cache: std::cell::RefCell<std::rc::Rc<crate::FrameCache>>,
-    /// `last_activity` value whose output this tab's frame cache already
-    /// incorporates. Equal stamps mean no PTY output since: the runs cannot
-    /// have gone stale, so the damage machinery is not even consulted.
-    pub out_seen: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl Tab {
@@ -160,7 +156,6 @@ impl Tab {
             entangled: false,
             name: None,
             frame_cache: std::cell::RefCell::new(std::rc::Rc::new(crate::FrameCache::default())),
-            out_seen: std::cell::Cell::new(None),
         }
     }
 
