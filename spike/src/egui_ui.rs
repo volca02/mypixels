@@ -877,10 +877,11 @@ fn font_row(
             .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
             .collect();
         // The current family leads the filtered list, whatever the filter
-        // left of the alphabetical order.
+        // left of the alphabetical order. (Key computed once: this runs
+        // every frame, over hundreds of families.)
+        let draft = st.font_popup.as_ref().map(|p| p.family.as_str()).unwrap_or("");
         families.sort_by(|a, b| {
-            (a.name != st_draft_family(st)).cmp(&(b.name != st_draft_family(st)))
-                .then_with(|| a.name.cmp(&b.name))
+            (a.name != draft).cmp(&(b.name != draft)).then_with(|| a.name.cmp(&b.name))
         });
         families.truncate(FONT_POPUP_MAX);
 
@@ -895,6 +896,12 @@ fn font_row(
                 // without this the whole dialog renders as one horizontal
                 // strip (found by the layout test below).
                 .layout(egui::Layout::top_down_justified(egui::Align::Min))
+                // ...and its DEFAULT close behavior is CloseOnClick: ANY
+                // click -- including the ones on this popup's own widgets --
+                // closed it, so clicking the filter box dismissed the dialog
+                // (found by the same test). A dialog closes on outside
+                // clicks only.
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| -> Option<String> {
                     // The popup lives in an auto-sizing Area whose available
                     // size is not trustworthy (an earlier version flowed the
@@ -1054,10 +1061,6 @@ fn font_row(
             st.font_popup = None;
         }
     });
-}
-
-fn st_draft_family(st: &UiState) -> String {
-    st.font_popup.as_ref().map(|p| p.family.clone()).unwrap_or_default()
 }
 
 /// The drafted face, if the family exists and has one at that index.
@@ -1468,5 +1471,111 @@ mod regression {
                 full.textures_delta.clear();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod input_regression {
+    use super::*;
+
+    struct Sim<'a> {
+        ctx: Context,
+        st: &'a mut UiState,
+        cfg: &'a mut crate::config::Config,
+        open: bool,
+        choices: &'a [crate::fonts::FontChoice],
+        last_popup_rect: Option<egui::Rect>,
+    }
+
+    impl<'a> Sim<'a> {
+        fn frame(&mut self, events: Vec<egui::Event>) -> (Vec<String>, bool, Option<String>) {
+            let Self { ctx, st, cfg, open, choices, .. } = self;
+            let mut full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1280.0, 720.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| { config_window(ui, open, cfg, st, choices); },
+            );
+            full.textures_delta.clear();
+            let labels: Vec<String> = full
+                .shapes
+                .iter()
+                .filter_map(|cs| match cs {
+                    egui::epaint::ClippedShape { shape: egui::Shape::Text(t), .. } => {
+                        let s = t.galley.text().to_string();
+                        (self.choices.iter().any(|c| c.name == s)).then_some(s)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(r) = full.shapes.iter().find_map(|cs| match cs {
+                egui::epaint::ClippedShape { shape: egui::Shape::Rect(r), .. } => {
+                    let w = r.rect.width();
+                    (w > 380.0 && w < 460.0 && r.rect.height() > 18.0 && r.rect.height() < 40.0)
+                        .then_some(r.rect)
+                }
+                _ => None,
+            }) {
+                self.last_popup_rect = Some(r);
+            }
+            let popup_open = self.st.font_popup.as_ref().is_some_and(|p| p.open);
+            let search = self.st.font_popup.as_ref().map(|p| p.search.clone());
+            (labels, popup_open, search)
+        }
+    }
+
+    #[test]
+    /// Clicking and typing in the popup's filter must not dismiss it: the
+    /// popup's DEFAULT close behavior (CloseOnClick) closed it on its own
+    /// filter click, and the app then tore the state down. Regression test
+    /// for the reported "typing into the font filter makes the popup vanish".
+    #[test]
+    fn filter_click_and_typing_keep_popup_open() {
+        let ctx = Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut db = glyphon::fontdb::Database::new();
+        db.load_system_fonts();
+        let choices = crate::fonts::font_choices(&db);
+        let mut st = UiState { font_popup: None };
+        let mut cfg = crate::config::Config::default();
+        let seed_spec = choices[choices.len() / 2].name.clone();
+        cfg.term_font = format!("{seed_spec} 13");
+        let mut sim = Sim {
+            ctx,
+            st: &mut st,
+            cfg: &mut cfg,
+            open: true,
+            choices: &choices,
+            last_popup_rect: None,
+        };
+
+        // pass 0: popup seeded, as the button click does
+        sim.st.font_popup = Some(seed_popup(FontWhich::Term, &format!("{seed_spec} 13"), &choices));
+        let (l, pop, se) = sim.frame(vec![]);
+        eprintln!("P0 popup={pop} labels={} search={se:?}", l.len());
+        let (l, pop, se) = sim.frame(vec![]);
+        eprintln!("P1 popup={pop} labels={} search={se:?}", l.len());
+        let pr = sim.last_popup_rect.expect("filter box laid out in the popup");
+        let filter_pos = pr.center();
+        let mods = egui::Modifiers::default();
+        let (l, pop, se) = sim.frame(
+            vec![
+                egui::Event::PointerMoved(filter_pos),
+                egui::Event::PointerButton { pos: filter_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: mods },
+                egui::Event::PointerButton { pos: filter_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: mods },
+            ],
+        );
+        let focused = sim.ctx.memory(|m| m.focused().is_some());
+        assert!(pop, "click on the popup's own filter dismissed the popup");
+        assert!(focused, "the click did not focus the filter box");
+        let (l, pop, se) = sim.frame(vec![egui::Event::Text("o".into())]);
+        assert!(pop, "typing dismissed the popup");
+        assert_eq!(se.as_deref(), Some("o"), "keystroke did not reach the filter");
+        let (l2, pop, se) = sim.frame(vec![egui::Event::Text("n".into())]);
+        assert!(pop, "typing dismissed the popup");
+        assert_eq!(se.as_deref(), Some("on"), "keystroke did not reach the filter");
+        assert!(l2.len() <= l.len(), "the filter did not narrow the family list");
     }
 }
