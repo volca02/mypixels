@@ -93,21 +93,6 @@ fn fs(@location(0) color: vec4<f32>,
 }
 "#;
 
-/// The tab-switcher overlay, drawn above the live terminal. Its dim and tile
-/// rects plus tile text form a second phase after the terminal's own text
-/// pass, so the terminal stays visible (dimmed) behind the switcher. Without
-/// the split, the single text pass would paint terminal text over the opaque
-/// tiles -- and the shared glyph pool would let the tile headers clobber the
-/// terminal runs they alias.
-///
-/// The rects draw through `overlay_rect_pipeline`, whose "src over" alpha
-/// equation never drops the window's own alpha -- the dim darkens the
-/// terminal, it does not make the window more transparent.
-pub struct OverlayPhase<'a> {
-    pub rects: Vec<RectVertex>,
-    pub areas: Vec<TextArea<'a>>,
-}
-
 /// Stage `rects` into `buffer` (growing it if needed) and draw them through
 /// `pipeline`. Each call site owns its buffer: the base and the switcher
 /// phases must never share one, because both writes land at offset 0 and the
@@ -249,23 +234,11 @@ pub struct Gpu {
     /// background is possible at all.
     pub alpha_ok: bool,
     pub rect_pipeline: wgpu::RenderPipeline,
-    /// Rect pipeline for the tab-switcher overlay phase: premultiplied
-    /// "src over" instead of the plain alpha blending (see init).
-    pub overlay_rect_pipeline: wgpu::RenderPipeline,
     pub rect_buffer: wgpu::Buffer,
-    /// Vertex storage for the switcher phase. Must not share `rect_buffer`
-    /// with the base phase: both phases write at offset 0 of their buffer and
-    /// both draws encode before the single frame submit, so a shared buffer
-    /// would make the base draw read the switcher's vertices (the base
-    /// background rect would be replaced by a double-drawn dim).
-    pub overlay_rect_buffer: wgpu::Buffer,
     pub viewport: Viewport,
     pub atlas: TextAtlas,
     pub swash_cache: SwashCache,
     pub text_renderer: TextRenderer,
-    /// Separate vertex storage: preparing overlay labels must not overwrite
-    /// terminal glyphs whose draw is encoded but has not been submitted yet.
-    overlay_text_renderer: TextRenderer,
     pub rects: Vec<RectVertex>,
     /// Pooled cosmic_text buffers for terminal runs (stable addresses).
     pub pool: Vec<Buffer>,
@@ -279,7 +252,6 @@ pub struct Gpu {
     /// because the overview and the terminal draw in the same frame: sharing
     /// buffers would let the tile headers overwrite terminal runs at prepare
     /// time.
-    pub ov_pool: Vec<Buffer>,
     /// Single buffer for the inline rename prompt (terminal font metrics).
     pub prompt_buf: Buffer,
     // --- Overview previews: real terminal frames, sampled down -------------
@@ -296,12 +268,6 @@ pub struct Gpu {
     prev_sampler: wgpu::Sampler,
     prev_bgl: wgpu::BindGroupLayout,
     prev_pipeline: wgpu::RenderPipeline,
-    prev_buffer: wgpu::Buffer,
-    /// Tile quads that sample a preview, six vertices each, and which tab each
-    /// one reads. Filled by `push_preview_quad`, drawn between the rect pass and
-    /// the text pass so tile headers stay on top.
-    prev_quads: Vec<PrevVertex>,
-    prev_quad_tab: Vec<usize>,
     /// Backing for `prev_viewport` (a glyphon Cache is a uniform buffer).
     prev_cache: Cache,
     previews: Vec<Option<PreviewSlot>>,
@@ -522,12 +488,6 @@ impl Gpu {
             multiview_mask: None,
             cache: None,
         });
-        let prev_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("preview quads"),
-            size: (64 * std::mem::size_of::<PrevVertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let prev_cache = Cache::new(&device);
         let cache = Cache::new(&device);
         // ColorMode::Web passes the text color through as-is. Accurate would
@@ -537,8 +497,6 @@ impl Gpu {
             TextAtlas::with_color_mode(&device, &queue, &cache, format, ColorMode::Web);
         let swash_cache = SwashCache::new();
         let text_renderer =
-            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let overlay_text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let mut viewport = Viewport::new(&device, &cache);
         viewport.update(&queue, Resolution { width, height });
@@ -611,33 +569,10 @@ impl Gpu {
             })
         };
         let rect_pipeline = make_rect_pipeline("rects", Some(wgpu::BlendState::ALPHA_BLENDING));
-        // "src over" alpha for the overlay layer. The surface is
-        // premultiplied, and straight-colour rects over a premultiplied
-        // target composite correctly with the usual
-        // SRC_ALPHA/ONE_MINUS_SRC_ALPHA colour equation. The alpha channel
-        // must follow the layer equation `src_a + (1 - src_a) * dst_a` --
-        // i.e. factors (One, OneMinusSrcAlpha). Plain ALPHA_BLENDING would
-        // compute `src_a * src_a + (1 - src_a) * dst_a`: the layer's own
-        // alpha attenuated by itself, so the two transparencies (dim and
-        // terminal background) combined multiplicatively and the window
-        // came out *more* transparent than both -- exactly what the old
-        // switcher did. "Src over" only ever adds opacity, like a real
-        // translucent layer in a compositor.
-        let overlay_rect_pipeline = make_rect_pipeline(
-            "overlay rects",
-            Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    operation: wgpu::BlendOperation::Add,
-                    src_factor: wgpu::BlendFactor::SrcAlpha,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                },
-                alpha: wgpu::BlendComponent {
-                    operation: wgpu::BlendOperation::Add,
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                },
-            }),
-        );
+        // (The hand-drawn switcher overlay once needed a second rect
+        // pipeline here with "src over" alpha, so its dim could darken the
+        // terminal without draining the window's own alpha; egui composites
+        // its own layers, so one pipeline is enough again.)
         let make_rect_buffer = |device: &wgpu::Device, label: &str| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -647,7 +582,6 @@ impl Gpu {
             })
         };
         let rect_buffer = make_rect_buffer(&device, "rects");
-        let overlay_rect_buffer = make_rect_buffer(&device, "overlay rects");
 
         let pool: Vec<Buffer> = (0..MAX_RUNS)
             .map(|_| Buffer::new(font_system, Metrics::new(font_px, font_lh)))
@@ -656,9 +590,6 @@ impl Gpu {
             .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_lh)))
             .collect();
         let prompt_buf = Buffer::new(font_system, Metrics::new(font_px, font_lh));
-        let ov_pool: Vec<Buffer> = (0..64)
-            .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_lh)))
-            .collect();
 
         Gpu {
             device,
@@ -666,14 +597,11 @@ impl Gpu {
             surface,
             config,
             rect_pipeline,
-            overlay_rect_pipeline,
             rect_buffer,
-            overlay_rect_buffer,
             viewport,
             atlas,
             swash_cache,
             text_renderer,
-            overlay_text_renderer,
             rects: Vec::with_capacity(1024),
             pool,
             slot_sig: vec![0u64; MAX_RUNS],
@@ -687,15 +615,11 @@ impl Gpu {
             prev_sampler,
             prev_bgl,
             prev_pipeline,
-            prev_buffer,
-            prev_quads: Vec::new(),
-            prev_quad_tab: Vec::new(),
             prev_cache,
             previews: Vec::new(),
             prev_viewport: None,
             prev_size: (0, 0),
             tab_pool,
-            ov_pool,
             prompt_buf,
         }
     }
@@ -711,60 +635,6 @@ impl Gpu {
             &pipeline,
             rects,
         );
-    }
-
-    fn draw_overlay_rects(&mut self, pass: &mut wgpu::RenderPass<'_>, rects: &[RectVertex]) {
-        let pipeline = self.overlay_rect_pipeline.clone();
-        draw_rects(
-            &self.device,
-            &self.queue,
-            pass,
-            &mut self.overlay_rect_buffer,
-            &pipeline,
-            rects,
-        );
-    }
-
-    /// Render one frame: all rects, then all text areas.
-    /// Clip-space vertices for one sampled tile, mirroring `rect_vertices`.
-    pub fn push_preview_quad(
-        &mut self,
-        tab: usize,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        wf: f32,
-        hf: f32,
-    ) {
-        if self.previews.get(tab).map(|p| p.is_none()).unwrap_or(true) {
-            return;
-        }
-        // Never drawn: the texture holds nothing yet, so sampling it would show
-        // garbage. The tile keeps its empty well for that one frame.
-        if self.prev_sigs.get(tab).copied().unwrap_or(0) == 0 {
-            return;
-        }
-        let cx = |px: f32| px / wf * 2.0 - 1.0;
-        // y points down in pixels, up in clip space.
-        let cy = |py: f32| 1.0 - py / hf * 2.0;
-        // One destination pixel covers 1/tile_w of the texture in UV.
-        let half = [0.5 / w.max(1.0), 0.5 / h.max(1.0)];
-        let v = |px: f32, py: f32, u: f32, vv: f32| PrevVertex {
-            pos: [cx(px), cy(py)],
-            uv: [u, vv],
-            half,
-        };
-        let (x1, y1) = (x + w, y + h);
-        self.prev_quads.extend_from_slice(&[
-            v(x, y, 0.0, 0.0),
-            v(x1, y, 1.0, 0.0),
-            v(x1, y1, 1.0, 1.0),
-            v(x, y, 0.0, 0.0),
-            v(x1, y1, 1.0, 1.0),
-            v(x, y1, 0.0, 1.0),
-        ]);
-        self.prev_quad_tab.push(tab);
     }
 
     pub fn set_prev_sig(&mut self, idx: usize, sig: u64) {
@@ -1038,7 +908,6 @@ impl Gpu {
         &mut self,
         font_system: &mut FontSystem,
         areas: Vec<glyphon::TextArea>,
-        overlay: Option<OverlayPhase<'_>>,
         previews: Vec<PreviewJob>,
         window: &Window,
         mut egui: Option<crate::egui_ui::EguiFrame<'_>>,
@@ -1207,63 +1076,6 @@ impl Gpu {
                 self.text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .expect("render");
-            }
-
-            // Phase 2 (switcher open): the dim and the tiles above the
-            // terminal text, the sampled thumbnails above the tiles, and the
-            // tile text on top.
-            if let Some(overlay) = overlay {
-                self.draw_overlay_rects(&mut pass, &overlay.rects);
-
-                // Sampled tiles: after the rects, so each tile's own background
-                // is underneath, and before the text, so headers stay on top.
-                let quads = std::mem::take(&mut self.prev_quads);
-                let owners = std::mem::take(&mut self.prev_quad_tab);
-                if !quads.is_empty() {
-                    let need = quads.len() * std::mem::size_of::<PrevVertex>();
-                    if need > self.prev_buffer.size() as usize {
-                        self.prev_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("preview quads"),
-                            size: ((need * 2) as u64).next_multiple_of(4096),
-                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        });
-                    }
-                    self.queue
-                        .write_buffer(&self.prev_buffer, 0, bytemuck::cast_slice(&quads));
-                    pass.set_pipeline(&self.prev_pipeline);
-                    pass.set_vertex_buffer(0, self.prev_buffer.slice(..));
-                    for (n, (chunk, tab)) in quads.chunks(6).zip(owners.iter()).enumerate() {
-                        if let Some(Some(slot)) = self.previews.get(*tab) {
-                            // Slice per quad: binding the whole buffer and drawing
-                            // 0..6 every time would paint the first tile's geometry
-                            // once per texture, so only one tile showed anything and
-                            // it showed the wrong tab.
-                            let v = std::mem::size_of::<PrevVertex>() as u64;
-                            let first = (n * 6) as u64 * v;
-                            pass.set_vertex_buffer(0, self.prev_buffer.slice(first..first + 6 * v));
-                            pass.set_bind_group(0, &slot.bind, &[]);
-                            pass.draw(0..chunk.len() as u32, 0..1);
-                        }
-                    }
-                }
-
-                if !overlay.areas.is_empty() {
-                    self.overlay_text_renderer
-                        .prepare(
-                            &self.device,
-                            &self.queue,
-                            font_system,
-                            &mut self.atlas,
-                            &self.viewport,
-                            overlay.areas,
-                            &mut self.swash_cache,
-                        )
-                        .expect("prepare");
-                    self.overlay_text_renderer
-                        .render(&self.atlas, &self.viewport, &mut pass)
-                        .expect("render");
-                }
             }
 
             // Last: egui on top of everything (the config window). It clears

@@ -929,14 +929,6 @@ impl App {
                     )
                 })
                 .collect();
-            gpu.ov_pool = (0..64)
-                .map(|_| {
-                    Buffer::new(
-                        &mut self.font_system,
-                        Metrics::new(tab_font_px, tab_lh),
-                    )
-                })
-                .collect();
         }
         self.sync_term_size();
         log::info!(
@@ -1080,8 +1072,9 @@ impl App {
         FrameData { runs, cursor, fg, bg, cursor_color }
     }
 
-    /// Render the terminal and, while Alt is held, the visual tab switcher. Builds a frame per tab (before the
-    /// mutable gpu borrow), then hands off to `draw_overview`.
+    /// Render the terminal and, while Alt is held, the egui tab switcher.
+    /// Builds a frame per tab (before the mutable gpu borrow), then hands
+    /// off to the gpu pass.
     fn draw(&mut self, window: &Window) {
         if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.notice = None; }
         let t_start = Instant::now();
@@ -1139,17 +1132,12 @@ impl App {
         );
         let mut full_output: Option<egui::FullOutput> = None;
         // The switcher draws through egui; its state machine stays in the
-        // app (Alt-hold open, navigation, Alt release dismiss). The
-        // hand-drawn overlay is kept behind SPIKE_HAND_SWITCHER for A/B
-        // until the egui cut is confirmed, then deleted with its previews.
-        let hand_switcher = std::env::var("SPIKE_HAND_SWITCHER").is_ok();
-        // The two renderers are mutually exclusive: with the env var set the
-        // hand-drawn overlay shows and the egui one stays out of the way.
-        let sw_open = !hand_switcher
-            && matches!(
+        // app (Alt-hold open, navigation, Alt release dismiss). The older
+        // hand-drawn overlay was deleted once the egui cut was confirmed:
+        // two renderers of the same UI meant two of every bug.
+        let sw_open = matches!(
                 self.overview.map(|o| o.mode),
-                Some(OverviewMode::Switcher)
-            );
+            Some(OverviewMode::Switcher));
         let sw_selected = self.active;
         let sw_cards: Vec<egui_ui::SwitcherCard> = if sw_open {
             self.tabs
@@ -1517,9 +1505,8 @@ impl App {
         // --- Terminal text ---
         // SAFETY: pool indices are disjoint (run index < MAX_RUNS), the pool
         // never reallocates after init, and the derived shared references are
-        // only used this frame, before any further pool writes. The overview
-        // uses its own pool (`ov_pool`), so this stays true with it open: its
-        // text sits in `OverlayPhase` and is drawn above the terminal's.
+        // only used this frame, before any further pool writes. The switcher
+        // draws through egui and never touches this pool.
         {
             let cache = shaping_cache_enabled();
             let fs = &mut self.font_system;
@@ -1601,12 +1588,11 @@ impl App {
         // a 60ms hitch. A throttled tile keeps showing its previous frame, which is
         // plenty for a thumbnail. A tab that has never been drawn ignores the cap,
         // so opening the overlay fills the whole grid in one go.
-        // Both switcher renderers need the offscreen preview frames: the
-        // hand-drawn one samples them as tiles, the egui one reads them back
-        // for the card thumbnails. (Only the overlay construction below
-        // stays hand-drawn-specific.)
+        // The egui switcher's card thumbnails read these offscreen preview
+        // frames back as textures (readback_preview), so every open switcher
+        // keeps them warm.
         let mut jobs: Vec<gpu::PreviewJob> = Vec::new();
-        if hand_switcher || sw_open {
+        if sw_open {
             if let Some(ov) = &self.overview {
             let n = self.tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
@@ -1677,34 +1663,6 @@ impl App {
             }
             }
         }
-        // The switcher's rects and text must sit above the terminal text, so
-        // everything `draw_overview` appends goes to `render_frame` as a
-        // second phase: base rects, terminal text, then dim + tiles + text.
-        let mut overlay: Option<gpu::OverlayPhase> = None;
-        if hand_switcher {
-            if let Some(ov) = &self.overview {
-            let (rects_start, areas_start) = (gpu.rects.len(), areas.len());
-            draw_overview(
-                &mut gpu,
-                &mut self.font_system,
-                &self.tabs,
-                ov.mode,
-                ov.selected,
-                &self.config,
-                &self.tab_attrs,
-                self.tab_text_h,
-                self.tab_char_w,
-                w,
-                h,
-                &mut areas,
-                self.scale,
-            );
-            overlay = Some(gpu::OverlayPhase {
-                rects: gpu.rects.split_off(rects_start),
-                areas: areas.split_off(areas_start),
-            });
-            }
-        }
         let egui_frame = match (full_output.as_mut(), self.egui.as_mut()) {
             (Some(full), Some(egui)) => {
                 // Take the shapes out: `full` is behind a reference, and the
@@ -1725,7 +1683,7 @@ impl App {
             },
             _ => None,
         };
-        gpu.render_frame(&mut self.font_system, areas, overlay, jobs, window, egui_frame);
+        gpu.render_frame(&mut self.font_system, areas, jobs, window, egui_frame);
 
         // The egui switcher's live thumbnails: read the freshly rendered
         // preview textures back for a few tabs per frame (same 60/200ms
@@ -2438,50 +2396,6 @@ fn push_tab_label(
     });
 }
 
-/// Push one text area into an overview tile, with a `scale` (for scaled
-/// thumbnails) and an optional monospace width. Mirrors `push_tab_label` but
-/// generalised. `slot` must be < pool.len().
-fn push_ov_text(
-    pool: &mut [Buffer],
-    slot: usize,
-    fs: &mut FontSystem,
-    attrs: &Attrs,
-    text: &str,
-    x: f32,
-    y: f32,
-    scale: f32,
-    color: [f32; 3],
-    monow: Option<f32>,
-    size_w: Option<f32>,
-    areas: &mut Vec<TextArea>,
-    bounds: TextBounds,
-) {
-    if slot >= pool.len() || text.is_empty() {
-        return;
-    }
-    let b = &mut pool[slot];
-    if let Some(mw) = monow {
-        b.set_monospace_width(Some(mw));
-    }
-    b.set_size(size_w, None);
-    b.set_text(text, attrs, Shaping::Basic, None);
-    b.shape_until_scroll(fs, false);
-    let buf: &Buffer = unsafe { &*(b as *const Buffer) };
-    areas.push(TextArea {
-        buffer: buf,
-        left: x,
-        top: y,
-        scale,
-        bounds,
-        default_color: glyphon::Color::rgb(
-            (color[0] * 255.0) as u8,
-            (color[1] * 255.0) as u8,
-            (color[2] * 255.0) as u8,
-        ),
-        custom_glyphs: &[],
-    });
-}
-
 /// Render the standalone tab overview: a dark backdrop, a two-line banner, and
 /// a centred grid of tiles. Each tile shows the tab's group colour, its title,
 /// and a scaled thumbnail of the terminal content (built from `frames`).
@@ -2574,209 +2488,6 @@ fn preview_rects(
     v
 }
 
-fn draw_overview(
-    gpu: &mut Gpu,
-    fs: &mut FontSystem,
-    tabs: &[Tab],
-    _mode: OverviewMode,
-    selected: usize,
-    config: &Config,
-    tab_attrs: &Attrs,
-    tab_text_h: f32,
-    tab_char_w: f32,
-    w: u32,
-    h: u32,
-    areas: &mut Vec<TextArea>,
-    scale: f32,
-) {
-    let wf = w as f32;
-    let hf = h as f32;
-    // The overlay rects draw through the "src over" alpha pipeline:
-    // straight colours in, the layer equation keeps the window's own alpha
-    // (a translucent rect darkens the live terminal beneath it instead of
-    // making the window more transparent).
-    let push_rect =
-        |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
-            v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, 0.0, wf, hf));
-        };
-    let push_rrect =
-        |v: &mut Vec<gpu::RectVertex>, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], r: f32| {
-            v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, r, wf, hf));
-        };
-
-    let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-    // Own pool: the terminal's runs draw in the same frame, and a shared pool
-    // would let the tile headers clobber the runs they alias at prepare time.
-    let pool = &mut gpu.ov_pool;
-    let mut slot = 0usize;
-
-    let background = crate::config::terminal_bg(config).to_f32();
-    let foreground = config.foreground_color.to_f32();
-    let surface = config.tablist_background.to_f32();
-    // The theme's background also works as a wash for light palettes.
-    // Dark backdrop over the whole window.
-    // The live terminal is painted underneath now, so this is a dim rather than
-    // a cover. The Alt-held switcher is a peek over running output, so it stays
-    // light enough to keep its live terminal context visible. Drawn with the
-    // "src over" alpha blend: it darkens the terminal and, like a real
-    // translucent layer, only ever makes the window a touch *less* see-through.
-    let dim = config.tab_overview_opacity.min(0.7);
-    push_rect(&mut gpu.rects, 0.0, 0.0, wf, hf, [background[0], background[1], background[2], dim]);
-
-    let n = tabs.len();
-    let cols = grid_cols(n);
-    let rows = (n + cols - 1) / cols;
-
-    // A quiet heading above the live previews.
-
-    // Grid geometry.
-    let pad = 10.0;
-    let spacing = 12.0;
-    let banner_h = 40.0;
-    // Configured in logical pixels, like every other size in this app: on a
-    // 2x display the tile is double. The preview stays sharp, not stretched:
-    // each tab's frame is rendered at full window resolution into the
-    // offscreen target and the tile merely samples it, so a bigger tile
-    // covers less source per destination pixel.
-    let thumb_w = (config.tab_overview_thumb_width as f32 * scale)
-        .min((wf - 100.0) / 4.0 - 20.0)
-        .max(60.0);
-    let thumb_h = (config.tab_overview_thumb_height as f32 * scale)
-        .min(thumb_w * 0.75)
-        .max(40.0);
-    let header_h = tab_text_h + 6.0;
-    let tile_w = thumb_w + pad * 2.0;
-    let tile_h = header_h + thumb_h + pad * 2.0;
-    let grid_w = cols as f32 * tile_w + (cols.saturating_sub(1)) as f32 * spacing;
-    let grid_h = rows as f32 * tile_h + (rows.saturating_sub(1)) as f32 * spacing;
-    let grid_x = ((wf - grid_w) / 2.0).max(8.0);
-    let grid_y = (banner_h + ((hf - banner_h - grid_h) / 2.0)).max(banner_h);
-
-    // Headers sit on a dark pill: the live tab strip shows through now, and bare
-    // text over it was unreadable.
-    let title = "Tab Switcher";
-    let title_col = config.accent_color.to_f32();
-    let (bx, by) = (grid_x, (grid_y - tab_text_h - 14.0).max(4.0));
-    push_rrect(
-        &mut gpu.rects, bx - 8.0, by - 5.0,
-        title.len() as f32 * tab_char_w + 16.0, tab_text_h + 10.0,
-        [surface[0], surface[1], surface[2], 1.0], 5.0,
-    );
-    push_ov_text(pool, slot, fs, tab_attrs, title, bx, by, 1.0, title_col, None, None, areas, bounds);
-    slot += 1;
-    let radius = 8.0f32;
-    let chip = tab_text_h.max(14.0);
-    // Tiles that sample a real frame, collected during the loop and pushed to
-    // `gpu` afterwards: the tile text holds `gpu` borrowed as `&mut gpu.pool`.
-    let mut tile_previews: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
-
-    for (idx, t) in tabs.iter().enumerate() {
-        let row = idx / cols;
-        let col = idx % cols;
-        let tx = grid_x + col as f32 * (tile_w + spacing);
-        let ty = grid_y + row as f32 * (tile_h + spacing);
-        let selected = idx == selected;
-        let accent_rgb = if t.group < 8 { config.col[t.group] } else { config.accent_color };
-        let accent = accent_rgb.to_f32();
-
-        // Depth: three expanding, fading rounded rects behind the tile. A real
-        // blur needs a second render pass; stacked rects read the same at this
-        // size and cost a handful of triangles.
-        for (grow, a) in [(10.0f32, 0.05f32), (6.0, 0.08), (3.0, 0.12)] {
-            push_rrect(
-                &mut gpu.rects, tx - grow, ty - grow + 4.0,
-                tile_w + grow * 2.0, tile_h + grow * 2.0,
-                [0.0, 0.0, 0.0, a], radius + grow, 
-            );
-        }
-        // Frame: the selected tile is ringed in its own group colour, the rest
-        // get a faint light edge.
-        if selected {
-            push_rrect(
-                &mut gpu.rects, tx - 2.0, ty - 2.0, tile_w + 4.0, tile_h + 4.0,
-                [accent[0], accent[1], accent[2], 0.95], radius + 2.0, 
-            );
-        } else {
-            push_rrect(
-                &mut gpu.rects, tx - 1.0, ty - 1.0, tile_w + 2.0, tile_h + 2.0,
-                [foreground[0], foreground[1], foreground[2], 0.12], radius + 1.0,
-            );
-        }
-        // Tiles are fully opaque on purpose: the terminal text is drawn below
-        // the dim, and the tiles cover it entirely. Between tiles the dimmed
-        // live terminal shows; inside a tile you see only that tab's preview.
-        let tile = if selected { theme::mix(config.tablist_background, accent_rgb, 0.16).to_f32() } else { surface };
-        let bgc = [tile[0], tile[1], tile[2], 1.0];
-        push_rrect(&mut gpu.rects, tx, ty, tile_w, tile_h, bgc, radius);
-
-        // Header: index chip in the accent colour, then the title.
-        let hx = tx + pad;
-        let hy = ty + pad;
-        push_rrect(
-            &mut gpu.rects, hx, hy, chip, chip,
-            [accent[0], accent[1], accent[2], 1.0], 3.0, 
-        );
-        let digits = if idx < 9 { 1 } else { 2 };
-        let num_x = hx + (chip - digits as f32 * tab_char_w) / 2.0;
-        push_ov_text(
-            pool, slot, fs, tab_attrs, &format!("{}", idx + 1),
-            num_x, hy - 1.0, 1.0, theme::on_color(accent_rgb).to_f32(), None, None, areas, bounds,
-        );
-        slot += 1;
-
-        let room = ((tile_w - pad * 2.0 - chip - 6.0) / tab_char_w).max(1.0) as usize;
-        let title: String = t.display_title().chars().take(room).collect();
-        let header_color: [f32; 3] = if selected { config.tab_color_fg_selected.to_f32() } else { config.tab_color_fg.to_f32() };
-        push_ov_text(
-            pool, slot, fs, tab_attrs, &title,
-            hx + chip + 6.0, hy - 1.0, 1.0, header_color, None, None, areas, bounds,
-        );
-        slot += 1;
-
-        // Preview area: a slightly deeper well inside the tile, for depth.
-        let thx = tx + pad;
-        let thy = ty + pad + header_h;
-        push_rrect(
-            &mut gpu.rects, thx - 1.0, thy - 1.0, thumb_w + 2.0, thumb_h + 2.0,
-            [background[0], background[1], background[2], 1.0], 4.0,
-        );
-        // Preview: a real render of the tab, sampled down. Every tile has one.
-        // A tile whose frame was not rebuilt this tick simply keeps showing its
-        // previous frame, so previews run at a few frames a second instead of
-        // stalling the overlay (see the rebuild budget in `draw`).
-        {
-            // Fit the whole window into the thumb, aspect intact, so the tile is
-            // a picture of the window -- the tab strip comes with it. The quad is
-            // pushed after the loop: `pool` holds `gpu` borrowed until then.
-            let s = (thumb_w / wf).min(thumb_h / hf);
-            let fw = wf * s;
-            let fh = hf * s;
-            tile_previews.push((
-                idx,
-                thx + (thumb_w - fw) / 2.0,
-                thy + (thumb_h - fh) / 2.0,
-                fw,
-                fh,
-            ));
-        }
-        // Entangled marker.
-        if t.entangled {
-            push_ov_text(
-                pool, slot, fs, tab_attrs, "* entangled",
-                thx, thy + thumb_h - tab_text_h, 1.0,
-                config.tab_color_entangle.to_f32(), None, None, areas, bounds,
-            );
-            slot += 1;
-        }
-    }
-
-    // Deferred until here: `push_preview_quad` needs `gpu`, and the tile text
-    // held it borrowed as `&mut gpu.pool` through the loop above.
-    for (tab, x, y, fw, fh) in tile_previews {
-        gpu.push_preview_quad(tab, x, y, fw, fh, wf, hf);
-    }
-}
-
 /// Parse a test key spec like "alt+shift+t", "ctrl+c", "esc", "f5".
 /// Test hook: read key specs from the $SPIKE_KEYS FIFO in a background
 /// thread and forward them over a channel. Returns None when unset.
@@ -2787,11 +2498,18 @@ fn spawn_key_reader(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
-        // A FIFO returns EOF when every writer closes. Our test harness opens
-        // and closes the FIFO per line, so reopen after each EOF and keep the
-        // reader alive (File::open blocks until the next writer attaches).
+        // Open the FIFO read-write: a FIFO opened O_RDONLY sees EOF (and
+        // blocks on the next open) every time the last writer closes, and a
+        // harness that closes and reopens per line can slip its next write
+        // into the gap between EOF and reopen -- a broken pipe the harness
+        // blames on a dead app. Holding a writer ourselves means the read
+        // side never EOFs and a reader always exists.
         loop {
-            let Ok(file) = std::fs::File::open(&path) else {
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            else {
                 return;
             };
             for line in BufReader::new(file).lines() {
