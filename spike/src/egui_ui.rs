@@ -162,8 +162,10 @@ const CARD_PAD: f32 = 10.0;
 const TITLE_MAX: f32 = 140.0;
 const CARD_TXT_GAP: f32 = 8.0;
 /// The thumbnail's height; its width follows the terminal's aspect.
-pub const THUMB_H: u32 = 52;
-pub const THUMB_W_RANGE: (u32, u32) = (40, 150);
+pub const THUMB_H: u32 = 76;
+/// The thumbnail width is `THUMB_H` times the terminal's aspect, clamped to
+/// this so an extreme aspect ratio cannot make a card absurdly wide.
+pub const THUMB_W_RANGE: (u32, u32) = (48, 240);
 const CARD_GAP: f32 = 12.0;
 
 /// A card's exact width: pads plus the wider of the text block and the
@@ -787,9 +789,14 @@ mod regression {
     fn switcher_screen_layout() {
         let ctx = Context::default();
         ctx.set_visuals(egui::Visuals::dark());
+        // A realistic thumbnail size for a ~5:3 terminal at THUMB_H.
+        let (tw, th) = (128u32, THUMB_H);
         let tex = ctx.load_texture(
             "test-thumb",
-            egui::ColorImage::from_rgba_unmultiplied([64, 52], &[7u8, 9, 11, 255].repeat(64 * 52)),
+            egui::ColorImage::from_rgba_unmultiplied(
+                [tw as usize, th as usize],
+                &[7u8, 9, 11, 255].repeat((tw * th) as usize),
+            ),
             egui::TextureOptions::LINEAR,
         );
         let cards: Vec<SwitcherCard> = (0..8)
@@ -798,7 +805,7 @@ mod regression {
                 active: i == 1,
                 marker: i == 3,
                 cwd: if i % 2 == 0 { Some(format!("~/projects/x{i}")) } else { None },
-                thumb: if i < 3 { Some((tex.clone(), (64, 52))) } else { None },
+                thumb: if i < 3 { Some((tex.clone(), (tw, th))) } else { None },
             })
             .collect();
         // Wide screen: one row. Narrow screen: several centred rows.
@@ -839,7 +846,7 @@ mod regression {
                                 shape: egui::Shape::Rect(r),
                                 ..
                             } if (80.0..300.0).contains(&r.rect.size().x)
-                                && (40.0..130.0).contains(&r.rect.size().y)
+                                && (40.0..170.0).contains(&r.rect.size().y)
                                 && r.rect.min.y >= 0.0
                                 && r.rect.max.y <= h + 1.0
                                 && r.rect.min.x >= 0.0
@@ -870,12 +877,15 @@ mod regression {
                     .iter()
                     .filter(|r| {
                         (80.0..300.0).contains(&r.size().x)
-                            && (40.0..130.0).contains(&r.size().y)
+                            && (40.0..170.0).contains(&r.size().y)
                     })
                     .collect();
                 let images: Vec<&egui::Rect> = rects
                     .iter()
-                    .filter(|r| (60.0..68.0).contains(&r.size().x) && (50.0..54.0).contains(&r.size().y))
+                    .filter(|r| {
+                        (tw as f32 - 1.0..tw as f32 + 1.0).contains(&r.size().x)
+                            && (th as f32 - 1.0..th as f32 + 1.0).contains(&r.size().y)
+                    })
                     .collect();
                 let with_thumbs = cards.iter().filter(|c| c.thumb.is_some()).count();
                 assert_eq!(images.len(), with_thumbs, "thumbnail images missing");
