@@ -13,7 +13,7 @@ env = dict(os.environ, HOME=str(work), RUST_LOG='info', PATH=str(helpers)+os.pat
 env.pop('WAYLAND_DISPLAY', None)
 env.pop('SPIKE_KEYS', None)
 log = (work / 'app.log').open('w')
-app = sp.Popen([str(root / 'spike/target/debug/spike'), '/usr/bin/python3', str(root / 'spike/tests/pty_fixture.py'), str(work)], env=env, stdout=log, stderr=log)
+app = sp.Popen([os.environ.get('SPIKE_BIN', str(root / 'spike/target/debug/spike')), '/usr/bin/python3', str(root / 'spike/tests/pty_fixture.py'), str(work)], env=env, stdout=log, stderr=log)
 
 def run(*args, **kw):
     if args[0] == 'xsel': args = ('/usr/bin/xsel', *args[1:])

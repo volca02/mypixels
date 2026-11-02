@@ -46,7 +46,7 @@ env = dict(os.environ, HOME=str(work), SPIKE_CONFIG=str(work / '.mypixels'),
            SPIKE_KEYS=str(keys), RUST_LOG='info')
 env.pop('WAYLAND_DISPLAY', None)
 log = (work / 'app.log').open('w')
-app = sp.Popen([str(root / 'target/debug/spike'), 'python3', str(fixture)],
+app = sp.Popen([os.environ.get('SPIKE_BIN', str(root / 'target/debug/spike')), 'python3', str(fixture)],
                env=env, stdout=log, stderr=log)
 
 
