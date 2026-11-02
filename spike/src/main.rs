@@ -362,6 +362,9 @@ struct App {
     /// terminal; Enter commits, Esc cancels.
     renaming: bool,
     rename_draft: String,
+    /// The seeded draft still stands in for a selection: the first
+    /// keystroke replaces it instead of appending (GTK select-all).
+    rename_fresh: bool,
     /// Alt-held visual switcher. Releasing Alt keeps its selected tab.
     overview: Option<OverviewState>,
     /// The egui switcher's thumbnails: per tab, the readback texture, the size
@@ -614,6 +617,7 @@ impl App {
             term_pt,
             renaming: false,
             rename_draft: String::new(),
+            rename_fresh: false,
             overview: None,
             sw_thumbs: Vec::new(),
             thumb_rr: 0,
@@ -1543,7 +1547,7 @@ impl App {
                 self.cell_h,
                 [self.bg[0], self.bg[1], self.bg[2], 1.0],
             );
-            let prompt = if self.renaming { format!("Rename: {}", self.rename_draft) }
+            let prompt = if self.renaming { format!("Rename: [{}]", self.rename_draft) }
                 else { format!("  {}", self.notice.as_ref().unwrap().0) };
             {
                 let fs = &mut self.font_system;
@@ -2090,10 +2094,24 @@ impl App {
                 self.renaming = false;
             },
             Key::Named(NamedKey::Backspace) => {
-                self.rename_draft.pop();
+                if self.rename_fresh {
+                    self.rename_draft.clear(); // delete the "selection"
+                } else {
+                    self.rename_draft.pop();
+                }
+                self.rename_fresh = false;
             },
             Key::Character(c) => {
-                self.rename_draft.push_str(c);
+                if self.rename_fresh {
+                    // The seeded title acted as selected text: typing over
+                    // a selection replaces it. Appending turned `shell` into
+                    // `shellworktree` -- the original's GTK entry select-all
+                    // never did that.
+                    self.rename_draft = c.to_string();
+                } else {
+                    self.rename_draft.push_str(c);
+                }
+                self.rename_fresh = false;
             },
             _ => {},
         }
@@ -2300,9 +2318,11 @@ impl App {
             "enlarge_font" => self.zoom_term(true),
             "shrink_font" => self.zoom_term(false),
             "rename_tab" => {
-                // Pre-fill the draft with the current displayed title; the
-                // inline prompt takes over from the next key.
+                // Pre-fill the draft with the current displayed title; it
+                // stands in for selected text (Enter keeps it, the first
+                // typed key replaces it) like the original's GTK entry.
                 self.rename_draft = self.tabs[self.active].display_title();
+                self.rename_fresh = true;
                 self.renaming = true;
             },
             // Not yet ported
