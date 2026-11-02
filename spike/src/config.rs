@@ -874,3 +874,12 @@ mod tests {
         assert!(out.contains("term_opacity: 0.1")); // default is 0.1, unchanged
     }
 }
+
+/// The terminal background the ORIGINAL actually paints: with no 16-color
+/// palette set, VTE's background is `bg_tint_color` (the pywal loader keeps
+/// `bg_tint_color` equal to the palette background when one is active, and
+/// `background_color` is not consulted on that path). Reading only
+/// `background_color` made `bg_tint_color` a dead key in the rewrite.
+pub fn terminal_bg(c: &Config) -> Rgb {
+    if c.palette.is_some() { c.background_color } else { c.bg_tint_color }
+}

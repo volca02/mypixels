@@ -29,6 +29,8 @@ pub struct SpikeListener {
     pub exited: Arc<Mutex<Vec<usize>>>,
     /// last time the terminal produced output (drives cursor-blink cadence)
     pub last_activity: Arc<Mutex<std::time::Instant>>,
+    /// last BEL received (drives the visual bell flash)
+    pub bell: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl SpikeListener {
@@ -49,6 +51,11 @@ impl EventListener for SpikeListener {
             Event::Title(t) => {
                 *self.title.lock().unwrap() = t;
                 *self.last_activity.lock().unwrap() = std::time::Instant::now();
+                self.notify_window();
+            },
+            Event::Bell => {
+                log::info!("bell received (tab {})", self.tab_id);
+                *self.bell.lock().unwrap() = Some(std::time::Instant::now());
                 self.notify_window();
             },
             Event::Exit | Event::ChildExit(_) => {
@@ -110,6 +117,7 @@ impl Tab {
             title: Arc::new(Mutex::new(String::new())),
             exited: Arc::clone(&shared.exited),
             last_activity: Arc::clone(&shared.last_activity),
+            bell: Arc::clone(&shared.bell),
         };
 
         let term = Arc::new(FairMutex::new(Term::new(

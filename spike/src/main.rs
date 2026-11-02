@@ -389,6 +389,8 @@ struct App {
     /// Last terminal output time (shared with the pty listeners); the clock
     /// thread reads it to keep the cursor solid right after activity.
     last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// last BEL seen anywhere (visual bell; see bell_flash)
+    bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -487,7 +489,7 @@ impl App {
         );
 
         let fg = config.foreground_color.to_f32();
-        let bg = config.background_color.to_f32();
+        let bg = crate::config::terminal_bg(&config).to_f32();
 
         let args: Vec<String> = std::env::args().collect();
         let (program, args) = if args.len() > 1 {
@@ -504,9 +506,11 @@ impl App {
             title: Arc::new(Mutex::new(String::new())),
             exited: Arc::new(Mutex::new(Vec::new())),
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
+            bell: Arc::new(Mutex::new(None)),
         };
         let exited = Arc::clone(&shared.exited);
         let last_activity = Arc::clone(&shared.last_activity);
+        let bell = Arc::clone(&shared.bell);
         // Cursor blink phase, toggled by the clock thread (activity-aware).
         let cursor_blink = Arc::new(AtomicBool::new(true));
 
@@ -627,6 +631,7 @@ impl App {
             switcher_open,
             cursor_blink,
             last_activity,
+            bell,
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -694,6 +699,7 @@ impl App {
             title: Arc::new(Mutex::new(String::new())),
             exited: Arc::clone(&self.exited),
             last_activity: Arc::clone(&self.last_activity),
+            bell: Arc::clone(&self.bell),
         }
     }
 
@@ -770,7 +776,7 @@ impl App {
     /// when the font changed, the cell metrics + glyph pools.
     fn apply_config(&mut self, font_changed: bool) {
         self.fg = self.config.foreground_color.to_f32();
-        self.bg = self.config.background_color.to_f32();
+        self.bg = crate::config::terminal_bg(&self.config).to_f32();
         if let Some(gpu) = &mut self.gpu {
             gpu.slot_sig.fill(0);
             gpu.prev_sigs.fill(0);
@@ -1093,12 +1099,24 @@ impl App {
         // still painted underneath it -- that is what the backdrop dims.
         // Every tab's frame is built first (thumbnails are live), before the
         // borrow of `tab` ends.
+        // Visual bell: a brief lift of the background, VTE's built-in bell
+        // with the sound removed. Run colors resolve from `self.bg` at build
+        // time, so lifting it for the duration of the builds flashes the
+        // whole terminal -- glyphs included -- not just the gaps between
+        // runs. Frames re-request each other while lit.
+        let bell_k = self.bell_flash();
+        let saved_bg = self.bg;
+        if bell_k > 0.0 {
+            self.bg = bell_mix(self.bg, bell_k);
+            window.request_redraw();
+        }
         let ov_frames: Vec<FrameData> = if self.overview.is_some() {
             self.tabs.iter().map(|t| self.build_frame(t, true)).collect()
         } else {
             Vec::new()
         };
         let frame = self.build_frame(tab, blink);
+        self.bg = saved_bg;
         let t_built = t_start.elapsed();
         let show_strip = self.show_tab_strip();
         let (w, h) = match &self.gpu {
@@ -1116,7 +1134,7 @@ impl App {
             self.config.term_font.clone(),
             self.config.tablist_font.clone(),
             self.config.foreground_color,
-            self.config.background_color,
+            crate::config::terminal_bg(&self.config),
             self.config.col,
         );
         let mut full_output: Option<egui::FullOutput> = None;
@@ -1231,7 +1249,7 @@ impl App {
             let font_changed = old_text_state.0 != self.config.term_font
                 || old_text_state.1 != self.config.tablist_font;
             let colors_changed = old_text_state.2 != self.config.foreground_color
-                || old_text_state.3 != self.config.background_color
+                || old_text_state.3 != crate::config::terminal_bg(&self.config)
                 || old_text_state.4 != self.config.col;
             if font_changed || colors_changed {
                 self.apply_config(font_changed);
@@ -2592,7 +2610,7 @@ fn draw_overview(
     let pool = &mut gpu.ov_pool;
     let mut slot = 0usize;
 
-    let background = config.background_color.to_f32();
+    let background = crate::config::terminal_bg(config).to_f32();
     let foreground = config.foreground_color.to_f32();
     let surface = config.tablist_background.to_f32();
     // The theme's background also works as a wash for light palettes.
@@ -2802,6 +2820,33 @@ fn spawn_key_reader(
         }
     });
     Some(rx)
+}
+
+impl App {
+    /// Visual-bell strength: 1.0 at the BEL, fading to 0 over 180ms.
+    fn bell_flash(&self) -> f32 {
+        let b = self.bell.lock().unwrap();
+        match *b {
+            Some(t) => {
+                let e = t.elapsed().as_secs_f32();
+                if e < 0.18 {
+                    1.0 - e / 0.18
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        }
+    }
+}
+
+/// Lift `bg` toward a neutral grey by `k` (see bell_flash).
+fn bell_mix(bg: [f32; 3], k: f32) -> [f32; 3] {
+    if k <= 0.0 {
+        return bg;
+    }
+    let w = k * 0.5;
+    std::array::from_fn(|i| bg[i] + (0.35 - bg[i]) * w)
 }
 
 /// A 32x32 window icon drawn in code (a prompt bar and block cursor on a
