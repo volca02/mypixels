@@ -32,6 +32,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::wayland::WindowAttributesExtWayland as _;
 use winit::window::{Window, WindowId};
 
 use config::Config;
@@ -2803,6 +2804,35 @@ fn spawn_key_reader(
     Some(rx)
 }
 
+/// A 32x32 window icon drawn in code (a prompt bar and block cursor on a
+/// dark field) -- no asset to ship, and the XDG icon lookup is not our job.
+/// Wayland largely ignores window icons; X11 and window switchers use it.
+fn app_icon() -> Option<winit::window::Icon> {
+    static ICON: OnceLock<Option<Arc<winit::window::Icon>>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        const S: usize = 32;
+        let mut px = vec![0u8; S * S * 4];
+        for y in 0..S {
+            for x in 0..S {
+                let inside = (2..30).contains(&x) && (2..30).contains(&y);
+                let bar = (20..24).contains(&y) && (6..14).contains(&x);
+                let block = (8..24).contains(&y) && (18..26).contains(&x);
+                let c: [u8; 4] = if bar || block {
+                    [0xa8, 0xc8, 0x44, 0xff]
+                } else if inside {
+                    [0x18, 0x18, 0x18, 0xff]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                px[(y * S + x) * 4..][..4].copy_from_slice(&c);
+            }
+        }
+        winit::window::Icon::from_rgba(px, S as u32, S as u32).ok().map(Arc::new)
+    })
+    .as_ref()
+    .map(|a| (**a).clone())
+}
+
 fn parse_key_spec(spec: &str) -> Option<(ModifiersState, Key)> {
     let mut mods = ModifiersState::empty();
     let mut keypart = "";
@@ -2984,7 +3014,15 @@ impl ApplicationHandler for App {
                             // Only worth requesting when we will use it: an
                             // ARGB visual costs the compositor a second blend.
                             .with_transparent(self.config.term_opacity > 0.0)
-                            .with_title("mypixels"),
+                            .with_title("mypixels")
+                            // Compositor identity: this is the wayland app_id
+                            // (and the X11 WM_CLASS), which the original set
+                            // to "mypixels" through Gtk.Application. Rules
+                            // people wrote for the original -- open on
+                            // workspace, no decorations, opacity exceptions
+                            // -- must keep matching the rewrite.
+                            .with_name("mypixels", "mypixels")
+                            .with_window_icon(app_icon()),
                     )
                     .expect("window"),
             );
