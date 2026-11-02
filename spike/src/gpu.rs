@@ -803,6 +803,7 @@ impl Gpu {
         overlay: Option<OverlayPhase<'_>>,
         previews: Vec<PreviewJob>,
         window: &Window,
+        mut egui: Option<crate::egui_ui::EguiFrame<'_>>,
     ) {
         let (w, h) = (self.config.width, self.config.height);
         let size = self.prev_size;
@@ -928,6 +929,18 @@ impl Gpu {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+
+        // egui's buffers and textures must be in place before the pass that
+        // samples them, and their copies run before this encoder's submit.
+        let egui_updates = egui.as_mut().map(|e| {
+            let cbs = e
+                .renderer
+                .update_buffers(&self.device, &self.queue, &mut encoder, &e.paint_jobs, &e.screen);
+            // Texture deltas (the font atlas) before the pass samples them.
+            crate::egui_ui::apply_textures(&self.device, &self.queue, e.renderer, e.full);
+            cbs
+        });
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
@@ -1024,6 +1037,19 @@ impl Gpu {
                         .expect("render");
                 }
             }
+
+            // Last: egui on top of everything (the config window). It clears
+            // nothing -- the pass was cleared transparent and egui only paints
+            // its own widgets, so the hand-drawn frame shows through.
+            if let Some(e) = egui.as_ref() {
+                // egui-wgpu wants a 'static pass; forget_lifetime is safe
+                // (the encoder is locked while the pass is live) and this is
+                // the pass's last use.
+                e.renderer.render(&mut pass.forget_lifetime(), &e.paint_jobs, &e.screen);
+            }
+        }
+        for cb in egui_updates.into_iter().flatten() {
+            self.queue.submit(Some(cb));
         }
         // Wayland uses this to request the compositor's next frame callback.
         // Without it a busy PTY can drive redraws as fast as the CPU can submit

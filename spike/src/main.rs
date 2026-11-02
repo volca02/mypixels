@@ -6,6 +6,7 @@
 
 mod clipboard;
 mod config;
+mod egui_ui;
 mod fonts;
 mod gpu;
 mod tab;
@@ -329,6 +330,9 @@ struct App {
     window_slot: Arc<Mutex<Option<Arc<Window>>>>,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
+    /// egui side: the configuration window, composited on top of the
+    /// hand-drawn frame by `Gpu::render_frame`.
+    egui: Option<egui_ui::Egui>,
     font_system: FontSystem,
     mono_attrs: Attrs<'static>,
     tab_attrs: Attrs<'static>,
@@ -568,6 +572,7 @@ impl App {
             window_slot,
             window: None,
             gpu: None,
+            egui: None,
             font_system,
             mono_attrs,
             tab_attrs,
@@ -597,7 +602,7 @@ impl App {
         let term_px = self.term_pt * 96.0 / 72.0 * self.scale;
         let (_, tab_pt) = config::parse_font(&self.config.tablist_font);
         let tab_px = tab_pt * 96.0 / 72.0 * self.scale;
-        self.gpu = Some(Gpu::init(
+        let gpu = Gpu::init(
             event_loop,
             window,
             &mut self.font_system,
@@ -605,7 +610,15 @@ impl App {
             self.cell_h,
             tab_px,
             self.tab_text_h,
+        );
+        self.egui = Some(egui_ui::Egui::init(
+            event_loop,
+            &gpu.device,
+            &gpu.queue,
+            gpu.config.format,
+            self.scale,
         ));
+        self.gpu = Some(gpu);
     }
 
     fn add_tab(&mut self) {
@@ -1042,6 +1055,145 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
+        // egui (configuration window): run the UI before the GPU is moved
+        // out of `self`, so applying a changed config can touch it.
+        // What the drawing caches depend on; the rest of the config is read
+        // live from `self.config` every frame.
+        let old_text_state = (
+            self.config.term_font.clone(),
+            self.config.tablist_font.clone(),
+            self.config.foreground_color,
+            self.config.background_color,
+            self.config.col,
+        );
+        let mut full_output: Option<egui::FullOutput> = None;
+        // The switcher draws through egui; its state machine stays in the
+        // app (Alt-hold open, navigation, Alt release dismiss). The
+        // hand-drawn overlay is kept behind SPIKE_HAND_SWITCHER for A/B
+        // until the egui cut is confirmed, then deleted with its previews.
+        let hand_switcher = std::env::var("SPIKE_HAND_SWITCHER").is_ok();
+        // The two renderers are mutually exclusive: with the env var set the
+        // hand-drawn overlay shows and the egui one stays out of the way.
+        let sw_open = !hand_switcher
+            && matches!(
+                self.overview.map(|o| o.mode),
+                Some(OverviewMode::Switcher)
+            );
+        let sw_selected = self.active;
+        let sw_cards: Vec<egui_ui::SwitcherCard> = if sw_open {
+            self.tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let mut title = t.display_title();
+                    let limit = if i == self.active {
+                        self.config.tab_title_short_current
+                    } else {
+                        self.config.tab_title_max_length
+                    };
+                    if limit > 0 && title.chars().count() > limit {
+                        title =
+                            title.chars().take(limit).collect::<String>()
+                                + &self.config.tab_shorten_str;
+                    }
+                    egui_ui::SwitcherCard {
+                        title,
+                        active: i == self.active,
+                        marker: t.entangled,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let acc = self.config.accent_color.to_f32();
+        let sw_accent = egui::Color32::from_rgb(
+            (acc[0] * 255.0) as u8,
+            (acc[1] * 255.0) as u8,
+            (acc[2] * 255.0) as u8,
+        );
+        let sw_dim = (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8;
+        {
+            let mut egui = self.egui.take();
+            if let Some(egui) = egui.as_mut() {
+                let raw = egui.state.take_egui_input(window);
+                let ctx = egui.ctx.clone();
+                let full = ctx.run_ui(raw, |ui| {
+                    let ev = egui_ui::config_window(
+                        ui.ctx(),
+                        &mut egui.config_open,
+                        &mut self.config,
+                        &mut egui.ui_state,
+                    );
+                    egui.config_changed = ev.apply;
+                    egui.save_requested = ev.save;
+                    egui.revert_requested = ev.revert;
+                    if sw_open {
+                        egui_ui::switcher_screen(
+                            ui,
+                            true,
+                            sw_selected,
+                            sw_dim,
+                            sw_accent,
+                            &sw_cards,
+                            &mut egui.switcher_pick,
+                        );
+                    }
+                });
+                // While the pointer is down on a slider, egui keeps asking
+                // for frames; forward that to winit's redraw path.
+                if ctx.requested_repaint_last_pass() {
+                    window.request_redraw();
+                }
+                full_output = Some(full);
+            }
+            self.egui = egui;
+        }
+        let (revert, changed, save) = self
+            .egui
+            .as_ref()
+            .map(|e| (e.revert_requested, e.config_changed, e.save_requested))
+            .unwrap_or_default();
+        if revert {
+            self.reload_config();
+        } else if changed {
+            // Re-apply only when a cached value moved. Opacity, switcher and
+            // geometry fields are read live per frame, and forcing a full
+            // re-shape on every slider tick would stutter the drag.
+            let font_changed = old_text_state.0 != self.config.term_font
+                || old_text_state.1 != self.config.tablist_font;
+            let colors_changed = old_text_state.2 != self.config.foreground_color
+                || old_text_state.3 != self.config.background_color
+                || old_text_state.4 != self.config.col;
+            if font_changed || colors_changed {
+                self.apply_config(font_changed);
+            }
+        }
+        if save {
+            match self.config.save() {
+                // Done on purpose: saving closes the window, so the user
+                // sees the result on the terminal, not in the dialog.
+                Ok(()) => {
+                    log::info!("configuration saved");
+                    if let Some(e) = self.egui.as_mut() {
+                        e.config_open = false;
+                    }
+                }
+                Err(err) => self.show_error(err),
+            }
+        }
+        if let Some(e) = self.egui.as_mut() {
+            e.config_changed = false;
+            e.save_requested = false;
+            e.revert_requested = false;
+            // A switcher card was clicked: activate that tab and dismiss.
+            if let Some(i) = e.take_switcher_pick() {
+                if i < self.tabs.len() {
+                    self.active = i;
+                }
+                self.close_switcher();
+            }
+        }
         // Moved out of `self` so the drawing code below can keep borrowing
         // other `self` fields freely. Put back before every exit.
         let mut gpu = self.gpu.take().expect("gpu present, checked above");
@@ -1370,7 +1522,8 @@ impl App {
         // plenty for a thumbnail. A tab that has never been drawn ignores the cap,
         // so opening the overlay fills the whole grid in one go.
         let mut jobs: Vec<gpu::PreviewJob> = Vec::new();
-        if let Some(ov) = &self.overview {
+        if hand_switcher {
+            if let Some(ov) = &self.overview {
             let n = self.tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
             gpu.ensure_previews(n, (w, h), &mut self.font_system);
@@ -1439,12 +1592,14 @@ impl App {
                 });
                 built += 1;
             }
+            }
         }
         // The switcher's rects and text must sit above the terminal text, so
         // everything `draw_overview` appends goes to `render_frame` as a
         // second phase: base rects, terminal text, then dim + tiles + text.
         let mut overlay: Option<gpu::OverlayPhase> = None;
-        if let Some(ov) = &self.overview {
+        if hand_switcher {
+            if let Some(ov) = &self.overview {
             let (rects_start, areas_start) = (gpu.rects.len(), areas.len());
             draw_overview(
                 &mut gpu,
@@ -1465,8 +1620,29 @@ impl App {
                 rects: gpu.rects.split_off(rects_start),
                 areas: areas.split_off(areas_start),
             });
+            }
         }
-        gpu.render_frame(&mut self.font_system, areas, overlay, jobs, window);
+        let egui_frame = match (full_output.as_mut(), self.egui.as_mut()) {
+            (Some(full), Some(egui)) => {
+                // Take the shapes out: `full` is behind a reference, and the
+                // tessellated jobs supersede them (only the texture deltas
+                // are still read from `full`).
+                let paint_jobs = egui
+                    .ctx
+                    .tessellate(std::mem::take(&mut full.shapes), full.pixels_per_point);
+                Some(egui_ui::EguiFrame {
+                    renderer: &mut egui.renderer,
+                    full,
+                    paint_jobs,
+                    screen: egui_wgpu::ScreenDescriptor {
+                        size_in_pixels: [w, h],
+                        pixels_per_point: self.scale,
+                    },
+                })
+            },
+            _ => None,
+        };
+        gpu.render_frame(&mut self.font_system, areas, overlay, jobs, window, egui_frame);
         self.gpu = Some(gpu);
 
         if std::env::var("SPIKE_TRACE").is_ok() {
@@ -1708,17 +1884,24 @@ impl App {
             self.handle_rename_key(key);
             return;
         }
-        // 1. Overview/switcher is modal: keys navigate/select tabs. Only keys
-        //    the overview doesn't claim fall through to the terminal.
-        if let Some(ov) = &self.overview {
-            match ov.mode {
-                OverviewMode::Switcher => self.handle_switcher_key(key),
+        // 1. The switcher claims only its own keys (arrows, Home/End, digits
+        //    and Esc with plain Alt); anything else falls through to the
+        //    normal handler, so configured bindings and the terminal keep
+        //    working while the switcher is open.
+        if self.overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
+            if self.handle_switcher_key(key) {
+                return;
             }
-            return;
         }
         // 2. Configured bindings
-        if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, false) {
+        let overview_active = self.overview.is_some();
+        if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
             self.do_action(&action, event_loop);
+            // A delegated action may have moved or closed the active tab;
+            // keep the highlighted tile in sync while the switcher is open.
+            if let Some(ov) = self.overview.as_mut() {
+                ov.selected = self.active;
+            }
             return;
         }
         // 3. Everything else goes to the active terminal
@@ -1785,17 +1968,27 @@ impl App {
         }
     }
 
-    /// Keys while the Alt-held switcher is open. Alt is held during navigation,
-    /// so match on the logical key (arrows, Home/End, digits) regardless of the
-    /// Alt modifier. Navigation changes the active tab live, so the preview and
-    /// the eventual commit are the same tab; Alt release just dismisses the
-    /// popup. Unhandled keys are dropped (the switcher is modal while held).
-    fn handle_switcher_key(&mut self, key: &Key) {
+    /// Keys while the Alt-held switcher is open. Returns whether the key is
+    /// one of the switcher's own bindings and was consumed. The switcher's
+    /// bindings are plain-Alt + arrow/Home/End/digit/Esc, so a key with any
+    /// other modifier (Ctrl+Shift+Left, Alt+Shift+X, ...) is *not* the
+    /// switcher's: it returns `false` and the caller delegates to the normal
+    /// handler (configured bindings, then the terminal). Navigation changes
+    /// the active tab live, so the preview and the eventual commit are the
+    /// same tab; Alt release just dismisses the popup.
+    fn handle_switcher_key(&mut self, key: &Key) -> bool {
         use winit::keyboard::NamedKey;
+        let alt_only = self.modifiers.alt_key()
+            && !self.modifiers.control_key()
+            && !self.modifiers.shift_key()
+            && !self.modifiers.super_key();
+        if !alt_only {
+            return false;
+        }
         let n = self.tabs.len();
         if n == 0 {
             self.close_switcher();
-            return;
+            return true;
         }
         let cols = grid_cols(n);
         let handled = match key {
@@ -1850,15 +2043,16 @@ impl App {
             },
             _ => false,
         };
-        // Keep the highlighted tile in sync with the active tab.
-        if let Some(ov) = self.overview.as_mut() {
-            ov.selected = self.active;
-        }
         if handled {
+            // Keep the highlighted tile in sync with the active tab.
+            if let Some(ov) = self.overview.as_mut() {
+                ov.selected = self.active;
+            }
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
+        handled
     }
 
     fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
@@ -1940,6 +2134,14 @@ impl App {
             },
             "config_reload" => {
                 self.reload_config();
+            },
+            "show_config" => {
+                if let Some(e) = self.egui.as_mut() {
+                    e.config_open = true;
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             },
             "goto_tab_0" | "goto_tab_1" | "goto_tab_2" | "goto_tab_3" | "goto_tab_4"
             | "goto_tab_5" | "goto_tab_6" | "goto_tab_7" | "goto_tab_8" | "goto_tab_9" => {
@@ -2724,6 +2926,15 @@ impl ApplicationHandler for App {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // egui first: it claims events for its own widgets (the config
+        // window) and lets the rest fall through to the app below. State
+        // events (resize, focus, modifiers) are never gated: the app needs
+        // them no matter what egui is doing.
+        let egui_consumed = self
+            .egui
+            .as_mut()
+            .map(|e| e.on_event(&window, &event))
+            .unwrap_or(false);
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -2774,6 +2985,13 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let px = position.x as f32;
                 let py = position.y as f32;
+                // The pointer position is app state, not an action: keep it
+                // current even while egui owns the pointer, so the next
+                // unclaimed click hit-tests against the right cell.
+                self.pointer = (px, py);
+                if egui_consumed {
+                    return;
+                }
                 // Terminal mouse reporting: all-motion mode reports every move,
                 // drag mode only while a button is held. The protocol has no
                 // sub-cell position, so one event per entered cell.
@@ -2810,7 +3028,6 @@ impl ApplicationHandler for App {
                     self.hover_add = hover_add;
                     window.request_redraw();
                 }
-                self.pointer = (px, py);
                 // Dragging extends the selection cell by cell: repainting on every
                 // pixel step would spend a frame per mouse sample.
                 if self.drag.is_some() {
@@ -2826,6 +3043,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+                if egui_consumed {
+                    return;
+                }
                 let at = self.pointer;
                 // While the app owns the mouse (and Shift is not bypassing it)
                 // the click is the app's, not the selection's: no paste, no
@@ -2888,6 +3108,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
+                if egui_consumed {
+                    return;
+                }
                 // A reported release goes back to the app; the coordinates fall
                 // back to the last reported cell when the pointer left the
                 // terminal area mid-drag.
@@ -2913,7 +3136,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
-                if key.state == ElementState::Pressed {
+                if key.state == ElementState::Pressed && !egui_consumed {
                     let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
                     let repeatable = action.as_deref().is_none_or(|action| matches!(action,
                         "prev_tab" | "next_tab" | "prev_tab_row" | "next_tab_row" |
@@ -2922,6 +3145,9 @@ impl ApplicationHandler for App {
                 }
             },
             WindowEvent::MouseWheel { delta, .. } => {
+                if egui_consumed {
+                    return;
+                }
                 // The wheel is part of the click protocol: while the app owns
                 // the mouse it scrolls the app, not the scrollback. Positive
                 // delta is the content moving down, i.e. wheel up.
@@ -2959,8 +3185,13 @@ impl ApplicationHandler for App {
                 let alt_down = !new.alt_key() && self.modifiers.alt_key();
                 self.modifiers = new;
                 if alt_up {
-                    // Alt pressed: start the switcher hold timer.
-                    *self.switcher_alt_at.lock().unwrap() = Some(std::time::Instant::now());
+                    // Alt pressed: start the switcher hold timer. Not while
+                    // the configuration window is open: Alt is a plain key
+                    // in its text fields, and a held "Altica" must not raise
+                    // the switcher behind the window.
+                    if !self.egui.as_ref().is_some_and(|e| e.config_open) {
+                        *self.switcher_alt_at.lock().unwrap() = Some(std::time::Instant::now());
+                    }
                     self.switcher_show_req.store(false, Ordering::SeqCst);
                 } else if alt_down {
                     // Alt released: commit (active tab is already the pick) and

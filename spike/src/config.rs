@@ -156,6 +156,7 @@ impl Default for Config {
         bind("search_prev", &["MOD1+SHIFT+a"]);
         bind("search_next", &["MOD1+SHIFT+d"]);
         bind("config_reload", &["CONTROL+SHIFT+r"]);
+        bind("show_config", &["MOD1+SHIFT+c"]);
         for (i, d) in (0..10).zip(["_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "_0"]) {
             bind(&format!("goto_tab_{i}"), &[&format!("MOD1+{d}")]);
         }
@@ -225,10 +226,15 @@ impl Config {
         Self::try_load().unwrap_or_else(|e| { log::warn!("{e}; using defaults"); Self::default() })
     }
 
-    pub fn try_load() -> Result<Config, String> {
-        let path = std::env::var_os("SPIKE_CONFIG").map(std::path::PathBuf::from)
+    /// The file the configuration is read from (and written to on save):
+    /// $SPIKE_CONFIG, else ~/.mypixels.
+    pub fn config_path() -> Option<std::path::PathBuf> {
+        std::env::var_os("SPIKE_CONFIG").map(std::path::PathBuf::from)
             .or_else(|| dirs::home_dir().map(|p| p.join(".mypixels")))
-            .ok_or("Cannot determine configuration path")?;
+    }
+
+    pub fn try_load() -> Result<Config, String> {
+        let path = Self::config_path().ok_or("Cannot determine configuration path")?;
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -249,6 +255,84 @@ impl Config {
         cfg.theme_files.dedup();
         Ok(cfg)
     }
+
+    /// Persist the fields the configuration UI edits, in place: each
+    /// top-level key's value line is replaced, anything else (comments,
+    /// bindings, palettes, keys the UI does not touch) stays byte for
+    /// byte. Keys the file does not have yet are appended.
+    pub fn save(&self) -> Result<(), String> {
+        let path = Self::config_path().ok_or("Cannot determine configuration path")?;
+        self.save_to(&path)
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let out = replace_top_level_values(&text, &Self::ui_keys(self));
+        std::fs::write(path, out).map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    }
+
+    /// (yaml key, value text) for every field the configuration UI can change.
+    fn ui_keys(&self) -> Vec<(String, String)> {
+        let rgb = |r: &Rgb| format!("'#{:02x}{:02x}{:02x}'", r.0, r.1, r.2);
+        let str_ = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut keys = vec![
+            ("term_font".into(), str_(&self.term_font)),
+            ("tablist_font".into(), str_(&self.tablist_font)),
+            ("term_opacity".into(), self.term_opacity.to_string()),
+            ("scrollback_lines".into(), self.scrollback_lines.to_string()),
+            ("background_color".into(), rgb(&self.background_color)),
+            ("foreground_color".into(), rgb(&self.foreground_color)),
+            ("selection_color".into(), rgb(&self.selection_color)),
+            ("cursor_color".into(), rgb(&self.cursor_color)),
+            ("accent_color".into(), rgb(&self.accent_color)),
+            ("bg_tint_color".into(), rgb(&self.bg_tint_color)),
+            ("tablist_background".into(), rgb(&self.tablist_background)),
+            ("tab_color_bg".into(), rgb(&self.tab_color_bg)),
+            ("tab_color_bg_selected".into(), rgb(&self.tab_color_bg_selected)),
+            ("tab_color_fg".into(), rgb(&self.tab_color_fg)),
+            ("tab_color_fg_selected".into(), rgb(&self.tab_color_fg_selected)),
+            ("add_button_color".into(), rgb(&self.add_button_color)),
+            ("tab_title_max_length".into(), self.tab_title_max_length.to_string()),
+            ("tab_title_short_current".into(), self.tab_title_short_current.to_string()),
+            ("tab_overview_on_alt".into(), self.tab_overview_on_alt.to_string()),
+            ("tab_overview_opacity".into(), self.tab_overview_opacity.to_string()),
+            ("tab_overview_delay_ms".into(), self.tab_overview_delay_ms.to_string()),
+            ("tab_overview_thumb_width".into(), self.tab_overview_thumb_width.to_string()),
+            ("tab_overview_thumb_height".into(), self.tab_overview_thumb_height.to_string()),
+            ("focus_new_tabs".into(), self.focus_new_tabs.to_string()),
+            ("hide_single_tab".into(), self.hide_single_tab.to_string()),
+            ("multiline_tabs".into(), self.multiline_tabs.to_string()),
+            ("tablist_top".into(), self.tablist_top.to_string()),
+            ("tablist_hide".into(), self.tablist_hide.to_string()),
+            ("tab_title_shorten_start".into(), self.tab_title_shorten_start.to_string()),
+            ("default_width".into(), self.default_width.to_string()),
+            ("default_height".into(), self.default_height.to_string()),
+            ("default_maximize".into(), self.default_maximize.to_string()),
+        ];
+        for (i, c) in self.col.iter().enumerate() {
+            keys.push((format!("col_{i}"), rgb(c)));
+        }
+        keys
+    }
+}
+
+/// Replace the value of each top-level `key:` line in `text`; absent keys
+/// are appended. A top-level key line starts at column 0 with `key:`, so
+/// replacing `col_0` cannot touch `col_1`, and indented keys (bindings,
+/// palette lists) never match. Everything after the colon on the line is
+/// the value -- true for every scalar in this file format.
+pub fn replace_top_level_values(text: &str, keys: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    for (key, value) in keys {
+        let prefix = format!("{key}:");
+        match lines.iter().position(|l| l == key || l.starts_with(&prefix)) {
+            Some(i) => lines[i] = format!("{prefix} {value}"),
+            None => lines.push(format!("{prefix} {value}")),
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 fn top_level_key(line: &str) -> Option<String> {
@@ -748,5 +832,45 @@ mod tests {
 
         assert!(Binding::parse("").is_none());
         assert!(Binding::parse("FOO+x").is_none()); // unknown modifier
+    }
+
+    #[test]
+    fn replace_keeps_comments_and_replaces_in_place() {
+        let text = "# upraveno\nautohide_delay: -1\nterm_opacity: 0.1\n# a comment\ncol_0: '#111111'\n";
+        let out = replace_top_level_values(text, &[
+            ("term_opacity".into(), "0.7".into()),
+            ("col_0".into(), "'#ff0000'".into()),
+        ]);
+        assert_eq!(
+            out,
+            "# upraveno\nautohide_delay: -1\nterm_opacity: 0.7\n# a comment\ncol_0: '#ff0000'\n"
+        );
+    }
+
+    #[test]
+    fn replace_appends_missing_keys_at_end() {
+        let text = "term_opacity: 0.1\n";
+        let out = replace_top_level_values(text, &[("tablist_top".into(), "false".into())]);
+        assert_eq!(out, "term_opacity: 0.1\ntablist_top: false\n");
+    }
+
+    #[test]
+    fn replace_does_not_touch_indented_or_prefixed_keys() {
+        let text = "  col_0: nested\ncol_0: '#111111'\ncol_1: '#222222'\n";
+        let out = replace_top_level_values(text, &[("col_0".into(), "'#333333'".into())]);
+        assert_eq!(out, "  col_0: nested\ncol_0: '#333333'\ncol_1: '#222222'\n");
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_bindings_and_comments() {
+        let cfg = Config::default();
+        let text = "# c\nbindings:\n  new_tab: CONTROL+SHIFT+t\ncol_0: '#000000'\nterm_opacity: 0.1\n";
+        let out = replace_top_level_values(text, &cfg.ui_keys());
+        // Bindings block and its indented entries survive byte for byte.
+        assert!(out.contains("bindings:\n  new_tab: CONTROL+SHIFT+t\n"));
+        assert!(out.starts_with("# c\n"));
+        // Every managed key is present exactly once.
+        assert_eq!(out.lines().filter(|l| l.starts_with("term_opacity:")).count(), 1);
+        assert!(out.contains("term_opacity: 0.1")); // default is 0.1, unchanged
     }
 }
