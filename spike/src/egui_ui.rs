@@ -678,8 +678,11 @@ pub fn config_window(
                 });
 
             });
+            // Every color chooser lives in this one section, grouped by
+            // where it paints; the other sections stay colour-free.
             ui.heading("Colors");
-            egui::Grid::new("colors").show(ui, |ui| {
+            ui.strong("Terminal");
+            egui::Grid::new("colors-terminal").show(ui, |ui| {
                 color_row(ui, "Background", &mut cfg.background_color, &mut ev);
                 color_row(ui, "Foreground", &mut cfg.foreground_color, &mut ev);
                 color_row(ui, "Selection", &mut cfg.selection_color, &mut ev);
@@ -699,7 +702,15 @@ pub fn config_window(
                         });
                     }
                 });
-
+            });
+            ui.strong("Tab strip");
+            egui::Grid::new("colors-tabs").show(ui, |ui| {
+                color_row(ui, "Strip", &mut cfg.tablist_background, &mut ev);
+                color_row(ui, "Tab", &mut cfg.tab_color_bg, &mut ev);
+                color_row(ui, "Tab (active)", &mut cfg.tab_color_bg_selected, &mut ev);
+                color_row(ui, "Tab text", &mut cfg.tab_color_fg, &mut ev);
+                color_row(ui, "Tab text (active)", &mut cfg.tab_color_fg_selected, &mut ev);
+                color_row(ui, "Add button", &mut cfg.add_button_color, &mut ev);
             });
             ui.heading("Tabs");
             egui::Grid::new("tabs").show(ui, |ui| {
@@ -712,12 +723,6 @@ pub fn config_window(
                     choices,
                     &mut ev,
                 );
-                color_row(ui, "Strip", &mut cfg.tablist_background, &mut ev);
-                color_row(ui, "Tab", &mut cfg.tab_color_bg, &mut ev);
-                color_row(ui, "Tab (active)", &mut cfg.tab_color_bg_selected, &mut ev);
-                color_row(ui, "Tab text", &mut cfg.tab_color_fg, &mut ev);
-                color_row(ui, "Tab text (active)", &mut cfg.tab_color_fg_selected, &mut ev);
-                color_row(ui, "Add button", &mut cfg.add_button_color, &mut ev);
                 row(ui, "Title length", |ui| {
                     if ui.add(egui::DragValue::new(&mut cfg.tab_title_max_length)).changed() {
                         ev.apply = true;
