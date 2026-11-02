@@ -3256,6 +3256,21 @@ impl ApplicationHandler for App {
                 if egui_consumed {
                     return;
                 }
+                // Ctrl+wheel zooms the font, matching the original's GTK
+                // accelerator. Checked before mouse reporting on purpose:
+                // GTK gave the accelerator priority over the terminal too,
+                // so vim cannot take the wheel while Ctrl is held.
+                if self.modifiers.control_key() {
+                    let z = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as f64,
+                        MouseScrollDelta::PixelDelta(p) => p.y,
+                    };
+                    if z != 0.0 {
+                        self.zoom_term(z > 0.0);
+                        window.request_redraw();
+                        return;
+                    }
+                }
                 // The wheel is part of the click protocol: while the app owns
                 // the mouse it scrolls the app, not the scrollback. Positive
                 // delta is the content moving down, i.e. wheel up.
