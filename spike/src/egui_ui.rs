@@ -1629,3 +1629,127 @@ mod input_regression {
         assert!(l2.len() <= l.len(), "the filter did not narrow the family list");
     }
 }
+
+/// Headless UI benchmark. Drives a real egui Context with scripted events
+/// through the same config window the app renders, per scenario, printing
+/// `BENCH <name> avg_ms=..` per scenario. Run it (and only it) with:
+///
+///   cargo test --release bench_ui -- --ignored --nocapture --test-threads=1
+///
+/// The numbers are egui CPU per frame (input, layout, galleys,
+/// tessellation): what one UI frame costs before winit/wgpu/GPU are
+/// involved. Compare scenario deltas to locate UI optimization work; run
+/// the test binary under `perf record` for symbol-level detail.
+#[cfg(test)]
+mod ui_bench {
+    use super::*;
+    use std::time::Instant;
+
+    struct Bench {
+        ctx: Context,
+        st: UiState,
+        cfg: crate::config::Config,
+        open: bool,
+        choices: Vec<crate::fonts::FontChoice>,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            let ctx = Context::default();
+            ctx.set_visuals(egui::Visuals::dark());
+            let mut db = glyphon::fontdb::Database::new();
+            db.load_system_fonts();
+            let choices = crate::fonts::font_choices(&db);
+            let mut cfg = crate::config::Config::default();
+            cfg.term_font = format!("{} 13", choices[choices.len() / 2].name);
+            Bench { ctx, st: UiState { font_popup: None }, cfg, open: true, choices }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> usize {
+            let Self { ctx, st, cfg, open, choices } = self;
+            let mut full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1280.0, 720.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    config_window(ui, open, cfg, st, choices);
+                },
+            );
+            full.textures_delta.clear();
+            full.shapes.len()
+        }
+
+        fn timed(&mut self, name: &str, n: u32, mut ev_of: impl FnMut(u32) -> Vec<egui::Event>) {
+            let mut shapes = 0;
+            for i in 0..n / 3 {
+                shapes = self.frame(ev_of(i)); // warmup: lazy font loads, caches
+            }
+            let t0 = Instant::now();
+            for i in 0..n {
+                shapes = self.frame(ev_of(i));
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            println!("BENCH {name:14} avg_ms={ms:.3}  shapes={shapes}");
+        }
+    }
+
+    #[test]
+    #[ignore = "UI benchmark; run explicitly with --release"]
+    fn bench_ui() {
+        let n = 600;
+        let mut b = Bench::new();
+        println!("BENCH families={}", b.choices.len());
+
+        b.open = false;
+        b.timed("closed", n, |_| vec![]); // egui pass doing nothing
+        b.open = true;
+        b.timed("panel", n, |_| vec![]); // config panel, idle
+        b.timed("panel-hover", n, |i| {
+            // hover animations: widgets re-layout under the pointer
+            vec![egui::Event::PointerMoved(egui::pos2(
+                1000.0 + (i % 60) as f32,
+                200.0 + (i % 90) as f32,
+            ))]
+        });
+
+        // ---- font popup ----
+        let seed = seed_popup(FontWhich::Term, &b.cfg.term_font.clone(), &b.choices.clone());
+        b.st.font_popup = Some(seed);
+        b.timed("popup", n, |_| vec![]);
+        // keystroke in the filter: list rebuild + relayout of every visible
+        // row; a Backspace after every character keeps the search (and the
+        // list) from drifting to empty over the run
+        let letters: Vec<char> = "onericSerifMonoDingbat".chars().collect();
+        let mods = egui::Modifiers::default();
+        b.timed("popup-filter", n, |i| {
+            if i % 2 == 0 {
+                vec![egui::Event::Text(letters[(i as usize / 2) % letters.len()].to_string())]
+            } else {
+                vec![egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: mods,
+                }]
+            }
+        });
+        b.timed("popup-scroll", n, |_| {
+            vec![
+                egui::Event::PointerMoved(egui::pos2(760.0, 300.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -24.0),
+                    modifiers: mods,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                },
+            ]
+        });
+    }
+}
