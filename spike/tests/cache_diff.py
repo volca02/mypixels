@@ -22,7 +22,11 @@ from PIL import Image
 root = Path(__file__).resolve().parents[1]
 OLD = os.environ.get('OLD_BIN', str(root / 'target/debug/spike'))
 NEW = os.environ.get('NEW_BIN', str(root / 'target/release/spike'))
-TOLERANCE = 0.0015  # fraction of terminal pixels allowed to differ
+# Cursor blink is a free-running phase between runs (and the strip's clock
+# sits just outside the crop); a cell plus antialiasing is ~0.06%. Half a
+# percent still catches any real regression: the pre-cache-vs-cache bugs
+# this test was written for measured 3-11%.
+TOLERANCE = 0.005
 
 CONFIG = """term_font: Cascadia Code 12
 tablist_font: Terminus (TTF) 12
@@ -55,15 +59,47 @@ def run_session(binary: str, tag: str) -> tuple[Path, dict]:
         # as its spec name; single characters map 1:1.
         keys_write(['space' if c == ' ' else c for c in s])
 
-    def press(*specs: str):
+    def press(*specs: str, settle: float = 0.0):
         keys_write(list(specs))
+        if settle:
+            time.sleep(settle)
 
-    def shot(name: str, w: int, h: int) -> tuple[str, Image.Image]:
-        path = work / f'{name}.png'
+    def run_cmd(text: str):
+        # Submit with two returns: a newline swallowed while the prompt was
+        # still being written (slow debug shells) glued commands together.
+        type_(text)
+        press('return', settle=0.4)
+        press('return', settle=0.4)
+        if settle:
+            time.sleep(settle)
+
+    def grab(w: int, h: int) -> Image.Image:
+        path = work / 'grab.png'
         sp.run(['import', '-window', 'root', str(path)], env=env, check=True, timeout=5)
         img = Image.open(path).convert('RGB')
-        strip = SHOT.strip_h
-        return name, img.crop((0, strip, w, h))
+        return img.crop((0, strip0, w, h))
+
+    strip0 = 0  # set once geometry is parsed
+
+    def quiet(w: int, h: int, secs: float = 15.0) -> None:
+        """Block until two consecutive grabs (0.4s apart) are identical: the
+        screen has settled. Sleeping a fixed time instead raced slow shells:
+        keystrokes landing before a prompt is ready glue commands together."""
+        prev = grab(w, h)
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            time.sleep(0.4)
+            now = grab(w, h)
+            if now.tobytes() == prev.tobytes():
+                return
+            prev = now
+
+    def shot(name: str, w: int, h: int) -> tuple[str, Image.Image]:
+        quiet(w, h)
+        img = grab(w, h)
+        path = work / f'{name}.png'
+        img.save(path)
+        return name, img
 
     def parse_geom() -> tuple[int, int, int]:
         info = (work / 'app.log').read_text()
@@ -79,25 +115,31 @@ def run_session(binary: str, tag: str) -> tuple[Path, dict]:
             if 'SPY active=' in (work / 'app.log').read_text():
                 break
         assert app.poll() is None, 'app died at boot:\n' + (work / 'app.log').read_text()[-2000:]
-        w, h, SHOT.strip_h = parse_geom()
+        w, h, strip0 = parse_geom()
+        quiet(w, h)
 
         steps = [
-            ('seq',        lambda: (type_('seq 1 400'), press('return')),             2.0),
-            ('scrolled',   lambda: press(*(['pgup'] * 3)),                            0.8),
-            ('zoom',       lambda: press(*(['alt+shift+plus'] * 2)),                0.8),
-            ('unzoom',     lambda: press(*(['alt+shift+minus'] * 2)),            0.8),
-            ('less',       lambda: (type_('less /etc/passwd'), press('return')),      1.5),
-            ('less-end',   lambda: press('G'),                                        0.8),
-            ('less-top',   lambda: press('g'),                                        0.8),
-            ('main',       lambda: press('q'),                                        1.0),
-            ('vim-insert', lambda: (type_('vim -u NONE\nreturn'), time.sleep(1.5),
-                                    press('i'), type_('h\\u00e9llo \\u754c'),
-                                    press('escape')),                                 0.8),
-            ('vim-num',    lambda: (type_(':set nu'), press('return')),               0.8),
-            ('vim-bottom', lambda: press('G'),                                        0.8),
-            ('vim-top',    lambda: press('g', 'g'),                                   0.8),
-            ('back-main',  lambda: (type_(':q!'), press('return')),                   1.0),
-            ('end',        lambda: (type_('echo CACHE-DIFF-DONE'), press('return')),    1.2),
+            ('seq',        lambda: run_cmd('seq 1 400'),                              2.0),
+            # Plain pgup belongs to the shell (bash: previous-history -- it
+            # *types* into the prompt); spike scrolls its scrollback on
+            # shift+pgup, matching the SHIFT+Page_Up default binding.
+            ('scrolled',   lambda: press(*(['shift+pgup'] * 3), settle=0.5),           0.8),
+            ('scrolled2',  lambda: press(*(['shift+pgup'] * 2)),                       0.8),
+            ('live',       lambda: press(*(['shift+pgdn'] * 5)),                       0.8),
+            ('zoom',       lambda: press(*(['alt+shift+plus'] * 2)),                   0.8),
+            ('unzoom',     lambda: press(*(['alt+shift+minus'] * 2)),                  0.8),
+            ('less',       lambda: run_cmd('less /etc/passwd'),                        1.5),
+            ('less-end',   lambda: press('G', 'G'),                                    0.8),
+            ('less-top',   lambda: press('g', 'g', 'g'),                               0.8),
+            ('main',       lambda: press('q'),                                         1.0),
+            ('vim-insert', lambda: (run_cmd('vim -u NONE'),
+                                    press('i'), type_('h\u00e9llo \u754c world'),
+                                    press('escape')),                                  0.8),
+            ('vim-num',    lambda: (type_(':set nu'), press('return', settle=0.5)),    0.8),
+            ('vim-bottom', lambda: press('G', 'G'),                                    0.8),
+            ('vim-top',    lambda: press('g', 'g', 'g', 'g'),                          0.8),
+            ('back-main',  lambda: run_cmd(':q!'),                                 1.0),
+            ('end',        lambda: run_cmd('echo CACHE-DIFF-DONE'),                1.2),
         ]
         for name, action, settle in steps:
             action()
@@ -111,13 +153,6 @@ def run_session(binary: str, tag: str) -> tuple[Path, dict]:
             app.wait(3)
         except sp.TimeoutExpired:
             app.kill()
-
-
-class _Shot:
-    strip_h = 0
-
-
-SHOT = _Shot()
 
 
 def compare(name: str, a: Image.Image, b: Image.Image) -> float:
