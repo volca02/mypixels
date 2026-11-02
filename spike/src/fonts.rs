@@ -320,6 +320,9 @@ pub struct FaceChoice {
 #[derive(Clone, Debug)]
 pub struct FontChoice {
     pub name: String,
+    /// Lowercased name, precomputed: the popup filters on it every time the
+    /// filter text changes.
+    pub name_lower: String,
     pub faces: Vec<FaceChoice>,
 }
 
@@ -351,10 +354,11 @@ pub fn font_choices(db: &Database) -> Vec<FontChoice> {
         .map(|(name, mut faces)| {
             faces.sort_by_key(|f| (f.weight, f.slant as u8));
             faces.dedup_by(|a, b| a.weight == b.weight && a.slant == b.slant);
-            FontChoice { name, faces }
+            let name_lower = name.to_lowercase();
+            FontChoice { name, name_lower, faces }
         })
         .collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by(|a, b| a.name_lower.cmp(&b.name_lower));
     out
 }
 

@@ -63,12 +63,22 @@ pub struct FontPopup {
     /// The filter box contents, persisted per frame while open.
     pub search: String,
     // ---- Draft (the popup's own selection, not yet the config's) ----
-    /// The drafted family name (index-free: names are the stable handle).
+    /// The drafted family name.
     pub family: String,
+    /// Index of `family` in the choices slice ([`usize::MAX`] when the
+    /// drafted family is not installed -- the config can name anything).
+    /// Carrying the index keeps the per-frame path free of name lookups.
+    pub family_idx: usize,
     /// Index into the family's face list (style).
     pub style: usize,
     /// Drafted size in points.
     pub size_pt: f32,
+    /// The rendered family list: `(filter, drafted family, choice indices)`.
+    /// Rebuilt only when one of its two inputs changes -- a keystroke or a
+    /// family click -- never per frame, over what can be hundreds of
+    /// families. (Filtering an already-sorted list stays sorted; the
+    /// drafted family is rotated to the front.)
+    pub list_cache: Option<(String, String, Vec<usize>)>,
 }
 
 /// Which font row a [`FontPopup`] belongs to.
@@ -870,20 +880,41 @@ fn font_row(
         if !st.font_popup.as_ref().is_some_and(|p| p.which == which) {
             return;
         }
+        // The list is rebuilt only when one of its inputs changes -- filter
+        // text or drafted family -- not every frame.
+        {
+            let popup = st.font_popup.as_mut().unwrap();
+            let needle = popup.search.to_lowercase();
+            let stale = !popup
+                .list_cache
+                .as_ref()
+                .is_some_and(|(n, f, _)| *n == needle && *f == popup.family);
+            if stale {
+                let mut idx: Vec<usize> = choices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| needle.is_empty() || c.name_lower.contains(&needle))
+                    .map(|(i, _)| i)
+                    .collect();
+                // Drafted family first, then plain alphabetical (a rotate
+                // would leave the alphabet split at the draft instead).
+                if let Some(p) = idx.iter().position(|&i| choices[i].name == popup.family) {
+                    let d = idx.remove(p);
+                    idx.insert(0, d);
+                }
+                idx.truncate(FONT_POPUP_MAX);
+                popup.list_cache = Some((needle, popup.family.clone(), idx));
+            }
+        }
         let mut search = std::mem::take(&mut st.font_popup.as_mut().unwrap().search);
-        let needle = search.to_lowercase();
-        let mut families: Vec<&crate::fonts::FontChoice> = choices
-            .iter()
-            .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
-            .collect();
-        // The current family leads the filtered list, whatever the filter
-        // left of the alphabetical order. (Key computed once: this runs
-        // every frame, over hundreds of families.)
-        let draft = st.font_popup.as_ref().map(|p| p.family.as_str()).unwrap_or("");
-        families.sort_by(|a, b| {
-            (a.name != draft).cmp(&(b.name != draft)).then_with(|| a.name.cmp(&b.name))
-        });
-        families.truncate(FONT_POPUP_MAX);
+        // Copied out so the popup closure can hold &mut popup while reading
+        // it. A few hundred usize once per frame, versus a full
+        // filter + sort + String churn before.
+        let order: Vec<usize> = st
+            .font_popup
+            .as_ref()
+            .and_then(|p| p.list_cache.as_ref().map(|(_, _, v)| v.clone()))
+            .unwrap_or_default();
 
         let mut commit: Option<String> = None;
         let mut close = false;
@@ -913,7 +944,7 @@ fn font_row(
                         egui::Layout::top_down_justified(egui::Align::Min),
                         |ui| {
                             // ---- Preview (draft face, draft size) ----
-                            let face = face_of(choices, &popup.family, popup.style);
+                            let face = face_of_idx(choices, popup.family_idx, popup.style);
                             let rt = match face {
                                 Some(f) => {
                                     // The terminal draws `size` pt at 96 dpi,
@@ -938,8 +969,7 @@ fn font_row(
                                 egui::TextEdit::singleline(&mut search).hint_text("Filter fonts\u{2026}"),
                             );
                             // ---- Family list (neutral labels) | style list ----
-                            let draft_family = popup.family.clone();
-                            let mut picked_family: Option<&crate::fonts::FontChoice> = None;
+                            let mut picked_family: Option<usize> = None;
                             let mut dbl = false;
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
@@ -950,20 +980,21 @@ fn font_row(
                                             .id_salt("font-families")
                                             .auto_shrink([false, false])
                                             .show(ui, |ui| {
-                                                for c in &families {
+                                                for &i in &order {
+                                                    let c = &choices[i];
                                                     let resp = ui.selectable_label(
-                                                        c.name == draft_family,
+                                                        i == popup.family_idx,
                                                         // The NAME in the neutral UI
                                                         // font: the face belongs to
                                                         // the preview, not the list.
                                                         &c.name,
                                                     );
                                                     if resp.double_clicked() {
-                                                        picked_family = Some(*c);
+                                                        picked_family = Some(i);
                                                         dbl = true;
                                                         break;
                                                     } else if resp.clicked() {
-                                                        picked_family = Some(*c);
+                                                        picked_family = Some(i);
                                                         break;
                                                     }
                                                 }
@@ -979,11 +1010,13 @@ fn font_row(
                                             .id_salt("font-styles")
                                             .auto_shrink([false, false])
                                             .show(ui, |ui| {
-                                                let Some(c) =
-                                                    choices.iter().find(|c| c.name == popup.family)
+                                                let Some(c) = choices.get(popup.family_idx)
                                                 else {
                                                     return;
                                                 };
+                                                if c.name != popup.family {
+                                                    return; // draft names nothing installed
+                                                }
                                                 for (i, f) in c.faces.iter().enumerate() {
                                                     let words =
                                                         crate::fonts::style_words(f.weight, f.slant);
@@ -1004,13 +1037,14 @@ fn font_row(
                                     },
                                 );
                             });
-                            if let Some(c) = picked_family {
+                            if let Some(i) = picked_family {
                                 // Snap the style to the same weight/slant the
                                 // previous family had selected, when offered.
-                                let want = face_of(choices, &popup.family, popup.style)
+                                let want = face_of_idx(choices, popup.family_idx, popup.style)
                                     .map(|f| (f.weight, f.slant));
-                                popup.family = c.name.clone();
-                                popup.style = nearest_style(c, want);
+                                popup.family = choices[i].name.clone();
+                                popup.family_idx = i;
+                                popup.style = nearest_style(&choices[i], want);
                             }
                             // ---- Size, OK, Cancel ----
                             ui.horizontal(|ui| {
@@ -1063,6 +1097,16 @@ fn font_row(
     });
 }
 
+/// The face a popup draft selects, by cached family index. This is the
+/// per-frame accessor; [`face_of`] (by name) is for one-shot paths.
+fn face_of_idx<'a>(
+    choices: &'a [crate::fonts::FontChoice],
+    family_idx: usize,
+    style: usize,
+) -> Option<&'a crate::fonts::FaceChoice> {
+    choices.get(family_idx)?.faces.get(style)
+}
+
 /// The drafted face, if the family exists and has one at that index.
 fn face_of<'a>(
     choices: &'a [crate::fonts::FontChoice],
@@ -1108,12 +1152,18 @@ fn seed_popup(
         } else {
             (spec, None)
         };
-    let style = choices
-        .iter()
-        .find(|c| c.name == family)
-        .map(|c| nearest_style(c, want))
-        .unwrap_or(0);
-    FontPopup { which, open: true, search: String::new(), family, style, size_pt: size }
+    let fam_idx = choices.iter().position(|c| c.name == family);
+    let style = fam_idx.map(|i| nearest_style(&choices[i], want)).unwrap_or(0);
+    FontPopup {
+        which,
+        open: true,
+        search: String::new(),
+        family,
+        family_idx: fam_idx.unwrap_or(usize::MAX),
+        style,
+        size_pt: size,
+        list_cache: None,
+    }
 }
 
 /// Compose the config value the popup commits: "Family Bold Italic 12",
@@ -1560,7 +1610,7 @@ mod input_regression {
         let pr = sim.last_popup_rect.expect("filter box laid out in the popup");
         let filter_pos = pr.center();
         let mods = egui::Modifiers::default();
-        let (l, pop, se) = sim.frame(
+        let (_l, pop, _se) = sim.frame(
             vec![
                 egui::Event::PointerMoved(filter_pos),
                 egui::Event::PointerButton { pos: filter_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: mods },

@@ -31,8 +31,11 @@ egui-winit = "0.37"
 # real gains on the table. Thin LTO across crates without fat-LTO build times.
 codegen-units = 1
 lto = "thin"
-strip = true
-debug = false
+# Line tables kept so `perf record` on this binary says what it actually
+# ran (egui layout vs glyphon vs wgpu). Costs disk, not speed; set back to
+# strip = true / drop debug when not profiling.
+debug = 1
+strip = false
 
 # --- patched dependency -------------------------------------------------------
 # Local changes: mutable completed line layouts for terminal cell placement,
