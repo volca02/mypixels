@@ -140,20 +140,49 @@ impl Egui {
 }
 
 /// One tab card in the switcher overlay.
-#[derive(Clone)]
 pub struct SwitcherCard {
     pub title: String,
     /// The tab that is actually active (marked, like the strip does).
     pub active: bool,
     /// The entangled-tab marker the strip shows.
     pub marker: bool,
+    /// The tab's working directory, the card's third line when present.
+    pub cwd: Option<String>,
+    /// A readback of the tab's live frame: the texture plus its pixel size.
+    /// The size follows the terminal area's own aspect, so the image needs
+    /// no letterboxing or cropping.
+    pub thumb: Option<(egui::TextureHandle, (u32, u32))>,
 }
 
-// Fixed card geometry: with a known width the row width is computable, so a
-// single row can be centred as a block instead of hugging the left edge.
-const CARD_W: f32 = 220.0;
-const CARD_H: f32 = 76.0;
+// Card geometry. The text column is fixed and the thumbnail adds its own
+// width, so a card's width is a pure function of it (see `card_width`):
+// that is what makes the row centring computable.
+const CARD_PAD: f32 = 10.0;
+const TEXT_COL: f32 = 96.0;
+const CARD_TXT_GAP: f32 = 8.0;
+/// The thumbnail's height; its width follows the terminal's aspect.
+pub const THUMB_H: u32 = 52;
+pub const THUMB_W_RANGE: (u32, u32) = (40, 150);
+/// Minimum card height when there is no thumbnail (three text lines).
+const CARD_MIN_H: f32 = 56.0;
 const CARD_GAP: f32 = 12.0;
+
+/// A card's exact width: pads plus the text column, plus the thumbnail when
+/// present.
+fn card_width(card: &SwitcherCard) -> f32 {
+    let mut w = CARD_PAD * 2.0 + TEXT_COL;
+    if let Some((_, (tw, _))) = &card.thumb {
+        w += *tw as f32 + CARD_TXT_GAP;
+    }
+    w
+}
+
+/// A card's exact height: the thumbnail (tallest element) or the text
+/// lines, plus pads.
+fn card_height(card: &SwitcherCard) -> f32 {
+    let th = card.thumb.as_ref().map_or(0.0, |(_, (_, th))| *th as f32);
+    th.max(CARD_MIN_H) + CARD_PAD * 2.0
+}
 
 /// The tab switcher overlay, drawn on the root ui. A `CentralPanel` covers
 /// the whole viewport by construction (there are no other panels), so the
@@ -180,36 +209,48 @@ pub fn switcher_screen(
             // Claim the whole backdrop (see docs).
             ui.allocate_rect(ui.max_rect(), egui::Sense::click());
             let avail_w = ui.available_width();
-            let per_row = ((avail_w - 32.0) / (CARD_W + CARD_GAP)).floor().max(1.0) as usize;
-            let rows = (cards.len() + per_row - 1) / per_row;
-            ui.add_space((ui.available_height() * 0.16).max(24.0));
-            if rows == 1 {
-                // One row: centre it as a block.
-                let total =
-                    cards.len() as f32 * CARD_W + (cards.len() - 1) as f32 * CARD_GAP;
-                ui.add_space((avail_w - total).max(0.0) / 2.0);
-                ui.horizontal(|ui| {
-                    for (i, card) in cards.iter().enumerate() {
-                        card_button(ui, i, card, i == selected, accent, pick);
-                        if i + 1 < cards.len() {
-                            ui.add_space(CARD_GAP);
-                        }
-                    }
-                });
-            } else {
-                // Several rows: a wrapped block, centred, capped so the wrap
-                // point matches the block width.
-                let block_w =
-                    (per_row as f32 * (CARD_W + CARD_GAP) - CARD_GAP).min(avail_w - 8.0);
-                ui.add_space((avail_w - block_w).max(0.0) / 2.0);
+            let widths: Vec<f32> = cards.iter().map(card_width).collect();
+            // Greedy fill: which cards land on which row, and each row's
+            // exact width.
+            let mut rows: Vec<Vec<f32>> = vec![Vec::new()];
+            for w in &widths {
+                let gap = if rows.last().unwrap().is_empty() {
+                    0.0
+                } else {
+                    CARD_GAP
+                };
+                let cur: f32 = rows.last().unwrap().iter().sum::<f32>() + gap + w;
+                if cur > avail_w && !rows.last().unwrap().is_empty() {
+                    rows.push(Vec::new());
+                }
+                rows.last_mut().unwrap().push(*w);
+            }
+            let row_w: Vec<f32> = rows
+                .iter()
+                .map(|r| r.iter().sum::<f32>() + (r.len().saturating_sub(1)) as f32 * CARD_GAP)
+                .collect();
+            let max_h = cards.iter().map(card_height).fold(0.0, f32::max);
+            let block_h = rows.len() as f32 * max_h + (rows.len() - 1) as f32 * CARD_GAP;
+            ui.add_space(((ui.available_height() - block_h) / 2.0).max(24.0));
+            for (r, w) in row_w.iter().enumerate() {
+                if r > 0 {
+                    ui.add_space(CARD_GAP);
+                }
+                // Every row (not just the first) is centred on its own width.
+                ui.add_space((avail_w - w).max(0.0) / 2.0);
                 ui.scope(|ui| {
-                    ui.set_max_width(block_w);
-                    ui.horizontal_wrapped(|ui| {
+                    ui.set_max_width(*w);
+                    ui.horizontal(|ui| {
+                        let mut first = true;
                         for (i, card) in cards.iter().enumerate() {
-                            card_button(ui, i, card, i == selected, accent, pick);
-                            if i + 1 < cards.len() {
+                            if card_index_row(i, &widths, avail_w) != r {
+                                continue;
+                            }
+                            if !first {
                                 ui.add_space(CARD_GAP);
                             }
+                            first = false;
+                            card_button(ui, i, card, i == selected, accent, pick);
                         }
                     });
                 });
@@ -217,8 +258,27 @@ pub fn switcher_screen(
         });
 }
 
-/// One tab card: a fixed-size rounded frame, the title, a "tab N" caption.
-/// The selected card gets the accent stroke and the brightest fill.
+/// Which row (0-based) card `i` lands on under the same greedy fill
+/// `switcher_screen` uses.
+fn card_index_row(i: usize, widths: &[f32], avail_w: f32) -> usize {
+    let mut x = 0.0f32;
+    let mut row = 0usize;
+    for (j, w) in widths.iter().enumerate() {
+        if x + w > avail_w && x > 0.0 {
+            row += 1;
+            x = 0.0;
+        }
+        if j == i {
+            return row;
+        }
+        x += w + CARD_GAP;
+    }
+    row
+}
+
+/// One tab card: a rounded frame with the live thumbnail (when read back)
+/// and the title, "tab N" and the working directory. The selected card
+/// gets the accent stroke and the brightest fill.
 fn card_button(
     ui: &mut egui::Ui,
     index: usize,
@@ -239,29 +299,66 @@ fn card_button(
         .fill(fill)
         .corner_radius(10.0)
         .stroke(egui::Stroke::new(1.5, stroke))
-        .inner_margin(egui::Margin::symmetric(14, 10));
+        .inner_margin(egui::Margin::symmetric(
+            CARD_PAD as i8,
+            CARD_PAD as i8,
+        ));
     let r = frame.show(ui, |ui| {
-        ui.set_min_width(CARD_W);
-        ui.set_max_width(CARD_W);
-        ui.set_min_height(CARD_H);
-        ui.set_max_height(CARD_H);
-        ui.vertical_centered(|ui| {
-            let mut rt = egui::RichText::new(if card.marker {
-                format!("* {}", card.title)
-            } else {
-                card.title.clone()
+        ui.set_min_size(egui::vec2(card_width(card), card_height(card) - CARD_PAD * 2.0));
+        if card.thumb.is_some() {
+            ui.horizontal_centered(|ui| {
+                if let Some((handle, _)) = &card.thumb {
+                    // Native texture size is exactly the thumbnail size.
+                    ui.image(egui::load::SizedTexture::from(handle));
+                    ui.add_space(CARD_TXT_GAP);
+                }
+                text_column(ui, index, card, selected);
             });
-            if selected {
-                rt = rt.strong();
-            }
-            ui.label(rt);
-            ui.label(
-                egui::RichText::new(format!("tab {}", index + 1)).weak().small(),
-            );
-        });
+        } else {
+            ui.vertical_centered(|ui| {
+                text_column(ui, index, card, selected);
+            });
+        }
     });
     if r.response.clicked() {
         *pick = Some(index);
+    }
+}
+
+/// The card's text: the title (entangled tabs keep the `*` marker, selected
+/// is bold), a "tab N" caption, and the working directory when present. All
+/// of it truncates to the fixed text column rather than growing the card.
+fn text_column(
+    ui: &mut egui::Ui,
+    index: usize,
+    card: &SwitcherCard,
+    selected: bool,
+) {
+    ui.set_max_width(TEXT_COL);
+    let mut title = if card.marker {
+        format!("* {}", card.title)
+    } else {
+        card.title.clone()
+    };
+    if title.is_empty() {
+        title = format!("tab {}", index + 1);
+    }
+    let mut rt = egui::RichText::new(title);
+    if selected {
+        rt = rt.strong();
+    }
+    ui.add(egui::Label::new(rt).wrap_mode(egui::TextWrapMode::Truncate));
+    ui.label(egui::RichText::new(format!("tab {}", index + 1)).weak().small());
+    if let Some(cwd) = &card.cwd {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(cwd)
+                    .weak()
+                    .small()
+                    .color(egui::Color32::from_rgb(98, 102, 120)),
+            )
+            .wrap_mode(egui::TextWrapMode::Truncate),
+        );
     }
 }
 
@@ -534,42 +631,53 @@ mod regression {
         pass(&ctx, 900.0, 600.0, true); // reopen
     }
 
-    // The switcher is a full-screen window (min == max == screen size) with a
-    // wrapping row of cards; same class of size request to keep NaN-free.
+    // The switcher is a full-viewport CentralPanel with a row of cards whose
+    // widths vary (thumbnail present or not); same class of size request to
+    // keep NaN-free. Some cards carry a real texture so the image path runs.
     #[test]
     fn switcher_screen_layout() {
         let ctx = Context::default();
         ctx.set_visuals(egui::Visuals::dark());
+        let tex = ctx.load_texture(
+            "test-thumb",
+            egui::ColorImage::from_rgba_unmultiplied([64, 52], &[7u8, 9, 11, 255].repeat(64 * 52)),
+            egui::TextureOptions::LINEAR,
+        );
         let cards: Vec<SwitcherCard> = (0..8)
             .map(|i| SwitcherCard {
-                title: format!("tab {i}"),
+                title: format!("a much longer tab title number {i}"),
                 active: i == 1,
                 marker: i == 3,
+                cwd: if i % 2 == 0 { Some(format!("~/projects/x{i}")) } else { None },
+                thumb: if i < 3 { Some((tex.clone(), (64, 52))) } else { None },
             })
             .collect();
-        for _ in 0..3 {
-            let mut pick = None;
-            let mut full = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_max(
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2(1280.0, 720.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| {
-                    switcher_screen(
-                        ui,
-                        true,
-                        1,
-                        76,
-                        egui::Color32::WHITE,
-                        &cards,
-                        &mut pick,
-                    );
-                },
-            );
-            full.textures_delta.clear();
+        // Wide screen: one row. Narrow screen: several centred rows.
+        for (w, h) in [(1280.0, 720.0), (560.0, 480.0)] {
+            for _ in 0..3 {
+                let mut pick = None;
+                let mut full = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(w, h),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        switcher_screen(
+                            ui,
+                            true,
+                            1,
+                            76,
+                            egui::Color32::WHITE,
+                            &cards,
+                            &mut pick,
+                        );
+                    },
+                );
+                full.textures_delta.clear();
+            }
         }
     }
 }

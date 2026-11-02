@@ -273,7 +273,7 @@ impl Tab {
     /// prompt would. Read at most every 400ms: the strip asks for every tab on
     /// every frame, and a frame that only blinks the cursor should not walk
     /// /proc.
-    fn current_dir(&self) -> Option<String> {
+    pub fn current_dir(&self) -> Option<String> {
         const EVERY: std::time::Duration = std::time::Duration::from_millis(400);
         let mut c = self.cwd.lock().unwrap();
         if c.1.is_none_or(|t| t.elapsed() >= EVERY) {

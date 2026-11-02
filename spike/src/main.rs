@@ -269,6 +269,17 @@ fn grid_cols(n: usize) -> usize {
 // App
 // ---------------------------------------------------------------------------
 
+/// One read-back, uploaded switcher thumbnail: the egui texture, the pixel
+/// size it was read at, the preview content signature it matches, and when it
+/// was last read (for the throttle).
+#[derive(Clone)]
+struct SwThumb {
+    handle: egui::TextureHandle,
+    size: (u32, u32),
+    sig: u64,
+    last: std::time::Instant,
+}
+
 struct App {
     config: Config,
     tabs: Vec<Tab>,
@@ -348,6 +359,12 @@ struct App {
     rename_draft: String,
     /// Alt-held visual switcher. Releasing Alt keeps its selected tab.
     overview: Option<OverviewState>,
+    /// The egui switcher's thumbnails: per tab, the readback texture, the size
+    /// it was read at, the content signature it matches, and when it was last
+    /// read. Cleared when the switcher closes, so the textures are dropped.
+    sw_thumbs: Vec<Option<SwThumb>>,
+    /// Rotating cursor for the readback order (mirrors `gpu.prev_rr`).
+    thumb_rr: usize,
     /// Alt-held tab switcher timing, shared with a background clock thread.
     /// `switcher_alt_at` is when Alt went down (None when released); the clock
     /// opens the switcher after the configured delay (`tab_overview_delay_ms`)
@@ -582,6 +599,8 @@ impl App {
             renaming: false,
             rename_draft: String::new(),
             overview: None,
+            sw_thumbs: Vec::new(),
+            thumb_rr: 0,
             switcher_alt_at,
             switcher_show_req,
             switcher_open,
@@ -1091,15 +1110,23 @@ impl App {
                     } else {
                         self.config.tab_title_max_length
                     };
+                    let cwd_line = t.current_dir().filter(|c| c != &title);
                     if limit > 0 && title.chars().count() > limit {
                         title =
                             title.chars().take(limit).collect::<String>()
                                 + &self.config.tab_shorten_str;
                     }
+                    let thumb = self
+                        .sw_thumbs
+                        .get(i)
+                        .and_then(|t| t.as_ref())
+                        .map(|t| (t.handle.clone(), t.size));
                     egui_ui::SwitcherCard {
                         title,
                         active: i == self.active,
                         marker: t.entangled,
+                        cwd: cwd_line,
+                        thumb,
                     }
                 })
                 .collect()
@@ -1521,8 +1548,12 @@ impl App {
         // a 60ms hitch. A throttled tile keeps showing its previous frame, which is
         // plenty for a thumbnail. A tab that has never been drawn ignores the cap,
         // so opening the overlay fills the whole grid in one go.
+        // Both switcher renderers need the offscreen preview frames: the
+        // hand-drawn one samples them as tiles, the egui one reads them back
+        // for the card thumbnails. (Only the overlay construction below
+        // stays hand-drawn-specific.)
         let mut jobs: Vec<gpu::PreviewJob> = Vec::new();
-        if hand_switcher {
+        if hand_switcher || sw_open {
             if let Some(ov) = &self.overview {
             let n = self.tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
@@ -1643,6 +1674,77 @@ impl App {
             _ => None,
         };
         gpu.render_frame(&mut self.font_system, areas, overlay, jobs, window, egui_frame);
+
+        // The egui switcher's live thumbnails: read the freshly rendered
+        // preview textures back for a few tabs per frame (same 60/200ms
+        // throttling and two-per-frame cap as the preview jobs) and upload
+        // them to egui. The thumbnail takes the terminal area of the texture
+        // at its own aspect, so a card shows the tab without letterboxing.
+        if sw_open {
+            let Some(ov) = &self.overview else { return };
+            let ctx = match self.egui.as_ref() {
+                Some(e) => e.ctx.clone(),
+                None => return,
+            };
+            let n = self.tabs.len();
+            let sel = ov.selected.min(n.saturating_sub(1));
+            let term_h = ((h as f32) - strip_h).max(1.0);
+            let tw = ((egui_ui::THUMB_H as f32) * (w as f32 / term_h))
+                .round()
+                .clamp(egui_ui::THUMB_W_RANGE.0 as f32, egui_ui::THUMB_W_RANGE.1 as f32)
+                as u32;
+            let th = egui_ui::THUMB_H;
+            let mut order: Vec<usize> = vec![sel];
+            for k in 0..n {
+                let i = (self.thumb_rr + k) % n;
+                if i != sel {
+                    order.push(i);
+                }
+            }
+            self.thumb_rr = (self.thumb_rr + 1).rem_euclid(n.max(1));
+            let now = Instant::now();
+            let mut done = 0;
+            for i in order {
+                if done >= 2 {
+                    break;
+                }
+                // Nothing to read back until the jobs block has rendered this
+                // tab (signature 0 = never), and an unchanged screen does not
+                // need a new readback.
+                let sig = gpu.prev_sigs.get(i).copied().unwrap_or(0);
+                if sig == 0 {
+                    continue;
+                }
+                let interval =
+                    std::time::Duration::from_millis(if i == sel { 60 } else { 200 });
+                let stale = self
+                    .sw_thumbs
+                    .get(i)
+                    .and_then(|t| t.as_ref())
+                    .is_none_or(|t| t.sig != sig && now.duration_since(t.last) >= interval);
+                if !stale {
+                    continue;
+                }
+                let Some(rgba) = gpu.readback_preview(i, strip_h as u32, (tw, th)) else {
+                    continue;
+                };
+                let handle = ctx.load_texture(
+                    format!("switcher-preview-{i}"),
+                    egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &rgba),
+                    egui::TextureOptions::LINEAR,
+                );
+                if self.sw_thumbs.len() < n {
+                    self.sw_thumbs.resize(n, None);
+                }
+                self.sw_thumbs[i] = Some(SwThumb {
+                    handle,
+                    size: (tw, th),
+                    sig,
+                    last: now,
+                });
+                done += 1;
+            }
+        }
         self.gpu = Some(gpu);
 
         if std::env::var("SPIKE_TRACE").is_ok() {
@@ -1962,6 +2064,7 @@ impl App {
         if self.overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
             self.overview = None;
             self.switcher_open.store(false, Ordering::SeqCst);
+            self.sw_thumbs.clear();
         }
         if let Some(w) = &self.window {
             w.request_redraw();
