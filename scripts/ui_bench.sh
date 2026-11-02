@@ -33,7 +33,7 @@ mkfifo "$FIFO"
 LOG=$OUT/spike.log
 : > "$LOG"
 
-RUST_LOG=${RUST_LOG:-info} SPIKE_KEYS=$FIFO "$BIN" >"$LOG" 2>&1 &
+RUST_LOG=${RUST_LOG:-info} SPIKE_TRACE=1 SPIKE_KEYS=$FIFO "$BIN" >"$LOG" 2>&1 &
 SPID=$!
 exec 3>"$FIFO"
 say() { printf '%s\n' "$1" >&3; }
@@ -70,8 +70,9 @@ stpump() { kill "$PUMP" 2>/dev/null; wait "$PUMP" 2>/dev/null; PUMP=""; }
 
 scenario() { # name setup-shell-code
     local name=$1 setup=$2
-    local before after
+    local before after tbefore tafter
     before=$(grep -c "SPY active=" "$LOG")
+    tbefore=$(grep -c "frame build" "$LOG")
     eval "$setup"
     pump
     sleep 0.5
@@ -83,7 +84,15 @@ scenario() { # name setup-shell-code
     wait "$PREC" 2>/dev/null
     stpump
     after=$(grep -c "SPY active=" "$LOG")
-    echo "BENCH $name  pump_lines=$((after - before))/${SECS}s  (frames per line: redraw per hook line; full fps needs SPIKE_PROF)"
+    tafter=$(grep -c "frame build" "$LOG")
+    echo "BENCH $name  pump_lines=$((after - before))/${SECS}s"
+    # build_frame wall time, straight from the app's own SPIKE_TRACE lines,
+    # normalized to microseconds: p50/p95/max over this scenario's frames.
+    grep -o "frame build [0-9.]*[a-zµ]*s" "$LOG" | tail -n $((tafter - tbefore)) \
+        | sed 's/frame build //' \
+        | awk '{v=$1+0; if ($0 ~ /ms/) v*=1000; else if ($0 ~ /ns/) v/=1000; print v}' \
+        | sort -n \
+        | awk '{a[NR]=$1} END {if (NR) printf "      build_frame us: n=%d p50=%.1f p95=%.1f max=%.1f\n", NR, a[int(NR*0.5)], a[int(NR*0.95)], a[NR]}' 
     echo "-- $name: top symbols --"
     perf report -i "$OUT/perf.$name.data" --stdio --percent-limit 0.5 2>/dev/null \
         | grep -v '^#' | grep -v '^[[:space:]]*$' | head -22
@@ -94,7 +103,7 @@ scenario() { # name setup-shell-code
 # first matching pattern)
 RUN=${1:-all}
 want() { [ "$RUN" = all ] || [ "$RUN" = "$1" ]; }
-want terminal     && scenario terminal     "sendkeys 'yes > /dev/null'"
+want terminal     && scenario terminal     "sendkeys 'yes'"
 want config       && scenario config       "say alt+shift+c"
 want config-idle  && scenario config-idle  "say ctrl+c"
 
