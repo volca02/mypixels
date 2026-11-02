@@ -43,3 +43,13 @@ reports cumulative frame-build and text-preparation times plus total frame time;
 subtract build from text time to isolate layout. The JSON records lines produced
 and elapsed time. A software renderer's CPU use is not comparable to a desktop
 GPU's, and unpaced input tests throughput as well as rendering.
+
+For preview rendering without xdotool, run from `spike/`:
+
+```sh
+xvfb-run -a python3 tests/preview_smoke.py
+```
+
+Requires ImageMagick `import` and Pillow. It compares a switcher thumbnail
+against a downscaled live frame, checking all four edges, aspect ratio, glyph
+placement, and colors. Screenshots are left in `/tmp/mypixels-preview-*`.

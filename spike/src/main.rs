@@ -276,6 +276,7 @@ fn grid_cols(n: usize) -> usize {
 struct SwThumb {
     handle: egui::TextureHandle,
     size: (u32, u32),
+    pixels: (u32, u32),
     sig: u64,
     last: std::time::Instant,
 }
@@ -818,6 +819,7 @@ impl App {
                 Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh));
             // New buffers hold nothing, so every cached signature is a lie.
             gpu.slot_sig = vec![0u64; gpu.pool.len()];
+            gpu.prev_sigs.fill(0);
         }
         // Cell size changed -> the grid that fits the surface changes.
         self.sync_term_size();
@@ -1486,19 +1488,13 @@ impl App {
                     fonts::shape_terminal_run(b, fs, &run.text, run.attrs, &run.cells, self.cell_w);
                 }
                 let buf: &Buffer = unsafe { &*(&pool[i] as *const Buffer) };
-                areas.push(TextArea {
-                    buffer: buf,
-                    left: (run.col as f32 * self.cell_w).round(),
-                    top: (strip_h + run.row as f32 * self.cell_h).round(),
-                    scale: 1.0,
+                areas.push(gpu::terminal_text_area(
+                    buf,
+                    run.col as f32 * self.cell_w,
+                    strip_h + run.row as f32 * self.cell_h,
+                    run.fg,
                     bounds,
-                    default_color: glyphon::Color::rgb(
-                        (run.fg[0] * 255.0) as u8,
-                        (run.fg[1] * 255.0) as u8,
-                        (run.fg[2] * 255.0) as u8,
-                    ),
-                    custom_glyphs: &[],
-                });
+                ));
             }
         }
 
@@ -1557,7 +1553,7 @@ impl App {
             if let Some(ov) = &self.overview {
             let n = self.tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
-            gpu.ensure_previews(n, (w, h), &mut self.font_system);
+            gpu.ensure_previews(n, (w, h));
             let now = Instant::now();
             // Selected tab first, then every other tab exactly once, from a
             // rotating cursor so a backlog drains in order and nothing starves.
@@ -1587,27 +1583,26 @@ impl App {
                 if throttled || (held != 0 && built >= 2) {
                     continue;
                 }
-                if let Some(b) = gpu.prev_bufs.get_mut(i) {
-                    b.set_metrics(glyphon::Metrics::new(self.cell_w, self.cell_h));
-                    b.set_size(Some(self.cols as f32 * self.cell_w), None);
-                    b.set_monospace_width(Some(self.cell_w));
-                    b.set_rich_text(
-                        preview_spans(fd, self.rows, &self.mono_attrs)
-                            .iter()
-                            .map(|(s, a)| (s.as_str(), a.clone())),
-                        &self.mono_attrs,
-                        Shaping::Basic,
-                        None,
+                let metrics = gpu.pool[0].metrics();
+                let buffers = &mut gpu.prev_bufs[i];
+                let runs = &fd.runs[..fd.runs.len().min(MAX_RUNS)];
+                buffers.resize_with(runs.len(), || Buffer::new(&mut self.font_system, metrics));
+                for (buffer, run) in buffers.iter_mut().zip(runs) {
+                    buffer.set_metrics(metrics);
+                    fonts::shape_terminal_run(
+                        buffer, &mut self.font_system, &run.text, run.attrs, &run.cells, self.cell_w,
                     );
-                    b.shape_until_scroll(&mut self.font_system, false);
                 }
                 gpu.set_prev_sig(i, sig);
                 gpu.prev_last[i] = now;
                 jobs.push(gpu::PreviewJob {
                     idx: i,
-                    top: strip_h,
                     bounds,
-                    default_fg: fd.fg,
+                    text: runs.iter().map(|run| gpu::PreviewText {
+                        left: run.col as f32 * self.cell_w,
+                        top: strip_h + run.row as f32 * self.cell_h,
+                        color: run.fg,
+                    }).collect(),
                     rects: preview_rects(
                         fd,
                         &fd.bg,
@@ -1730,7 +1725,10 @@ impl App {
                     .sw_thumbs
                     .get(i)
                     .and_then(|t| t.as_ref())
-                    .is_none_or(|t| t.sig != sig && now.duration_since(t.last) >= interval);
+                    .is_none_or(|t| {
+                        t.pixels != (tw, th)
+                            || (t.sig != sig && now.duration_since(t.last) >= interval)
+                    });
                 if !stale {
                     continue;
                 }
@@ -1749,6 +1747,7 @@ impl App {
                     handle,
                     // Point size for the layout (the texture is pixel-dense).
                     size: (ptw.round() as u32, pth.round() as u32),
+                    pixels: (tw, th),
                     sig,
                     last: now,
                 });
@@ -2434,7 +2433,7 @@ fn frame_sig(fd: &FrameData, cell_w: f32) -> u64 {
     for run in &fd.runs {
         mix(&mut h, run.row as u64);
         mix(&mut h, run.col as u64);
-        mix(&mut h, run.width as u64);
+        mix(&mut h, run_sig(run, cell_w));
         for b in run.text.as_bytes() {
             mix(&mut h, *b as u64);
         }
@@ -2444,53 +2443,6 @@ fn frame_sig(fd: &FrameData, cell_w: f32) -> u64 {
     }
     mix(&mut h, (cell_w * 1000.0).round() as u64);
     h
-}
-
-/// One whole screen as spans for a single multi-line `Buffer`: a line per
-/// terminal row, gaps padded with spaces so columns land on the grid, and a
-/// newline ending every row. An empty row still gets a space, because a line
-/// with no glyphs may not advance by a full line height.
-fn preview_spans(
-    fd: &FrameData,
-    rows: usize,
-    default: &Attrs<'static>,
-) -> Vec<(String, Attrs<'static>)> {
-    let mut spans: Vec<(String, Attrs<'static>)> = Vec::with_capacity(fd.runs.len() + rows);
-    let mut idx = 0usize;
-    for r in 0..rows as u32 {
-        let mut col = 0u32;
-        let mut any = false;
-        while idx < fd.runs.len() && fd.runs[idx].row == r {
-            let run = &fd.runs[idx];
-            // Runs arrive in row order. Anything out of order (a wild redraw) is
-            // skipped rather than double-drawn in the wrong column.
-            //
-            // Runs also carry the padding spaces out to the end of the line. They
-            // are invisible in a thumbnail too, but shaping 545 of them per row --
-            // 80k glyphs a refresh at full size -- cost seconds, so they are
-            // dropped here along with runs that are nothing but padding. Leading
-            // gaps stay: they are what puts text in the right column.
-            let body = run.text.trim_end();
-            if !body.is_empty() && run.col >= col {
-                if run.col > col {
-                    spans.push((" ".repeat((run.col - col) as usize), default.clone()));
-                }
-                spans.push((body.to_string(), (*run.attrs).clone()));
-                col = run.col.saturating_add(body.chars().count() as u32);
-                any = true;
-            }
-            idx += 1;
-        }
-        spans.push((
-            if any {
-                "\n".to_string()
-            } else {
-                " \n".to_string()
-            },
-            default.clone(),
-        ));
-    }
-    spans
 }
 
 /// Rects for an offscreen frame: window background, tab strip, cell backgrounds
@@ -2543,7 +2495,7 @@ fn preview_rects(
             strip_h + cy as f32 * cell_h,
             cell_w,
             cell_h,
-            [fg[0], fg[1], fg[2], 0.85],
+            [fg[0], fg[1], fg[2], 0.55],
         );
     }
     v
@@ -3481,10 +3433,6 @@ mod preview_tests {
         }
     }
 
-    fn joined(spans: &[(String, Attrs<'static>)]) -> String {
-        spans.iter().map(|(s, _)| s.as_str()).collect()
-    }
-
     #[test]
     fn padding_is_not_shaped_but_background_width_is_preserved() {
         let mut runs = Vec::new();
@@ -3501,28 +3449,6 @@ mod preview_tests {
         let mut runs = Vec::new();
         push_run(&mut runs, run(0, 0, "      "), [0.5; 3], [0.0; 3]);
         assert!(runs.is_empty());
-    }
-
-    #[test]
-    fn one_line_per_row_with_gaps_holding_the_columns() {
-        let fd = FrameData {
-            runs: vec![run(0, 0, "ab   "), run(2, 4, "cd")],
-            cursor: None,
-            ..FrameData::default()
-        };
-        // Trailing padding is invisible in a thumbnail and expensive to shape, so
-        // it is gone; leading spaces stay because they place the text.
-        assert_eq!(joined(&preview_spans(&fd, 4, &Attrs::new())), "ab\n \n    cd\n \n");
-    }
-
-    #[test]
-    fn an_empty_row_still_advances_a_line() {
-        let fd = FrameData {
-            runs: vec![],
-            cursor: None,
-            ..FrameData::default()
-        };
-        assert_eq!(joined(&preview_spans(&fd, 3, &Attrs::new())), " \n \n \n");
     }
 
     #[test]

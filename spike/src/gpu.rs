@@ -152,13 +152,42 @@ struct PreviewSlot {
 }
 
 /// An offscreen frame to render this frame: which tab's target to draw into,
-/// the rects for it, and where its single text buffer starts vertically.
+/// the rects and terminal runs for it.
 pub struct PreviewJob {
     pub idx: usize,
-    pub top: f32,
     pub bounds: glyphon::TextBounds,
-    pub default_fg: [f32; 3],
+    pub text: Vec<PreviewText>,
     pub rects: Vec<RectVertex>,
+}
+
+/// Placement and resolved color of a run in an offscreen terminal frame.
+pub struct PreviewText {
+    pub left: f32,
+    pub top: f32,
+    pub color: [f32; 3],
+}
+
+/// Both the window and offscreen frames use the same glyph placement and color.
+pub fn terminal_text_area<'a>(
+    buffer: &'a Buffer,
+    left: f32,
+    top: f32,
+    color: [f32; 3],
+    bounds: glyphon::TextBounds,
+) -> TextArea<'a> {
+    TextArea {
+        buffer,
+        left: left.round(),
+        top: top.round(),
+        scale: 1.0,
+        bounds,
+        default_color: glyphon::Color::rgb(
+            (color[0] * 255.0) as u8,
+            (color[1] * 255.0) as u8,
+            (color[2] * 255.0) as u8,
+        ),
+        custom_glyphs: &[],
+    }
 }
 
 /// A tile that samples a real rendered terminal frame. `half` is the box filter
@@ -254,10 +283,9 @@ pub struct Gpu {
     /// Single buffer for the inline rename prompt (terminal font metrics).
     pub prompt_buf: Buffer,
     // --- Overview previews: real terminal frames, sampled down -------------
-    /// One buffer per tab holding that tab's whole screen as one multi-line
-    /// buffer. Its own pool, because `draw_overview` spends `pool` slots on tile
-    /// headers in the same frame and they would overwrite each other.
-    pub prev_bufs: Vec<Buffer>,
+    /// Each tab has its own run buffers, using the live terminal's metrics
+    /// and shaping path. They cannot alias the window's buffers.
+    pub prev_bufs: Vec<Vec<Buffer>>,
     /// Shaped content signature per preview buffer, so an unchanged screen is
     /// only re-drawn, never re-shaped.
     pub prev_sigs: Vec<u64>,
@@ -950,19 +978,19 @@ impl Gpu {
         Some(rgba)
     }
 
-    pub fn ensure_previews(&mut self, n: usize, size: (u32, u32), fs: &mut FontSystem) {
+    pub fn ensure_previews(&mut self, n: usize, size: (u32, u32)) {
         let (w, h) = size;
         if w == 0 || h == 0 {
             return;
         }
         if self.prev_size != size {
             self.previews.clear();
+            self.prev_sigs.fill(0);
             self.prev_size = size;
             self.prev_viewport = Some(Viewport::new(&self.device, &self.prev_cache));
         }
         while self.prev_bufs.len() < n {
-            self.prev_bufs
-                .push(Buffer::new(fs, Metrics::new(1.0, 1.0)));
+            self.prev_bufs.push(Vec::new());
             self.prev_sigs.push(0);
             self.prev_last.push(Instant::now());
         }
@@ -1092,19 +1120,9 @@ impl Gpu {
                     );
                 }
                 if size.0 > 0 && size.1 > 0 {
-                    let area = glyphon::TextArea {
-                        buffer: buf,
-                        left: 0.0,
-                        top: job.top,
-                        scale: 1.0,
-                        bounds: job.bounds,
-                        default_color: glyphon::Color::rgb(
-                            (job.default_fg[0] * 255.0) as u8,
-                            (job.default_fg[1] * 255.0) as u8,
-                            (job.default_fg[2] * 255.0) as u8,
-                        ),
-                        custom_glyphs: &[],
-                    };
+                    let areas = buf.iter().zip(&job.text).map(|(buffer, run)| {
+                        terminal_text_area(buffer, run.left, run.top, run.color, job.bounds)
+                    });
                     if let Some(vp) = self.prev_viewport.as_mut() {
                         let prep = self.text_renderer.prepare(
                             &self.device,
@@ -1112,7 +1130,7 @@ impl Gpu {
                             font_system,
                             &mut self.atlas,
                             vp,
-                            [area],
+                            areas,
                             &mut self.swash_cache,
                         );
                         if prep.is_ok() {
