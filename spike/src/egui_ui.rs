@@ -891,112 +891,149 @@ fn font_row(
             let inner = egui::Popup::from_response(&r)
                 .open_bool(&mut popup.open)
                 .width(420.0)
+                // from_response leaves the default left-to-right layout;
+                // without this the whole dialog renders as one horizontal
+                // strip (found by the layout test below).
+                .layout(egui::Layout::top_down_justified(egui::Align::Min))
                 .show(|ui| -> Option<String> {
-                    // ---- Preview (draft face, draft size) ----
-                    let face = face_of(choices, &popup.family, popup.style);
-                    let rt = match face {
-                        Some(f) => {
-                            // The terminal draws `size` pt at 96 dpi, i.e.
-                            // size*4/3 px; preview the same physical size.
-                            let px = (popup.size_pt * 96.0 / 72.0).clamp(9.0, 48.0);
-                            let key = preview_family_name(&popup.family, f.weight, f.slant);
-                            egui::RichText::new(FONT_PREVIEW_TEXT).font(egui::FontId::new(
-                                px,
-                                egui::FontFamily::Name(std::sync::Arc::from(key.as_str())),
-                            ))
-                        }
-                        None => egui::RichText::new(FONT_PREVIEW_TEXT)
-                            .weak()
-                            .italics(),
-                    };
-                    ui.add_sized(
-                        [404.0, (popup.size_pt * 96.0 / 72.0 * 1.6).clamp(24.0, 76.0)],
-                        egui::Label::new(rt),
-                    );
-                    ui.separator();
-                    // ---- Filter ----
-                    ui.add(
-                        egui::TextEdit::singleline(&mut search)
-                            .hint_text("Filter fonts\u{2026}")
-                            .desired_width(404.0),
-                    );
-                    // ---- Family list (neutral style) | style list ----
-                    let draft_family = popup.family.clone();
-                    let mut picked_family: Option<&crate::fonts::FontChoice> = None;
-                    let mut dbl = false;
-                    ui.horizontal(|ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("font-families")
-                            .max_height(240.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for c in &families {
-                                    let resp = ui.selectable_label(
-                                        c.name == draft_family,
-                                        // The NAME in the neutral UI font: the
-                                        // face belongs to the preview, not the
-                                        // list.
-                                        &c.name,
-                                    );
-                                    if resp.double_clicked() {
-                                        picked_family = Some(*c);
-                                        dbl = true;
-                                        break;
-                                    } else if resp.clicked() {
-                                        picked_family = Some(*c);
-                                        break;
-                                    }
+                    // The popup lives in an auto-sizing Area whose available
+                    // size is not trustworthy (an earlier version flowed the
+                    // whole dialog as one horizontal strip across the
+                    // screen). Lay the dialog out in an exactly-sized box
+                    // instead: every region gets an explicit rect.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(404.0, 452.0),
+                        egui::Layout::top_down_justified(egui::Align::Min),
+                        |ui| {
+                            // ---- Preview (draft face, draft size) ----
+                            let face = face_of(choices, &popup.family, popup.style);
+                            let rt = match face {
+                                Some(f) => {
+                                    // The terminal draws `size` pt at 96 dpi,
+                                    // i.e. size*4/3 px; preview the same
+                                    // physical size.
+                                    let px = (popup.size_pt * 96.0 / 72.0).clamp(9.0, 48.0);
+                                    let key = preview_family_name(&popup.family, f.weight, f.slant);
+                                    egui::RichText::new(FONT_PREVIEW_TEXT).font(egui::FontId::new(
+                                        px,
+                                        egui::FontFamily::Name(std::sync::Arc::from(key.as_str())),
+                                    ))
                                 }
+                                None => egui::RichText::new(FONT_PREVIEW_TEXT)
+                                    .weak()
+                                    .italics(),
+                            };
+                            ui.add_sized([404.0, 64.0], egui::Label::new(rt).selectable(false));
+                            ui.separator();
+                            // ---- Filter ----
+                            ui.add_sized(
+                                [404.0, 24.0],
+                                egui::TextEdit::singleline(&mut search).hint_text("Filter fonts\u{2026}"),
+                            );
+                            // ---- Family list (neutral labels) | style list ----
+                            let draft_family = popup.family.clone();
+                            let mut picked_family: Option<&crate::fonts::FontChoice> = None;
+                            let mut dbl = false;
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(250.0, 240.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("font-families")
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                for c in &families {
+                                                    let resp = ui.selectable_label(
+                                                        c.name == draft_family,
+                                                        // The NAME in the neutral UI
+                                                        // font: the face belongs to
+                                                        // the preview, not the list.
+                                                        &c.name,
+                                                    );
+                                                    if resp.double_clicked() {
+                                                        picked_family = Some(*c);
+                                                        dbl = true;
+                                                        break;
+                                                    } else if resp.clicked() {
+                                                        picked_family = Some(*c);
+                                                        break;
+                                                    }
+                                                }
+                                            });
+                                    },
+                                );
+                                ui.separator();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(140.0, 240.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("font-styles")
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                let Some(c) =
+                                                    choices.iter().find(|c| c.name == popup.family)
+                                                else {
+                                                    return;
+                                                };
+                                                for (i, f) in c.faces.iter().enumerate() {
+                                                    let words =
+                                                        crate::fonts::style_words(f.weight, f.slant);
+                                                    let name = if words.is_empty() {
+                                                        "Regular".to_string()
+                                                    } else {
+                                                        words
+                                                    };
+                                                    if ui
+                                                        .selectable_value(&mut popup.style, i, name)
+                                                        .double_clicked()
+                                                    {
+                                                        dbl = true;
+                                                        break;
+                                                    }
+                                                }
+                                            });
+                                    },
+                                );
                             });
-                        ui.separator();
-                        egui::ScrollArea::vertical()
-                            .id_salt("font-styles")
-                            .max_height(240.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let Some(c) = choices.iter().find(|c| c.name == popup.family) else {
-                                    return;
-                                };
-                                for (i, f) in c.faces.iter().enumerate() {
-                                    let words = crate::fonts::style_words(f.weight, f.slant);
-                                    let name = if words.is_empty() { "Regular".to_string() } else { words };
-                                    if ui
-                                        .selectable_value(&mut popup.style, i, name)
-                                        .double_clicked()
-                                    {
-                                        dbl = true;
-                                        break;
-                                    }
-                                }
+                            if let Some(c) = picked_family {
+                                // Snap the style to the same weight/slant the
+                                // previous family had selected, when offered.
+                                let want = face_of(choices, &popup.family, popup.style)
+                                    .map(|f| (f.weight, f.slant));
+                                popup.family = c.name.clone();
+                                popup.style = nearest_style(c, want);
+                            }
+                            // ---- Size, OK, Cancel ----
+                            ui.horizontal(|ui| {
+                                ui.label("Size");
+                                ui.add(
+                                    egui::DragValue::new(&mut popup.size_pt)
+                                        .range(4.0..=96.0)
+                                        .speed(0.5)
+                                        .suffix(" pt"),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("OK").clicked() || dbl {
+                                            commit = compose_value(
+                                                choices,
+                                                &popup.family,
+                                                popup.style,
+                                                popup.size_pt,
+                                            );
+                                            close = true;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            close = true;
+                                        }
+                                    },
+                                );
                             });
-                    });
-                    if let Some(c) = picked_family {
-                        // Snap the style to the same weight/slant the previous
-                        // family had selected, when that family ships it.
-                        let want = face_of(choices, &popup.family, popup.style)
-                            .map(|f| (f.weight, f.slant));
-                        popup.family = c.name.clone();
-                        popup.style = nearest_style(c, want);
-                    }
-                    // ---- Size, OK, Cancel ----
-                    ui.horizontal(|ui| {
-                        ui.label("Size");
-                        ui.add(
-                            egui::DragValue::new(&mut popup.size_pt)
-                                .range(4.0..=96.0)
-                                .speed(0.5)
-                                .suffix(" pt"),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("OK").clicked() || dbl {
-                                commit = compose_value(choices, &popup.family, popup.style, popup.size_pt);
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
+                        },
+                    );
                     commit.clone()
                 });
             if commit.is_none() {
@@ -1207,12 +1244,16 @@ mod regression {
 
         let mut st = UiState { font_popup: None };
         let mut cfg = crate::config::Config::default();
-        cfg.term_font = format!("{} 13", choices[0].name);
+        // Seed from a family in the middle of the list: the popup puts the
+        // current family first, so the next row down is the first family
+        // alphabetically -- two distinct names to measure the list with.
+        let mid = &choices[choices.len() / 2];
+        cfg.term_font = format!("{} 13", mid.name);
         let mut open = true;
         // The popup, seeded from the config value exactly as the button does.
         st.font_popup = Some(seed_popup(FontWhich::Term, &cfg.term_font, &choices));
         let family = st.font_popup.as_ref().unwrap().family.clone();
-        assert_eq!(family, choices[0].name, "seed should name the family");
+        assert_eq!(family, mid.name, "seed should name the family");
         assert_eq!(st.font_popup.as_ref().unwrap().size_pt, 13.0);
         for _ in 0..3 {
             let mut full = ctx.run_ui(
@@ -1241,9 +1282,11 @@ mod regression {
         });
         assert!(!chars.is_empty(), "preview face was not installed into egui");
 
-        // The family list draws NEUTRAL labels: among the laid-out text,
-        // the plain family name appears (the preview line is sample text,
-        // never a bare family name).
+        // Layout: the popup must stack VERTICALLY (its default layout is
+        // left-to-right, which once rendered the whole dialog as one
+        // horizontal strip). Measure: the current family label first, the
+        // alphabetically-first family below it, and the OK button under the
+        // lists -- all compared by galley position.
         let full = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_max(
@@ -1254,24 +1297,30 @@ mod regression {
             },
             |ui| { config_window(ui, &mut open, &mut cfg, &mut st, &choices); },
         );
-        let texts: Vec<String> = full
-            .shapes
-            .iter()
-            .filter_map(|cs| match cs {
-                egui::epaint::ClippedShape { shape: egui::Shape::Text(t), .. } => {
-                    Some(t.galley.text().to_string())
+        let label_pos = |want: &str| -> Option<egui::Pos2> {
+            full.shapes.iter().find_map(|cs| match cs {
+                egui::epaint::ClippedShape { shape: egui::Shape::Text(t), .. }
+                    if t.galley.text() == want =>
+                {
+                    Some(t.pos)
                 }
                 _ => None,
             })
-            .collect();
+        };
+        let cur = label_pos(&mid.name).expect("current family name in the list");
+        let next = label_pos(&choices[0].name).expect("second family name in the list");
         assert!(
-            texts.iter().any(|t| *t == choices[0].name),
-            "family name missing from the neutral list"
+            next.y > cur.y + 8.0 && (next.x - cur.x).abs() < 8.0,
+            "family list is not a vertical column: {:?} at {cur:?}, {:?} at {next:?}",
+            mid.name,
+            choices[0].name
         );
+        let ok = label_pos("OK").expect("OK button");
         assert!(
-            texts.iter().any(|t| t.contains("Size")),
-            "size control missing"
+            ok.y > cur.y + 100.0,
+            "OK button is not below the lists: OK at {ok:?}, list starts at {cur:?}"
         );
+        assert!(label_pos("Size").is_some(), "size control missing");
 
         // Commit round-trip: the composed description parses back to the
         // same family and lands on the same face.
@@ -1421,4 +1470,3 @@ mod regression {
         }
     }
 }
-
