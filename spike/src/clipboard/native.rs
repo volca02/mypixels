@@ -62,7 +62,7 @@ impl Drop for WriterSlot {
 }
 fn write_source(file: File, text: Arc<str>, writers: &Arc<AtomicUsize>) {
     if writers
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             (n < 8).then_some(n + 1)
         })
         .is_err()
