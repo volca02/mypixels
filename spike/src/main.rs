@@ -1689,11 +1689,20 @@ impl App {
             let n = self.tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
             let term_h = ((h as f32) - strip_h).max(1.0);
-            let tw = ((egui_ui::THUMB_H as f32) * (w as f32 / term_h))
-                .round()
-                .clamp(egui_ui::THUMB_W_RANGE.0 as f32, egui_ui::THUMB_W_RANGE.1 as f32)
-                as u32;
-            let th = egui_ui::THUMB_H;
+            // The point size (egui space) follows the same config values as
+            // the hand-drawn overview: `tab_overview_thumb_width/height`,
+            // capped so four fit across the window, aspect fitted.
+            let (ptw, pth) = egui_ui::thumbnail_size(
+                (w as f32) / self.scale.max(1.0),
+                (w as f32) / term_h,
+                self.config.tab_overview_thumb_width,
+                self.config.tab_overview_thumb_height,
+            );
+            // The egui context runs at the display's pixels-per-point, so
+            // read the preview back at full pixel density -- a texture at
+            // point size would be upscaled and look soft.
+            let tw = (ptw * self.scale).round().max(1.0) as u32;
+            let th = (pth * self.scale).round().max(1.0) as u32;
             let mut order: Vec<usize> = vec![sel];
             for k in 0..n {
                 let i = (self.thumb_rr + k) % n;
@@ -1738,7 +1747,8 @@ impl App {
                 }
                 self.sw_thumbs[i] = Some(SwThumb {
                     handle,
-                    size: (tw, th),
+                    // Point size for the layout (the texture is pixel-dense).
+                    size: (ptw.round() as u32, pth.round() as u32),
                     sig,
                     last: now,
                 });

@@ -161,12 +161,24 @@ const CARD_PAD: f32 = 10.0;
 /// The widest the text column may be; longer titles truncate.
 const TITLE_MAX: f32 = 140.0;
 const CARD_TXT_GAP: f32 = 8.0;
-/// The thumbnail's height; its width follows the terminal's aspect.
-pub const THUMB_H: u32 = 76;
-/// The thumbnail width is `THUMB_H` times the terminal's aspect, clamped to
-/// this so an extreme aspect ratio cannot make a card absurdly wide.
-pub const THUMB_W_RANGE: (u32, u32) = (48, 240);
 const CARD_GAP: f32 = 12.0;
+
+/// The card thumbnail's size, in points. The same formula the Python
+/// original's overview uses: the configured box (`tab_overview_thumb_*`),
+/// capped so four fit across the panel, with the terminal's own aspect
+/// fitted inside the box -- so the preview never letterboxes.
+pub fn thumbnail_size(panel_w: f32, aspect: f32, max_tw: u32, max_th: u32) -> (f32, f32) {
+    if aspect <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let box_w = (max_tw as f32).min(panel_w / 4.0 - 20.0).max(48.0);
+    let box_h = (max_th as f32).min(box_w * 0.75).max(1.0);
+    if box_w / box_h > aspect {
+        (box_h * aspect, box_h)
+    } else {
+        (box_w, box_w / aspect)
+    }
+}
 
 /// A card's exact width: pads plus the wider of the text block and the
 /// thumbnail (the text sits on top, the image below it).
@@ -454,9 +466,15 @@ impl egui::Widget for CardFace<'_> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             text_column(ui, self.index, self.card, self.selected);
-            if let Some((handle, _)) = &self.card.thumb {
+            if let Some((handle, (tw, th))) = &self.card.thumb {
                 ui.add_space(CARD_TXT_GAP);
-                ui.image(egui::load::SizedTexture::from(handle));
+                // The texture is stored at pixel density (points times the
+                // display scale) and drawn at its point size, so it stays
+                // sharp on scaled displays.
+                ui.add(
+                    egui::Image::new(egui::load::SizedTexture::from(handle))
+                        .fit_to_exact_size(egui::vec2(*tw as f32, *th as f32)),
+                );
             }
         });
         ui.interact(
@@ -789,27 +807,30 @@ mod regression {
     fn switcher_screen_layout() {
         let ctx = Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        // A realistic thumbnail size for a ~5:3 terminal at THUMB_H.
-        let (tw, th) = (128u32, THUMB_H);
-        let tex = ctx.load_texture(
-            "test-thumb",
-            egui::ColorImage::from_rgba_unmultiplied(
-                [tw as usize, th as usize],
-                &[7u8, 9, 11, 255].repeat((tw * th) as usize),
-            ),
-            egui::TextureOptions::LINEAR,
-        );
-        let cards: Vec<SwitcherCard> = (0..8)
-            .map(|i| SwitcherCard {
-                title: format!("a much longer tab title number {i}"),
-                active: i == 1,
-                marker: i == 3,
-                cwd: if i % 2 == 0 { Some(format!("~/projects/x{i}")) } else { None },
-                thumb: if i < 3 { Some((tex.clone(), (tw, th))) } else { None },
-            })
-            .collect();
-        // Wide screen: one row. Narrow screen: several centred rows.
-        for (w, h) in [(1280.0, 720.0), (560.0, 480.0)] {
+        // The same config values and aspect main.rs uses; a wide and a
+        // narrow screen so both the row grouping and the per-row centring
+        // are exercised.
+        let aspect = 1.78;
+        for (w, h) in [(1920.0, 1080.0), (560.0, 480.0)] {
+            let (ptw, pth) = thumbnail_size(w, aspect, 300, 225);
+            let (tw, th) = (ptw.round() as u32, pth.round() as u32);
+            let tex = ctx.load_texture(
+                format!("test-thumb-{tw}x{th}"),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [tw as usize, th as usize],
+                    &[7u8, 9, 11, 255].repeat((tw * th) as usize),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            let cards: Vec<SwitcherCard> = (0..8)
+                .map(|i| SwitcherCard {
+                    title: format!("a much longer tab title number {i}"),
+                    active: i == 1,
+                    marker: i == 3,
+                    cwd: if i % 2 == 0 { Some(format!("~/projects/x{i}")) } else { None },
+                    thumb: if i < 3 { Some((tex.clone(), (tw, th))) } else { None },
+                })
+                .collect();
             for _ in 0..3 {
                 let mut pick = None;
                 let mut full = ctx.run_ui(
@@ -845,8 +866,8 @@ mod regression {
                             egui::epaint::ClippedShape {
                                 shape: egui::Shape::Rect(r),
                                 ..
-                            } if (80.0..300.0).contains(&r.rect.size().x)
-                                && (40.0..170.0).contains(&r.rect.size().y)
+                            } if (80.0..400.0).contains(&r.rect.size().x)
+                                && (40.0..300.0).contains(&r.rect.size().y)
                                 && r.rect.min.y >= 0.0
                                 && r.rect.max.y <= h + 1.0
                                 && r.rect.min.x >= 0.0
@@ -876,8 +897,8 @@ mod regression {
                 let cards_r: Vec<&egui::Rect> = rects
                     .iter()
                     .filter(|r| {
-                        (80.0..300.0).contains(&r.size().x)
-                            && (40.0..170.0).contains(&r.size().y)
+                        (80.0..400.0).contains(&r.size().x)
+                            && (40.0..300.0).contains(&r.size().y)
                     })
                     .collect();
                 let images: Vec<&egui::Rect> = rects
