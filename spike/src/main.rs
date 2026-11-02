@@ -12,8 +12,7 @@ mod gpu;
 mod tab;
 mod theme;
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -220,7 +219,6 @@ fn push_run(runs: &mut Vec<Run>, mut r: Run, _def_fg: [f32; 3], def_bg: [f32; 3]
     runs.push(r);
 }
 
-#[derive(Clone)]
 struct Run {
     row: u32,
     col: u32,
@@ -235,48 +233,13 @@ struct Run {
     attrs: &'static Attrs<'static>,
 }
 
-/// Everything about a frame that survives a clean frame: the terminal
-/// damage tells us which rows changed; unchanged rows are moved through
-/// this cache (kept per tab, shared by `Rc`), so a clean frame costs a
-/// refcount clone instead of a 75k-cell re-walk. Lives in a `RefCell<Rc<_>>`
-/// on the tab.
 #[derive(Default)]
-pub(crate) struct FrameCache {
-    /// Every viewport row's runs, flat, in row order.
-    runs: Vec<Run>,
-    /// `(start, len)` per viewport row; the spans concatenate to `runs`.
-    spans: Vec<(u32, u32)>,
-    /// Fingerprint of the inputs that invalidate everything (geometry,
-    /// fonts, palette, alt screen, scroll offset). 0 = never built.
-    fp: u64,
-}
-
-/// One built frame: the (usually shared, unchanged) run data, plus the
-/// per-frame meta. Colors and cursor live OUTSIDE the cache: the cursor
-/// blinks and moves between identical-content frames, and a cache keyed on
-/// runs must not be invalidated by either.
-#[derive(Default)]
-struct FrameOut {
-    cache: Rc<FrameCache>,
+struct FrameData {
     fg: [f32; 3],
     bg: [f32; 3],
     cursor_color: [f32; 3],
+    runs: Vec<Run>,
     cursor: Option<(u32, u32)>,
-}
-
-/// Placeholder for a run that was moved out of a cache being consumed
-/// (cheap: `String::new` and `Vec::new` do not allocate).
-fn dummy_run(attrs: &'static Attrs<'static>) -> Run {
-    Run {
-        row: 0,
-        col: 0,
-        width: 0,
-        fg: [0.0; 3],
-        bg: [0.0; 3],
-        text: String::new(),
-        cells: Vec::new(),
-        attrs,
-    }
 }
 
 /// The Alt-held visual tab switcher. Standalone overview is intentionally absent.
@@ -340,10 +303,6 @@ struct App {
     /// no window exists yet; `resumed` applies the real factor before the
     /// window is created and `ScaleFactorChanged` keeps it current.
     scale: f32,
-    /// Bumped whenever the font system is rebuilt. The per-tab frame cache
-    /// fingerprints it: cached runs point at leaked `Attrs` belonging to the
-    /// font system that built them, so a rebuild must invalidate every cache.
-    font_gen: Cell<u64>,
     /// Vertical metrics of the term/tablist fonts, read from the fonts
     /// themselves -- line height differs a lot per family (Cascadia 9pt lands on
     /// 15px, Terminus 12 on 17px) and one guessed factor fit neither.
@@ -621,7 +580,6 @@ impl App {
             tab_char_w,
             tab_h,
             tab_text_h: tab_lh,
-            font_gen: Cell::new(1),
             scale: 1.0,
             term_metrics,
             tab_metrics,
@@ -842,7 +800,6 @@ impl App {
     /// at the size the glyphs are actually rasterised at, so HiDPI screens
     /// get the rounded cell of their real size, not a 1x cell doubled.
     fn rebuild_term_font(&mut self) {
-        self.font_gen.set(self.font_gen.get() + 1);
         let font_px = self.term_pt * 96.0 / 72.0 * self.scale;
         self.term_metrics =
             fonts::line_metrics(&mut self.font_system, self.term_family, self.term_weight, self.term_slant)
@@ -921,7 +878,6 @@ impl App {
     /// Rebuild the tablist font from config (family + size): attrs, tab
     /// metrics, and the tab glyph pool.
     fn rebuild_tab_font(&mut self) {
-        self.font_gen.set(self.font_gen.get() + 1);
         let (tab_spec, tab_pt) = config::parse_font(&self.config.tablist_font);
         let tab_font_px = tab_pt * 96.0 / 72.0 * self.scale;
         let tab = fonts::resolve_font(self.font_system.db(), &tab_spec);
@@ -1018,248 +974,27 @@ impl App {
         self.rebuild_term_font();
     }
 
-    /// Build (or reuse) one tab's frame. The terminal's own damage reporter
-    /// says which rows changed; unchanged rows are moved through the tab's
-    /// cache, so a clean frame costs lock + damage + fingerprint + an `Rc`
-    /// clone -- no cell is walked. Cursor blink and selection live outside
-    /// the run cache (meta), so they never invalidate it.
-    /// Build (or reuse) one tab's frame, in three tiers of work:
-    ///
-    /// * nothing new on the PTY since this tab's last build -> the run cache
-    ///   cannot be stale (cells only change through PTY output; the cursor
-    ///   and colors are per-frame meta, not cache); damage is not even read;
-    /// * output happened -> the terminal's own damage report says which ROWS
-    ///   changed; every other row's runs are moved through the cache;
-    /// * geometry/font/palette/alt-screen/scroll-offset changed -> full
-    ///   rebuild (runs reference leaked `Attrs` and table-resolved colors
-    ///   from the inputs that built them).
-    ///
-    /// Cursor blink and selection never invalidate anything: the cursor is
-    /// drawn as a rect and the selection wash rides over the runs.
-    fn build_frame(&self, tab: &Tab, show_cursor: bool) -> FrameOut {
-        use alacritty_terminal::term::TermDamage;
-        use alacritty_terminal::vte::ansi::{Color, NamedColor};
-        let mut term = tab.term.lock();
-        // The activity stamp is bumped by the PTY listener and by local key
-        // input (both can change cells). Unchanged stamp => no bytes since
-        // this tab was last built => its runs are provably current.
-        let last_act = *self.last_activity.lock().unwrap();
+    fn build_frame(&self, tab: &Tab, show_cursor: bool) -> FrameData {
+        let term = tab.term.lock();
         let content = term.renderable_content();
         let palette = Palette::from_colors(content.colors, &self.config.palette);
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
         let resolve = |color: &Color| palette.resolve_with(color, self.fg, self.bg, self.config.cursor_color.to_f32());
         let fg = resolve(&Color::Named(NamedColor::Foreground));
         let bg = resolve(&Color::Named(NamedColor::Background));
         let cursor_color = resolve(&Color::Named(NamedColor::Cursor));
         let rows = self.rows;
         let cols = self.cols;
-        let offset = content.display_offset as u32;
-        let alt = (content.mode.bits() & TermMode::ALT_SCREEN.bits()) as u64;
-
-        let cursor = if !show_cursor {
-            None
-        } else {
-            match content.cursor.shape {
-                alacritty_terminal::vte::ansi::CursorShape::Hidden => None,
-                _ if content.cursor.point.line.0 + (content.display_offset as i32) < self.rows as i32 => Some((
-                    content.cursor.point.column.0 as u32,
-                    (content.cursor.point.line.0 + content.display_offset as i32) as u32,
-                )),
-                _ => None,
-            }
-        };
-
-        // Fingerprint of the inputs that would silently change every row.
-        let mut h: u64 = 0xcbf29ce484222325;
-        let mut mix = |v: u64| {
-            h ^= v;
-            h = h.wrapping_mul(0x100000001b3);
-        };
-        mix((rows as u64) << 32 | cols as u64);
-        mix(offset as u64);
-        mix(self.font_gen.get());
-        mix(alt);
-        for c in fg.iter().chain(bg.iter()).chain(cursor_color.iter()) {
-            mix((c.clamp(0.0, 1.0) * 255.0).round() as u64);
-        }
-        for i in 0..269 {
-            match &content.colors[i] {
-                Some(rgb) => mix(((rgb.r as u64) << 16) | ((rgb.g as u64) << 8) | rgb.b as u64),
-                None => mix(0),
-            }
-        }
-        let fp = h | 1;
-
-        let mut cache_rc = tab.frame_cache.borrow().clone();
-        let cache_current = cache_rc.fp == fp && cache_rc.spans.len() == rows;
-        if tab.out_seen.get() == Some(last_act) && cache_current {
-            // Fastest path: no bytes since this tab's runs were built.
-            return FrameOut { cache: cache_rc, fg, bg, cursor_color, cursor };
-        }
-
-        // Everything read off `content` above is computed; release the
-        // borrow, because reading damage needs `term` mutably. The walk
-        // below takes a fresh content (free -- it is a lazy view, and the
-        // terminal is still locked throughout).
-        drop(content);
-        // ---- output happened: ask the terminal which rows it changed ----
-        // Damage is consume-and-reset, per terminal. A tab nobody drew just
-        // accumulates it (bounded, in-place per row) until it is built next.
-        let mut rebuild_all;
-        let mut dirty: Vec<u32> = Vec::new();
-        match term.damage() {
-            TermDamage::Full => rebuild_all = true,
-            TermDamage::Partial(it) => {
-                rebuild_all = false;
-                dirty.extend(it.map(|d| d.line as u32));
-            }
-        }
-        term.reset_damage();
-        // Remember the stamp as of BEFORE reading damage: output racing in
-        // during this frame bumped the stamp past it, so next frame reads
-        // damage again and nothing is missed.
-        tab.out_seen.set(Some(last_act));
-        let content = term.renderable_content();
-
-        // Damage arrives in grid space (viewport line + display offset);
-        // everything that could shift the whole view arrives as Full instead.
-        if !rebuild_all {
-            dirty.retain(|l| *l >= offset && *l - offset < rows as u32);
-            for l in dirty.iter_mut() {
-                *l -= offset;
-            }
-        }
-        // A fingerprint change (fonts, geometry, palette, alt screen, scroll
-        // offset) invalidates EVERY row, even rows the terminal reports as
-        // undamaged -- see the doc comment. Also covers the never-built
-        // cache (fp 0 can never match a real fp).
-        if !cache_current {
-            rebuild_all = true;
-        }
-
-        // ---- rebuild the damaged rows ----
-        // Per-cell colour resolution is a table read from here on.
-        // `resolve_with` was ~10% of every frame, redoing these same 512
-        // resolutions per CELL; the answers only depend on the palette --
-        // which the fingerprint above already decided is unchanged.
-        let mut named_tab = [[0f32; 3]; 269];
-        let mut index_tab = [[0f32; 3]; 256];
-        for i in 0..269 {
-            use alacritty_terminal::vte::ansi::NamedColor as N;
-            named_tab[i] = match &palette.colors[i] {
-                Some(rgb) => *rgb, // palette.colors is already f32
-                None if i < 16 => match &palette.cfg16 {
-                    Some(p) => p[i],
-                    None => PALETTE[i],
-                },
-                None if i == N::Foreground as usize => fg,
-                None if i == N::Background as usize => bg,
-                None if i == N::Cursor as usize => cursor_color,
-                None if i == N::BrightForeground as usize => fg,
-                None if i == N::DimForeground as usize => fg.map(|v| v * 0.66),
-                None if (N::DimBlack as usize..=N::DimWhite as usize).contains(&i) => {
-                    let slot = i - N::DimBlack as usize;
-                    match &palette.cfg16 {
-                        Some(p) => p[slot].map(|v| v * 0.66),
-                        None => PALETTE[slot].map(|v| v * 0.66),
-                    }
-                }
-                None => fg,
-            };
-        }
-        for i in 0..256usize {
-            index_tab[i] = match &palette.colors[i] {
-                Some(rgb) => *rgb,
-                None if i < 16 => match &palette.cfg16 {
-                    Some(p) => p[i],
-                    None => PALETTE[i],
-                },
-                None if (16..232).contains(&i) => cube_color(i as u8),
-                None => {
-                    let v = (8.0 + 10.0 * (i as u32 - 232) as f32) / 255.0;
-                    [v, v, v]
-                }
-            };
-        }
-        let cell_color = |c: &Color| match c {
-            Color::Spec(rgb) => [rgb.r as f32 / 255.0, rgb.g as f32 / 255.0, rgb.b as f32 / 255.0],
-            Color::Named(n) => {
-                let i = *n as usize;
-                if i < 269 {
-                    named_tab[i]
-                } else {
-                    fg
-                }
-            }
-            Color::Indexed(i) => index_tab[*i as usize],
-        };
-
-        let mut dirty_flags = vec![false; rows];
-        if rebuild_all {
-            dirty_flags.iter_mut().for_each(|f| *f = true);
-        } else {
-            for l in dirty {
-                dirty_flags[l as usize] = true;
-            }
-        }
-        // Move the old runs out when nobody else still holds this frame
-        // (the common case: the previous frame died with the previous
-        // draw). If somebody does, clean rows are cloned instead -- rare,
-        // correct, and no worse than before this cache existed.
-        let take_old = Rc::get_mut(&mut cache_rc).is_some();
-        let mut old_runs: Vec<Run> = if take_old {
-            std::mem::take(&mut Rc::get_mut(&mut cache_rc).unwrap().runs)
-        } else {
-            Vec::new()
-        };
 
         let mut runs: Vec<Run> = Vec::new();
-        let mut spans = vec![(0u32, 0u32); rows];
-        let dummy_attrs = self.cell_attrs(' ', Flags::empty());
-        let mut oi: usize = 0; // old_runs consumed so far (clean rows are copied in row order)
         let mut cur: Option<Run> = None;
-        let mut cur_row: usize = usize::MAX;
-        let mut span_start: usize = 0; // runs.len() at the start of the row being closed
-
-        macro_rules! close_row {
-            ($r:expr) => {{
-                let r: usize = $r;
-                if dirty_flags[r] {
-                    spans[r] = (span_start as u32, (runs.len() - span_start) as u32);
-                } else {
-                    let (os, olen) = cache_rc.spans[r];
-                    let start = runs.len();
-                    if take_old {
-                        for k in 0..olen as usize {
-                            runs.push(std::mem::replace(&mut old_runs[oi + k], dummy_run(dummy_attrs)));
-                        }
-                        oi += olen as usize;
-                    } else {
-                        runs.extend(cache_rc.runs[os as usize..(os + olen) as usize].iter().cloned());
-                    }
-                    debug_assert_eq!(runs.len(), start + olen as usize);
-                }
-                span_start = runs.len();
-            }};
-        }
 
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + content.display_offset as i32;
-            if row < 0 {
-                continue;
-            }
+            if row < 0 { continue; }
             let row = row as usize;
             if row >= rows {
                 break;
-            }
-            if cur_row != row {
-                if let Some(r) = cur.take() {
-                    push_run(&mut runs, r, fg, bg);
-                }
-                let from = if cur_row == usize::MAX { 0 } else { cur_row };
-                for r in from..row {
-                    close_row!(r);
-                }
-                cur_row = row;
             }
             let col = indexed.point.column.0;
             if col >= cols {
@@ -1269,18 +1004,11 @@ impl App {
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
-            if !dirty_flags[row] {
-                continue; // clean row: its runs were moved through the cache
-            }
 
-            let mut fg = cell_color(&cell.fg);
-            let mut bg = cell_color(&cell.bg);
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if cell.flags.contains(Flags::DIM) {
-                fg = fg.map(|v| v * 0.66);
-            }
+            let mut fg = resolve(&cell.fg);
+            let mut bg = resolve(&cell.bg);
+            if cell.flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
+            if cell.flags.contains(Flags::DIM) { fg = fg.map(|v| v * 0.66); }
             let attrs = self.cell_attrs(cell.c, cell.flags);
             let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
 
@@ -1324,14 +1052,21 @@ impl App {
         if let Some(r) = cur.take() {
             push_run(&mut runs, r, fg, bg);
         }
-        let from = if cur_row == usize::MAX { 0 } else { cur_row };
-        for r in from..rows {
-            close_row!(r);
-        }
 
-        let new = Rc::new(FrameCache { runs, spans, fp });
-        *tab.frame_cache.borrow_mut() = Rc::clone(&new);
-        FrameOut { cache: new, fg, bg, cursor_color, cursor }
+        let cursor = if !show_cursor {
+            None
+        } else {
+            match content.cursor.shape {
+                alacritty_terminal::vte::ansi::CursorShape::Hidden => None,
+                _ if content.cursor.point.line.0 + (content.display_offset as i32) < self.rows as i32 => Some((
+                    content.cursor.point.column.0 as u32,
+                    (content.cursor.point.line.0 + content.display_offset as i32) as u32,
+                )),
+                _ => None,
+            }
+        };
+
+        FrameData { runs, cursor, fg, bg, cursor_color }
     }
 
     /// Render the terminal and, while Alt is held, the visual tab switcher. Builds a frame per tab (before the
@@ -1353,7 +1088,7 @@ impl App {
         // still painted underneath it -- that is what the backdrop dims.
         // Every tab's frame is built first (thumbnails are live), before the
         // borrow of `tab` ends.
-        let ov_frames: Vec<FrameOut> = if self.overview.is_some() {
+        let ov_frames: Vec<FrameData> = if self.overview.is_some() {
             self.tabs.iter().map(|t| self.build_frame(t, true)).collect()
         } else {
             Vec::new()
@@ -1706,7 +1441,7 @@ impl App {
         self.add_hit = add_hit;
 
         // --- Terminal: cell backgrounds ---
-        for run in &frame.cache.runs {
+        for run in &frame.runs {
             let same_bg = (run.bg[0] - frame.bg[0]).abs() < 0.004
                 && (run.bg[1] - frame.bg[1]).abs() < 0.004
                 && (run.bg[2] - frame.bg[2]).abs() < 0.004;
@@ -1760,7 +1495,7 @@ impl App {
             let cache = shaping_cache_enabled();
             let fs = &mut self.font_system;
             let pool = &mut gpu.pool;
-            for (i, run) in frame.cache.runs.iter().take(MAX_RUNS).enumerate() {
+            for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
                 // Row 0 is replaced by the rename prompt.
                 if self.renaming && run.row == 0 {
                     continue;
@@ -1878,7 +1613,7 @@ impl App {
                 }
                 let metrics = gpu.pool[0].metrics();
                 let buffers = &mut gpu.prev_bufs[i];
-                let runs = &fd.cache.runs[..fd.cache.runs.len().min(MAX_RUNS)];
+                let runs = &fd.runs[..fd.runs.len().min(MAX_RUNS)];
                 buffers.resize_with(runs.len(), || Buffer::new(&mut self.font_system, metrics));
                 for (buffer, run) in buffers.iter_mut().zip(runs) {
                     buffer.set_metrics(metrics);
@@ -2051,7 +1786,7 @@ impl App {
 
         if std::env::var("SPIKE_TRACE").is_ok() {
             let mut h: u64 = 0xcbf29ce484222325;
-            for run in &frame.cache.runs {
+            for run in &frame.runs {
                 for b in run.text.as_bytes() {
                     h ^= *b as u64;
                     h = h.wrapping_mul(0x100000001b3);
@@ -2062,7 +1797,7 @@ impl App {
                 t_start.elapsed(),
                 self.cols,
                 self.rows,
-                frame.cache.runs.len(),
+                frame.runs.len(),
             );
         }
     }
@@ -2707,7 +2442,7 @@ fn push_ov_text(
 /// and a scaled thumbnail of the terminal content (built from `frames`).
 /// Signature of a whole frame, so a preview buffer is only re-shaped when its
 /// tab actually changed. Same idea as `run_sig`, folded over the frame.
-fn frame_sig(fd: &FrameOut, cell_w: f32) -> u64 {
+fn frame_sig(fd: &FrameData, cell_w: f32) -> u64 {
     fn mix(h: &mut u64, v: u64) {
         *h ^= v;
         *h = h.wrapping_mul(0x100000001b3);
@@ -2722,8 +2457,8 @@ fn frame_sig(fd: &FrameOut, cell_w: f32) -> u64 {
     for color in fd.fg.iter().chain(fd.bg.iter()).chain(fd.cursor_color.iter()) {
         mix(&mut h, color.to_bits() as u64);
     }
-    mix(&mut h, fd.cache.runs.len() as u64);
-    for run in &fd.cache.runs {
+    mix(&mut h, fd.runs.len() as u64);
+    for run in &fd.runs {
         mix(&mut h, run.row as u64);
         mix(&mut h, run.col as u64);
         mix(&mut h, run_sig(run, cell_w));
@@ -2743,7 +2478,7 @@ fn frame_sig(fd: &FrameOut, cell_w: f32) -> u64 {
 /// -- it belongs to the active tab and carries the overlay.
 #[allow(clippy::too_many_arguments)]
 fn preview_rects(
-    fd: &FrameOut,
+    fd: &FrameData,
     bg: &[f32; 3],
     bar: &[f32; 3],
     fg: &[f32; 3],
@@ -2756,7 +2491,7 @@ fn preview_rects(
 ) -> Vec<gpu::RectVertex> {
     let wf = w as f32;
     let hf = h as f32;
-    let mut v: Vec<gpu::RectVertex> = Vec::with_capacity((fd.cache.runs.len() + 3) * 6);
+    let mut v: Vec<gpu::RectVertex> = Vec::with_capacity((fd.runs.len() + 3) * 6);
     let mut push = |x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
         v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, 0.0, wf, hf))
     };
@@ -2765,7 +2500,7 @@ fn preview_rects(
     if strip_h > 0.0 {
         push(0.0, 0.0, wf, strip_h, [bar[0], bar[1], bar[2], 1.0]);
     }
-    for run in &fd.cache.runs {
+    for run in &fd.runs {
         if (run.row as usize) >= rows {
             continue;
         }
@@ -3746,19 +3481,16 @@ mod preview_tests {
 
     #[test]
     fn signatures_see_text_cursor_and_default_colors() {
-        let mut fd = FrameOut {
-            cache: Rc::new(FrameCache {
-                runs: vec![run(0, 0, "x")],
-                spans: vec![(0, 1)],
-                fp: 1,
-            }),
-            ..FrameOut::default()
+        let mut fd = FrameData {
+            runs: vec![run(0, 0, "x")],
+            cursor: None,
+            ..FrameData::default()
         };
         let base = frame_sig(&fd, 7.0);
         fd.cursor = Some((1, 0));
         assert_ne!(base, frame_sig(&fd, 7.0), "the cursor is part of the frame");
         fd.cursor = None;
-        Rc::get_mut(&mut fd.cache).unwrap().runs[0].text = "y".into();
+        fd.runs[0].text = "y".into();
         assert_ne!(base, frame_sig(&fd, 7.0), "so is the text");
         let old = frame_sig(&fd, 7.0);
         fd.bg = [1.0; 3];
