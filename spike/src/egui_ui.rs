@@ -25,6 +25,8 @@ pub struct Egui {
     /// The installed fonts the font popup can preview, from the app's own
     /// font database (see `fonts::font_choices`).
     pub font_choices: Vec<crate::fonts::FontChoice>,
+    /// Last frame's (panel open, popup open), for close-edge focus release.
+    pub open_prev: (bool, bool),
 }
 
 /// One frame of egui output, ready for `Gpu::render_frame`: tessellated
@@ -221,6 +223,7 @@ impl Egui {
             ui_state: UiState { font_popup: None },
             switcher_pick: None,
             font_choices,
+            open_prev: (false, false),
         }
     }
 
@@ -362,6 +365,36 @@ fn measure_card(ui: &egui::Ui, index: usize, card: &SwitcherCard) -> (f32, f32) 
 /// the terminal. Clicking a card reports that tab through `pick`; keyboard
 /// stays with the app (nothing here takes keyboard focus), so the Alt-held
 /// state machine and its navigation keys work unchanged.
+/// Release egui keyboard focus. A TextEdit that vanishes with its panel or
+/// popup does NOT release focus by itself, and while egui holds focus,
+/// egui-winit reports every key event as consumed -- the app then drops all
+/// keystrokes and the terminal silently stops receiving input ("letters
+/// vanish"). Call this whenever a UI region that could own the keyboard
+/// steps aside, or when the app claims a click for itself.
+pub fn release_focus(ctx: &egui::Context) {
+    if let Some(id) = ctx.memory(|m| m.focused()) {
+        ctx.memory_mut(|m| m.surrender_focus(id));
+        eprintln!("DBG release: was focused {:?}, now focused {:?}", id, ctx.memory(|m| m.focused()));
+    } else {
+        eprintln!("DBG release: no focused id");
+    }
+}
+
+/// Edge-triggered release: fires when the config panel or the font popup
+/// transitions open -> closed. `prev` is the previous frame's state, owned
+/// by the caller (the app).
+pub fn release_focus_if_closed(
+    ctx: &egui::Context,
+    open: bool,
+    popup_open: bool,
+    prev: &mut (bool, bool),
+) {
+    if (prev.0 && !open) || (prev.1 && !popup_open) {
+        release_focus(ctx);
+    }
+    *prev = (open, popup_open);
+}
+
 pub fn switcher_screen(
     ui: &mut egui::Ui,
     open: bool,
@@ -1628,128 +1661,95 @@ mod input_regression {
         assert_eq!(se.as_deref(), Some("on"), "keystroke did not reach the filter");
         assert!(l2.len() <= l.len(), "the filter did not narrow the family list");
     }
-}
 
-/// Headless UI benchmark. Drives a real egui Context with scripted events
-/// through the same config window the app renders, per scenario, printing
-/// `BENCH <name> avg_ms=..` per scenario. Run it (and only it) with:
-///
-///   cargo test --release bench_ui -- --ignored --nocapture --test-threads=1
-///
-/// The numbers are egui CPU per frame (input, layout, galleys,
-/// tessellation): what one UI frame costs before winit/wgpu/GPU are
-/// involved. Compare scenario deltas to locate UI optimization work; run
-/// the test binary under `perf record` for symbol-level detail.
-#[cfg(test)]
-mod ui_bench {
-    use super::*;
-    use std::time::Instant;
-
-    struct Bench {
-        ctx: Context,
-        st: UiState,
-        cfg: crate::config::Config,
-        open: bool,
-        choices: Vec<crate::fonts::FontChoice>,
-    }
-
-    impl Bench {
-        fn new() -> Self {
-            let ctx = Context::default();
-            ctx.set_visuals(egui::Visuals::dark());
-            let mut db = glyphon::fontdb::Database::new();
-            db.load_system_fonts();
-            let choices = crate::fonts::font_choices(&db);
-            let mut cfg = crate::config::Config::default();
-            cfg.term_font = format!("{} 13", choices[choices.len() / 2].name);
-            Bench { ctx, st: UiState { font_popup: None }, cfg, open: true, choices }
-        }
-
-        fn frame(&mut self, events: Vec<egui::Event>) -> usize {
-            let Self { ctx, st, cfg, open, choices } = self;
-            let mut full = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_max(
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2(1280.0, 720.0),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    config_window(ui, open, cfg, st, choices);
-                },
-            );
-            full.textures_delta.clear();
-            full.shapes.len()
-        }
-
-        fn timed(&mut self, name: &str, n: u32, mut ev_of: impl FnMut(u32) -> Vec<egui::Event>) {
-            let mut shapes = 0;
-            for i in 0..n / 3 {
-                shapes = self.frame(ev_of(i)); // warmup: lazy font loads, caches
-            }
-            let t0 = Instant::now();
-            for i in 0..n {
-                shapes = self.frame(ev_of(i));
-            }
-            let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-            println!("BENCH {name:14} avg_ms={ms:.3}  shapes={shapes}");
+    /// The app gates real keystrokes on `egui_winit::consumed`, which is
+    /// true whenever egui holds keyboard focus. If focus survives closing
+    /// the panel/popup or a click back onto the terminal, every keystroke
+    /// afterwards is eaten by egui -- no widget visible, nothing typed:
+    /// the reported "letters vanish when I start typing". These cases pin
+    /// that focus is actually surrendered.
+    fn fresh_sim<'a>(st: &'a mut UiState, cfg: &'a mut crate::config::Config, open: bool, choices: &'a [crate::fonts::FontChoice]) -> Sim<'a> {
+        Sim {
+            ctx: Context::default(),
+            st,
+            cfg,
+            open,
+            choices,
+            last_popup_rect: None,
         }
     }
 
     #[test]
-    #[ignore = "UI benchmark; run explicitly with --release"]
-    fn bench_ui() {
-        let n = 600;
-        let mut b = Bench::new();
-        println!("BENCH families={}", b.choices.len());
-
-        b.open = false;
-        b.timed("closed", n, |_| vec![]); // egui pass doing nothing
-        b.open = true;
-        b.timed("panel", n, |_| vec![]); // config panel, idle
-        b.timed("panel-hover", n, |i| {
-            // hover animations: widgets re-layout under the pointer
-            vec![egui::Event::PointerMoved(egui::pos2(
-                1000.0 + (i % 60) as f32,
-                200.0 + (i % 90) as f32,
-            ))]
-        });
-
-        // ---- font popup ----
-        let seed = seed_popup(FontWhich::Term, &b.cfg.term_font.clone(), &b.choices.clone());
-        b.st.font_popup = Some(seed);
-        b.timed("popup", n, |_| vec![]);
-        // keystroke in the filter: list rebuild + relayout of every visible
-        // row; a Backspace after every character keeps the search (and the
-        // list) from drifting to empty over the run
-        let letters: Vec<char> = "onericSerifMonoDingbat".chars().collect();
+    fn keyboard_focus_released_when_ui_steps_aside() {
+        let mut db = glyphon::fontdb::Database::new();
+        db.load_system_fonts();
+        let choices = crate::fonts::font_choices(&db);
+        let seed_spec = choices[choices.len() / 2].name.clone();
         let mods = egui::Modifiers::default();
-        b.timed("popup-filter", n, |i| {
-            if i % 2 == 0 {
-                vec![egui::Event::Text(letters[(i as usize / 2) % letters.len()].to_string())]
-            } else {
-                vec![egui::Event::Key {
-                    key: egui::Key::Backspace,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: mods,
-                }]
-            }
-        });
-        b.timed("popup-scroll", n, |_| {
-            vec![
-                egui::Event::PointerMoved(egui::pos2(760.0, 300.0)),
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, -24.0),
-                    modifiers: mods,
-                    phase: egui::TouchPhase::Move,
-                    source: egui::MouseWheelSource::Unknown,
-                },
-            ]
-        });
+
+        // Focus the font filter: click it, verify focus actually landed.
+        let focus_filter = |sim: &mut Sim| {
+            let p = seed_popup(FontWhich::Term, &format!("{seed_spec} 13"), sim.choices);
+            sim.st.font_popup = Some(p);
+            sim.frame(vec![]);
+            let r = sim.last_popup_rect.expect("filter laid out");
+            let pos = r.center();
+            sim.frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: mods },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: mods },
+            ]);
+            assert!(sim.ctx.memory(|m| m.focused().is_some()), "filter never got focus");
+        };
+
+        // A: panel closed (Save / x) while the filter had focus. Closing the
+        // panel also clears the popup, exactly as config_window does, so the
+        // app's edge helper sees (true,true) -> (false,false).
+        let mut st = UiState { font_popup: None };
+        let mut cfg = crate::config::Config::default();
+        let mut sim = fresh_sim(&mut st, &mut cfg, true, &choices);
+        focus_filter(&mut sim);
+        let mut prev = (true, true);
+        eprintln!("DBG pre-close: mem={:?} i.focused={}", sim.ctx.memory(|m| m.focused()), sim.ctx.input(|i| i.focused));
+        sim.open = false;
+        sim.st.font_popup = None;
+        sim.frame(vec![]);
+        eprintln!("DBG post-close-frame: mem={:?} i.focused={}", sim.ctx.memory(|m| m.focused()), sim.ctx.input(|i| i.focused));
+        release_focus_if_closed(&sim.ctx, false, false, &mut prev);
+        sim.frame(vec![egui::Event::Text("z".into())]);
+        eprintln!("DBG post-z: mem={:?} i.focused={}", sim.ctx.memory(|m| m.focused()), sim.ctx.input(|i| i.focused));
+        assert!(sim.ctx.memory(|m| m.focused()).is_none(), "egui still holds a widget focus after the panel closed");
+
+        // B: popup closed (OK/Cancel) while the filter had focus, panel open.
+        let mut st = UiState { font_popup: None };
+        let mut cfg = crate::config::Config::default();
+        let mut sim = fresh_sim(&mut st, &mut cfg, true, &choices);
+        focus_filter(&mut sim);
+        let mut prev = (true, true);
+        sim.st.font_popup = None;
+        sim.frame(vec![]);
+        release_focus_if_closed(&sim.ctx, true, false, &mut prev);
+        sim.frame(vec![egui::Event::Text("z".into())]);
+        assert!(sim.ctx.memory(|m| m.focused()).is_none(), "egui still holds a widget focus after the popup closed");
+
+        // C: filter focused, user clicks the terminal. Such a click is NOT
+        // egui-consumed, and the app releases focus for every click it
+        // claims itself; simulate that call.
+        let mut st = UiState { font_popup: None };
+        let mut cfg = crate::config::Config::default();
+        let mut sim = fresh_sim(&mut st, &mut cfg, true, &choices);
+        focus_filter(&mut sim);
+        let term = egui::pos2(400.0, 600.0); // left of the right-docked panel
+        sim.frame(vec![
+            egui::Event::PointerMoved(term),
+            egui::Event::PointerButton { pos: term, button: egui::PointerButton::Primary, pressed: true, modifiers: mods },
+            egui::Event::PointerButton { pos: term, button: egui::PointerButton::Primary, pressed: false, modifiers: mods },
+        ]);
+        eprintln!("DBG C pre-release: mem={:?}", sim.ctx.memory(|m| m.focused()));
+        release_focus(&sim.ctx);
+        eprintln!("DBG C post-release: mem={:?}", sim.ctx.memory(|m| m.focused()));
+        sim.frame(vec![egui::Event::Text("z".into())]);
+        eprintln!("DBG C post-z: mem={:?}", sim.ctx.memory(|m| m.focused()));
+        assert!(sim.ctx.memory(|m| m.focused()).is_none(), "egui kept keyboard focus after a click on the terminal");
     }
 }

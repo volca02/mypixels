@@ -1202,6 +1202,12 @@ impl App {
                 if ctx.requested_repaint_last_pass() {
                     window.request_redraw();
                 }
+                // A panel/popup that closed this frame must surrender
+                // keyboard focus; a vanished TextEdit does not do it alone,
+                // and while egui holds focus every keystroke reads as
+                // consumed and never reaches the terminal.
+                let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open);
+                egui_ui::release_focus_if_closed(&ctx, egui.config_open, popup_open, &mut egui.open_prev);
                 full_output = Some(full);
             }
             self.egui = egui;
@@ -2807,6 +2813,10 @@ fn parse_key_spec(spec: &str) -> Option<(ModifiersState, Key)> {
         "space" => Key::Named(NamedKey::Space),
         // "+" can't be written literally (it's the modifier separator).
         "plus" => Key::Character("+".into()),
+        // "+" and "-" are also how the zoom bindings match the numpad
+        // (NumLock on => winit delivers characters), so the harness can
+        // reach enlarge/shrink with alt+shift+plus / alt+shift+minus.
+        "minus" => Key::Character("-".into()),
         "braceleft" => Key::Character("{".into()),
         "braceright" => Key::Character("}".into()),
         "f1" => Key::Named(NamedKey::F1),
@@ -3138,6 +3148,11 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
                 if egui_consumed {
                     return;
+                }
+                // The app owns this click (terminal, tab strip): whoever held
+                // egui keyboard focus is no longer who the user is typing to.
+                if let Some(e) = self.egui.as_ref() {
+                    egui_ui::release_focus(&e.ctx);
                 }
                 let at = self.pointer;
                 // While the app owns the mouse (and Shift is not bypassing it)
