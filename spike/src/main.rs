@@ -26,7 +26,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode;
 
 use glyphon::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Resolution, Shaping, TextArea, TextBounds,
+    Attrs, Buffer, FontSystem, Metrics, Resolution, Shaping, TextArea, TextBounds,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -352,7 +352,11 @@ struct App {
     coverage: RefCell<Option<fonts::Coverage>>,
     /// Runtime terminal font state. `term_pt` is the live size (enlarge/
     /// shrink font mutates it); a config reload resets it to the config value.
+    /// The family here is the RESOLVED one: a config spec of "Foo Bold 12"
+    /// stores family "Foo" plus its style, so rebuilds do not re-parse.
     term_family: &'static str,
+    term_weight: u16,
+    term_slant: fonts::DbStyle,
     term_pt: f32,
     /// Inline rename mode: when true, keys edit `rename_draft` instead of the
     /// terminal; Enter commits, Esc cancels.
@@ -392,41 +396,50 @@ struct App {
 impl App {
     fn new() -> Self {
         let config = Config::load();
-        // Pango sizes are points; cosmic-text wants pixels (@96 dpi).
-        let (term_family, term_pt) = config::parse_font(&config.term_font);
-        let (tab_family, tab_pt) = config::parse_font(&config.tablist_font);
+        // Pango sizes are points; cosmic-text wants pixels (@96 dpi). The
+        // parsed family may still carry style words ("Foo Bold 12");
+        // resolve_font() splits those against the real database below.
+        let (term_spec, term_pt) = config::parse_font(&config.term_font);
+        let (tab_spec, tab_pt) = config::parse_font(&config.tablist_font);
         // Fallback chain must know the primary families up front, so powerline /
         // Nerd Font glyphs in prompts resolve to icons instead of tofu.
         let (mut font_system, fallback_chain) =
-            fonts::build_font_system(&[term_family.as_str(), tab_family.as_str()]);
+            fonts::build_font_system(&[term_spec.as_str(), tab_spec.as_str()]);
         log::info!("font fallback chain: {:?}", fallback_chain);
         let font_px = term_pt * 96.0 / 72.0;
         let tab_font_px = tab_pt * 96.0 / 72.0;
         // Font size comes from the Buffer Metrics (see Gpu::init), not Attrs.
         // mono_attrs/tab_attrs are 'static, so the family names must be too.
-        let term_family: &'static str = Box::leak(term_family.into_boxed_str());
-        let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
+        let term = fonts::resolve_font(font_system.db(), &term_spec);
+        let tab = fonts::resolve_font(font_system.db(), &tab_spec);
+        let term_family: &'static str = Box::leak(term.family.into_boxed_str());
+        let tab_family: &'static str = Box::leak(tab.family.into_boxed_str());
+        let (term_weight, term_slant) = (term.weight, term.slant);
         let (mono_attrs, tab_attrs) = {
             let db = font_system.db();
             (
                 fonts::pin_face(
                     db,
-                    Attrs::new().family(Family::Name(term_family)),
+                    Attrs::new(),
                     term_family,
+                    term_weight,
+                    term_slant,
                 ),
                 fonts::pin_face(
                     db,
-                    Attrs::new().family(Family::Name(tab_family)),
+                    Attrs::new(),
                     tab_family,
+                    tab.weight,
+                    tab.slant,
                 ),
             )
         };
 
         // Line height comes from the font itself, not a guessed factor.
-        let term_metrics =
-            fonts::line_metrics(&mut font_system, &term_family).unwrap_or(fonts::LineMetrics::DEFAULT);
-        let tab_metrics =
-            fonts::line_metrics(&mut font_system, &tab_family).unwrap_or(fonts::LineMetrics::DEFAULT);
+        let term_metrics = fonts::line_metrics(&mut font_system, term_family, term_weight, term_slant)
+            .unwrap_or(fonts::LineMetrics::DEFAULT);
+        let tab_metrics = fonts::line_metrics(&mut font_system, tab_family, tab.weight, tab.slant)
+            .unwrap_or(fonts::LineMetrics::DEFAULT);
         let term_lh = term_metrics.height_at(font_px);
         let tab_lh = tab_metrics.height_at(tab_font_px);
 
@@ -596,6 +609,8 @@ impl App {
             tab_attrs,
             coverage: RefCell::new(None),
             term_family,
+            term_weight,
+            term_slant,
             term_pt,
             renaming: false,
             rename_draft: String::new(),
@@ -786,15 +801,18 @@ impl App {
     /// get the rounded cell of their real size, not a 1x cell doubled.
     fn rebuild_term_font(&mut self) {
         let font_px = self.term_pt * 96.0 / 72.0 * self.scale;
-        self.term_metrics = fonts::line_metrics(&mut self.font_system, self.term_family)
-            .unwrap_or(fonts::LineMetrics::DEFAULT);
+        self.term_metrics =
+            fonts::line_metrics(&mut self.font_system, self.term_family, self.term_weight, self.term_slant)
+                .unwrap_or(fonts::LineMetrics::DEFAULT);
         let term_lh = self.term_metrics.height_at(font_px);
         self.mono_attrs = {
             let db = self.font_system.db();
             fonts::pin_face(
                 db,
-                Attrs::new().family(Family::Name(self.term_family)),
+                Attrs::new(),
                 self.term_family,
+                self.term_weight,
+                self.term_slant,
             )
         };
 
@@ -860,15 +878,17 @@ impl App {
     /// Rebuild the tablist font from config (family + size): attrs, tab
     /// metrics, and the tab glyph pool.
     fn rebuild_tab_font(&mut self) {
-        let (tab_family, tab_pt) = config::parse_font(&self.config.tablist_font);
+        let (tab_spec, tab_pt) = config::parse_font(&self.config.tablist_font);
         let tab_font_px = tab_pt * 96.0 / 72.0 * self.scale;
-        let tab_family: &'static str = Box::leak(tab_family.into_boxed_str());
-        self.tab_metrics = fonts::line_metrics(&mut self.font_system, tab_family)
-            .unwrap_or(fonts::LineMetrics::DEFAULT);
+        let tab = fonts::resolve_font(self.font_system.db(), &tab_spec);
+        let tab_family: &'static str = Box::leak(tab.family.into_boxed_str());
+        self.tab_metrics =
+            fonts::line_metrics(&mut self.font_system, tab_family, tab.weight, tab.slant)
+                .unwrap_or(fonts::LineMetrics::DEFAULT);
         let tab_lh = self.tab_metrics.height_at(tab_font_px);
         self.tab_attrs = {
             let db = self.font_system.db();
-            fonts::pin_face(db, Attrs::new().family(Family::Name(tab_family)), tab_family)
+            fonts::pin_face(db, Attrs::new(), tab_family, tab.weight, tab.slant)
         };
 
         let mut tmeasure =
@@ -917,8 +937,11 @@ impl App {
     /// Full font re-apply from config (used by config_reload). Resets the live
     /// term size to the config value, then rebuilds both fonts.
     fn apply_fonts(&mut self) {
-        let (term_family, term_pt) = config::parse_font(&self.config.term_font);
-        self.term_family = Box::leak(term_family.into_boxed_str());
+        let (term_spec, term_pt) = config::parse_font(&self.config.term_font);
+        let term = fonts::resolve_font(self.font_system.db(), &term_spec);
+        self.term_family = Box::leak(term.family.into_boxed_str());
+        self.term_weight = term.weight;
+        self.term_slant = term.slant;
         self.term_pt = term_pt;
         self.rebuild_term_font();
         self.rebuild_tab_font();

@@ -52,14 +52,23 @@ pub struct UiState {
     pub font_popup: Option<FontPopup>,
 }
 
-/// The font selector popup, opened from one of the two font rows.
+/// The font selector popup, opened from one of the two font rows. It works
+/// like the classic font-selection dialog: family, style, size, and a live
+/// preview; nothing reaches the config until OK.
 pub struct FontPopup {
-    /// The row it belongs to; the chosen family is written there.
+    /// The row it belongs to; the chosen description is written there.
     pub which: FontWhich,
-    /// egui's open flag; click-outside (or a pick) flips it to false.
+    /// egui's open flag; click-outside (or OK/Cancel) flips it to false.
     pub open: bool,
     /// The filter box contents, persisted per frame while open.
     pub search: String,
+    // ---- Draft (the popup's own selection, not yet the config's) ----
+    /// The drafted family name (index-free: names are the stable handle).
+    pub family: String,
+    /// Index into the family's face list (style).
+    pub style: usize,
+    /// Drafted size in points.
+    pub size_pt: f32,
 }
 
 /// Which font row a [`FontPopup`] belongs to.
@@ -69,12 +78,24 @@ pub enum FontWhich {
     Tablist,
 }
 
+/// egui family name for one face's preview. Faces live under a name built
+/// from the family, weight and slant so a family's styles cannot overwrite
+/// each other in egui's face store (which dedupes installs by name).
+pub fn preview_family_name(family: &str, weight: u16, slant: crate::fonts::DbStyle) -> String {
+    let slope = match slant {
+        crate::fonts::DbStyle::Normal => 'n',
+        crate::fonts::DbStyle::Italic => 'i',
+        crate::fonts::DbStyle::Oblique => 'o',
+    };
+    format!("{family}\u{1}{weight}{slope}")
+}
+
 /// Serves the installed font files to egui's text layout, on first use.
 ///
-/// The font popup previews families egui does not ship; this provider is
-/// where their bytes come from. `fonts_for_family` is asked once per family
-/// at layout time, so each previewed file is read exactly once per session
-/// and only when it is actually shown.
+/// The font popup previews families and styles egui does not ship; this
+/// provider is where their bytes come from. `fonts_for_family` is asked once
+/// per family name at layout time, so each previewed file is read exactly
+/// once per session and only when it is actually shown.
 struct FontPreviewProvider {
     fonts: std::sync::Mutex<std::collections::HashMap<String, (std::path::PathBuf, u32)>>,
 }
@@ -116,13 +137,21 @@ impl Egui {
     ) -> Self {
         let ctx = Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        // The font popup previews any installed family; this provider hands
-        // the bytes over to egui's layout when a preview is first drawn.
+        // The font popup previews any installed family/style; this provider
+        // hands the bytes over to egui's layout when a preview is first
+        // drawn. One entry per face, under its preview family name.
         ctx.add_font_provider(std::sync::Arc::new(FontPreviewProvider {
             fonts: std::sync::Mutex::new(
                 font_choices
                     .iter()
-                    .map(|c| (c.name.clone(), (c.path.clone(), c.face)))
+                    .flat_map(|c| {
+                        c.faces.iter().map(move |f| {
+                            (
+                                preview_family_name(&c.name, f.weight, f.slant),
+                                (f.path.clone(), f.index),
+                            )
+                        })
+                    })
                     .collect(),
             ),
         }));
@@ -811,17 +840,18 @@ fn row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) 
     ui.end_row();
 }
 
-/// The sample text a font popup row is previewed with.
-const FONT_PREVIEW_TEXT: &str = "AaBbCcDd 0123456789";
-/// A popup previews at most this many families. Each previewed family loads
-/// one font file into the atlas on first use, so this is a memory bound as
-/// well as a UI one.
-const FONT_POPUP_MAX: usize = 60;
+/// The sample text a font popup previews with.
+const FONT_PREVIEW_TEXT: &str = "AaBbGgRr 0123 The quick brown fox";
+/// A popup lists at most this many families per pass. Each previewed face
+/// reads one font file into the atlas, and a full system can hold hundreds
+/// of families; the filter box covers the tail.
+const FONT_POPUP_MAX: usize = 300;
 
-/// A font row: a button showing the current family that opens a popup of
-/// the installed fonts, each previewed in its own face. The pick is written
-/// straight into the config (a font change re-shapes the terminal, so there
-/// is no draft stage).
+/// A font row: a button showing the current description that opens the
+/// selection popup. The popup drafts family, style and size against a live
+/// preview; only OK writes the Pango-style description ("Family Bold Italic
+/// 12") into the config -- a font change rebuilds the whole font system, so
+/// it must never fire per keystroke or per list click.
 fn font_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -835,73 +865,234 @@ fn font_row(
         let shown: String = cfg_value.chars().take(30).collect();
         let r = ui.add(egui::Button::new(shown).min_size(egui::vec2(160.0, 0.0)));
         if r.clicked() && st.font_popup.is_none() {
-            st.font_popup = Some(FontPopup { which, open: true, search: String::new() });
+            st.font_popup = Some(seed_popup(which, cfg_value, choices));
         }
-        // The popup belongs to this row only; it must be re-shown every
-        // frame while open, so it is driven here rather than at the panel
-        // level.
-        if st.font_popup.as_ref().is_some_and(|p| p.which == which) {
-            let mut search = std::mem::take(&mut st.font_popup.as_mut().unwrap().search);
-            // The current family first (if it survives the filter), then
-            // the filtered list in name order, capped.
-            let needle = search.to_lowercase();
-            let mut list: Vec<&crate::fonts::FontChoice> = choices
-                .iter()
-                .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
-                .collect();
-            list.sort_by(|a, b| {
-                (*cfg_value == b.name).cmp(&(*cfg_value == a.name)).then_with(|| {
-                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                })
-            });
-            list.truncate(FONT_POPUP_MAX);
-            {
-                let popup = st.font_popup.as_mut().unwrap();
-                // The content closure returns the picked family (if any);
-                // applying it happens outside, so it does not fight the
-                // `&mut popup.open` borrow of `open_bool`.
-                let inner = egui::Popup::from_response(&r)
-                    .open_bool(&mut popup.open)
-                    .width(300.0)
-                    .show(|ui| -> Option<String> {
-                        ui.add_space(4.0);
-                        ui.add(egui::TextEdit::singleline(&mut search).hint_text("Filter…"));
-                        ui.separator();
-                        let mut picked = None;
+        if !st.font_popup.as_ref().is_some_and(|p| p.which == which) {
+            return;
+        }
+        let mut search = std::mem::take(&mut st.font_popup.as_mut().unwrap().search);
+        let needle = search.to_lowercase();
+        let mut families: Vec<&crate::fonts::FontChoice> = choices
+            .iter()
+            .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
+            .collect();
+        // The current family leads the filtered list, whatever the filter
+        // left of the alphabetical order.
+        families.sort_by(|a, b| {
+            (a.name != st_draft_family(st)).cmp(&(b.name != st_draft_family(st)))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        families.truncate(FONT_POPUP_MAX);
+
+        let mut commit: Option<String> = None;
+        let mut close = false;
+        {
+            let popup = st.font_popup.as_mut().unwrap();
+            let inner = egui::Popup::from_response(&r)
+                .open_bool(&mut popup.open)
+                .width(420.0)
+                .show(|ui| -> Option<String> {
+                    // ---- Preview (draft face, draft size) ----
+                    let face = face_of(choices, &popup.family, popup.style);
+                    let rt = match face {
+                        Some(f) => {
+                            // The terminal draws `size` pt at 96 dpi, i.e.
+                            // size*4/3 px; preview the same physical size.
+                            let px = (popup.size_pt * 96.0 / 72.0).clamp(9.0, 48.0);
+                            let key = preview_family_name(&popup.family, f.weight, f.slant);
+                            egui::RichText::new(FONT_PREVIEW_TEXT).font(egui::FontId::new(
+                                px,
+                                egui::FontFamily::Name(std::sync::Arc::from(key.as_str())),
+                            ))
+                        }
+                        None => egui::RichText::new(FONT_PREVIEW_TEXT)
+                            .weak()
+                            .italics(),
+                    };
+                    ui.add_sized(
+                        [404.0, (popup.size_pt * 96.0 / 72.0 * 1.6).clamp(24.0, 76.0)],
+                        egui::Label::new(rt),
+                    );
+                    ui.separator();
+                    // ---- Filter ----
+                    ui.add(
+                        egui::TextEdit::singleline(&mut search)
+                            .hint_text("Filter fonts\u{2026}")
+                            .desired_width(404.0),
+                    );
+                    // ---- Family list (neutral style) | style list ----
+                    let draft_family = popup.family.clone();
+                    let mut picked_family: Option<&crate::fonts::FontChoice> = None;
+                    let mut dbl = false;
+                    ui.horizontal(|ui| {
                         egui::ScrollArea::vertical()
-                            .max_height(400.0)
+                            .id_salt("font-families")
+                            .max_height(240.0)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                for c in &list {
-                                    let rt = egui::RichText::new(FONT_PREVIEW_TEXT)
-                                        .font(egui::FontId::new(
-                                            15.0,
-                                            egui::FontFamily::Name(std::sync::Arc::from(
-                                                &*c.name,
-                                            )),
-                                        ));
-                                    let selected = c.name == *cfg_value;
-                                    if ui.selectable_label(selected, rt).clicked() {
-                                        picked = Some(c.name.clone());
+                                for c in &families {
+                                    let resp = ui.selectable_label(
+                                        c.name == draft_family,
+                                        // The NAME in the neutral UI font: the
+                                        // face belongs to the preview, not the
+                                        // list.
+                                        &c.name,
+                                    );
+                                    if resp.double_clicked() {
+                                        picked_family = Some(*c);
+                                        dbl = true;
+                                        break;
+                                    } else if resp.clicked() {
+                                        picked_family = Some(*c);
+                                        break;
                                     }
                                 }
                             });
-                        ui.add_space(4.0);
-                        picked
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("font-styles")
+                            .max_height(240.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let Some(c) = choices.iter().find(|c| c.name == popup.family) else {
+                                    return;
+                                };
+                                for (i, f) in c.faces.iter().enumerate() {
+                                    let words = crate::fonts::style_words(f.weight, f.slant);
+                                    let name = if words.is_empty() { "Regular".to_string() } else { words };
+                                    if ui
+                                        .selectable_value(&mut popup.style, i, name)
+                                        .double_clicked()
+                                    {
+                                        dbl = true;
+                                        break;
+                                    }
+                                }
+                            });
                     });
-                if let Some(name) = inner.and_then(|i| i.inner) {
-                    if *cfg_value != name {
-                        *cfg_value = name;
-                        ev.apply = true;
+                    if let Some(c) = picked_family {
+                        // Snap the style to the same weight/slant the previous
+                        // family had selected, when that family ships it.
+                        let want = face_of(choices, &popup.family, popup.style)
+                            .map(|f| (f.weight, f.slant));
+                        popup.family = c.name.clone();
+                        popup.style = nearest_style(c, want);
                     }
-                    popup.open = false;
-                }
+                    // ---- Size, OK, Cancel ----
+                    ui.horizontal(|ui| {
+                        ui.label("Size");
+                        ui.add(
+                            egui::DragValue::new(&mut popup.size_pt)
+                                .range(4.0..=96.0)
+                                .speed(0.5)
+                                .suffix(" pt"),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("OK").clicked() || dbl {
+                                commit = compose_value(choices, &popup.family, popup.style, popup.size_pt);
+                                close = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    commit.clone()
+                });
+            if commit.is_none() {
+                commit = inner.and_then(|i| i.inner);
             }
-            st.font_popup.as_mut().unwrap().search = search;
-            if !st.font_popup.as_ref().is_some_and(|p| p.open) {
-                st.font_popup = None;
+            if close {
+                popup.open = false;
             }
         }
+        if let Some(val) = commit {
+            if *cfg_value != val {
+                *cfg_value = val;
+                ev.apply = true;
+            }
+        }
+        st.font_popup.as_mut().unwrap().search = search;
+        if !st.font_popup.as_ref().is_some_and(|p| p.open) {
+            st.font_popup = None;
+        }
     });
+}
+
+fn st_draft_family(st: &UiState) -> String {
+    st.font_popup.as_ref().map(|p| p.family.clone()).unwrap_or_default()
+}
+
+/// The drafted face, if the family exists and has one at that index.
+fn face_of<'a>(
+    choices: &'a [crate::fonts::FontChoice],
+    family: &str,
+    style: usize,
+) -> Option<&'a crate::fonts::FaceChoice> {
+    choices.iter().find(|c| c.name == family)?.faces.get(style)
+}
+
+/// The style index of the face closest to `want` (weight, slant); defaults
+/// to the family's Regular-ish face.
+fn nearest_style(
+    c: &crate::fonts::FontChoice,
+    want: Option<(u16, crate::fonts::DbStyle)>,
+) -> usize {
+    let (w, s) = want.unwrap_or((400, crate::fonts::DbStyle::Normal));
+    c.faces
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, f)| {
+            (f.weight as i32 - w as i32).unsigned_abs() + if f.slant == s { 0 } else { 1000 }
+        })
+        .map_or(0, |(i, _)| i)
+}
+
+/// Seed a popup's draft from the current config description: the spec names
+/// a family exactly, or it splits into family + style, or the draft starts
+/// from its first word so the list at least highlights near it.
+fn seed_popup(
+    which: FontWhich,
+    cfg_value: &str,
+    choices: &[crate::fonts::FontChoice],
+) -> FontPopup {
+    let (spec, size) = crate::config::parse_font(cfg_value);
+    let (family, want) = if choices.iter().any(|c| c.name == spec) {
+        (spec, None)
+    } else if let Some((base, w, s)) = crate::fonts::split_style_suffix(&spec) {
+            if choices.iter().any(|c| c.name == base) {
+                (base, Some((w, s)))
+            } else {
+                (spec, None)
+            }
+        } else {
+            (spec, None)
+        };
+    let style = choices
+        .iter()
+        .find(|c| c.name == family)
+        .map(|c| nearest_style(c, want))
+        .unwrap_or(0);
+    FontPopup { which, open: true, search: String::new(), family, style, size_pt: size }
+}
+
+/// Compose the config value the popup commits: "Family Bold Italic 12",
+/// with the style words omitted for the plain upright face. `None` when the
+/// draft names no real family (OK on a family-less draft must not write
+/// garbage).
+fn compose_value(
+    choices: &[crate::fonts::FontChoice],
+    family: &str,
+    style: usize,
+    size_pt: f32,
+) -> Option<String> {
+    let face = face_of(choices, family, style)?;
+    let words = crate::fonts::style_words(face.weight, face.slant);
+    Some(if words.is_empty() {
+        format!("{family} {size_pt}")
+    } else {
+        format!("{family} {words} {size_pt}")
+    })
 }
 
 fn color_row(ui: &mut egui::Ui, label: &str, c: &mut crate::config::Rgb, ev: &mut ConfigEvents) {
@@ -991,32 +1182,38 @@ mod regression {
     fn font_popup_layout() {
         let ctx = Context::default();
         ctx.set_visuals(egui::Visuals::dark());
-        // A real database so the provider has a real file to read (the same
+        // A real database so the provider has real files to read (the same
         // construction the app's FontSystem uses).
         let mut db = glyphon::fontdb::Database::new();
         db.load_system_fonts();
         let choices = crate::fonts::font_choices(&db);
         assert!(!choices.is_empty(), "no installed fonts on the test machine");
-        let previewed = choices[0].clone();
-        // Register the same provider Egui::init does.
+        // Register the same provider Egui::init does: one entry per face.
         ctx.add_font_provider(std::sync::Arc::new(FontPreviewProvider {
             fonts: std::sync::Mutex::new(
                 choices
                     .iter()
-                    .map(|c| (c.name.clone(), (c.path.clone(), c.face)))
+                    .flat_map(|c| {
+                        c.faces.iter().map(move |f| {
+                            (
+                                preview_family_name(&c.name, f.weight, f.slant),
+                                (f.path.clone(), f.index),
+                            )
+                        })
+                    })
                     .collect(),
             ),
         }));
 
         let mut st = UiState { font_popup: None };
         let mut cfg = crate::config::Config::default();
+        cfg.term_font = format!("{} 13", choices[0].name);
         let mut open = true;
-        // The popup, opened from the terminal font row.
-        st.font_popup = Some(FontPopup {
-            which: FontWhich::Term,
-            open: true,
-            search: String::new(),
-        });
+        // The popup, seeded from the config value exactly as the button does.
+        st.font_popup = Some(seed_popup(FontWhich::Term, &cfg.term_font, &choices));
+        let family = st.font_popup.as_ref().unwrap().family.clone();
+        assert_eq!(family, choices[0].name, "seed should name the family");
+        assert_eq!(st.font_popup.as_ref().unwrap().size_pt, 13.0);
         for _ in 0..3 {
             let mut full = ctx.run_ui(
                 egui::RawInput {
@@ -1031,31 +1228,22 @@ mod regression {
             full.textures_delta.clear();
         }
 
-        // The previewed family made it into egui's font system: the provider
-        // read the file and epaint installed it into the family's fallback
-        // chain when the preview row laid out (this is the whole point of
+        // The drafted face made it into egui's font system: the provider
+        // read the file and epaint installed it under the face's preview
+        // family name when the preview laid out (this is the whole point of
         // the popup). The chain is observable through the family's
-        // character map: non-empty, and carrying our face under its name.
-        let chars = ctx
-            .fonts_mut(|f| {
-                f.characters(&egui::FontFamily::Name(std::sync::Arc::from(
-                    previewed.name.as_str(),
-                )))
-                .clone()
-            });
-        assert!(
-            !chars.is_empty(),
-            "previewed family {previewed:?} has no installed face in egui"
-        );
-        let faces: std::collections::HashSet<String> =
-            chars.values().flatten().cloned().collect();
-        assert!(
-            faces.contains(&previewed.name),
-            "face {previewed:?} not in the family chain: {faces:?}"
-        );
+        // character map.
+        let style = st.font_popup.as_ref().unwrap().style;
+        let face = face_of(&choices, &family, style).expect("drafted face exists");
+        let key = preview_family_name(&family, face.weight, face.slant);
+        let chars = ctx.fonts_mut(|f| {
+            f.characters(&egui::FontFamily::Name(std::sync::Arc::from(key.as_str()))).clone()
+        });
+        assert!(!chars.is_empty(), "preview face was not installed into egui");
 
-        // The popup drew its preview rows: well above the ~30 galleys the
-        // panel alone produces.
+        // The family list draws NEUTRAL labels: among the laid-out text,
+        // the plain family name appears (the preview line is sample text,
+        // never a bare family name).
         let full = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_max(
@@ -1066,12 +1254,38 @@ mod regression {
             },
             |ui| { config_window(ui, &mut open, &mut cfg, &mut st, &choices); },
         );
-        let galleys = full
+        let texts: Vec<String> = full
             .shapes
             .iter()
-            .filter(|cs| matches!(cs, egui::epaint::ClippedShape { shape: egui::Shape::Text(_), .. }))
-            .count();
-        assert!(galleys >= 60, "popup preview rows missing: {galleys} galleys");
+            .filter_map(|cs| match cs {
+                egui::epaint::ClippedShape { shape: egui::Shape::Text(t), .. } => {
+                    Some(t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| *t == choices[0].name),
+            "family name missing from the neutral list"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Size")),
+            "size control missing"
+        );
+
+        // Commit round-trip: the composed description parses back to the
+        // same family and lands on the same face.
+        let composed =
+            compose_value(&choices, &family, style, 13.0).expect("draft composes");
+        let (spec, size) = crate::config::parse_font(&composed);
+        assert_eq!(size, 13.0, "size must round-trip through {composed:?}");
+        let r = crate::fonts::resolve_font(&db, &spec);
+        assert_eq!(r.family, family, "family must round-trip through {composed:?}");
+        assert_eq!(
+            (r.weight, r.slant),
+            (face.weight, face.slant),
+            "style must round-trip through {composed:?}"
+        );
     }
 
     // The switcher is a full-viewport CentralPanel with a row of cards whose

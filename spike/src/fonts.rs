@@ -23,7 +23,7 @@ use glyphon::cosmic_text::{
     skrifa, skrifa::prelude::*, Attrs, Buffer, Fallback, Family, FeatureTag, FontFeatures,
     FontSystem, Hinting, PlatformFallback, Shaping, Style, Weight, Wrap,
 };
-use glyphon::fontdb::{Database, ID, Style as DbStyle};
+pub use glyphon::fontdb::{Database, ID, Style as DbStyle};
 use std::collections::HashMap;
 use unicode_script::Script;
 
@@ -131,10 +131,15 @@ fn read_hhea(db: &Database, id: ID) -> Option<(f32, f32, f32)> {
 }
 
 /// Read a family's vertical metrics out of the loaded database.
-pub fn line_metrics(fs: &mut FontSystem, family: &str) -> Option<LineMetrics> {
+pub fn line_metrics(
+    fs: &mut FontSystem,
+    family: &str,
+    weight: u16,
+    slant: DbStyle,
+) -> Option<LineMetrics> {
     let id = {
         let db = fs.db_mut();
-        let want = pick_face(db, family).map(|p| p.postscript);
+        let want = pick_face_near(db, family, weight, slant).map(|p| p.postscript);
         db.faces()
             .find(|face| match &want {
                 // Metrics of the face we will actually draw with: Bold has
@@ -151,7 +156,9 @@ pub fn line_metrics(fs: &mut FontSystem, family: &str) -> Option<LineMetrics> {
         read_hhea(db, id)
     };
     let (upem, ascent, descent, leading) = {
-        let font = fs.get_font(id, glyphon::fontdb::Weight::NORMAL)?;
+        // The requested weight, not NORMAL: for a variable face this picks the
+        // named instance the terminal actually draws with.
+        let font = fs.get_font(id, glyphon::fontdb::Weight(weight))?;
         let m = font.metrics();
         (
             m.units_per_em as f32,
@@ -183,6 +190,7 @@ pub fn line_metrics(fs: &mut FontSystem, family: &str) -> Option<LineMetrics> {
 pub struct FacePick {
     pub postscript: String,
     pub weight: u16,
+    pub slant: DbStyle,
 }
 
 /// Resolve a family name to the one face we want from it.
@@ -194,7 +202,26 @@ pub struct FacePick {
 /// faces by distance from 400 and break ties by database order, so the answer is
 /// stable and never an accident of file scan order.
 pub fn pick_face(db: &Database, family: &str) -> Option<FacePick> {
-    let mut best: Option<(u32, u16, String)> = None; // (penalty, weight, postscript)
+    pick_face_near(db, family, 400, DbStyle::Normal)
+}
+
+/// The face of `family` nearest the requested weight and slant.
+///
+/// Asking for a family alone is not enough. A family can ship Bold, Italic and
+/// Medium faces and no Regular at all -- Terminus (TTF) here is exactly that --
+/// and "whichever face comes first in the database" is then a coin flip that can
+/// land on Bold, which is what made the tab strip look emboldened. Rank faces by
+/// distance from the request (slant first: an unintended italic is worse than an
+/// unintended weight) and break ties by database order, so the answer is stable
+/// and never an accident of file scan order. With the default request (400,
+/// Normal) this is the old upright-near-400 picker.
+pub fn pick_face_near(
+    db: &Database,
+    family: &str,
+    weight: u16,
+    slant: DbStyle,
+) -> Option<FacePick> {
+    let mut best: Option<(u32, u16, DbStyle, String)> = None; // (penalty, weight, slant, postscript)
     for face in db.faces() {
         if !face
             .families
@@ -203,32 +230,61 @@ pub fn pick_face(db: &Database, family: &str) -> Option<FacePick> {
         {
             continue;
         }
-        // An italic cell is wrong in a terminal either way, so sloped faces are
-        // only ever a last resort.
-        let slope: u32 = match face.style {
-            DbStyle::Normal => 0,
-            _ => 10_000,
+        // An unintended slope is wrong in a terminal either way, so mismatched
+        // slant is a last resort; a requested slant pays the same tax in
+        // reverse, keeping an upright family's faked-slope fall from grace
+        // symmetric.
+        let slope: u32 = if face.style == slant {
+            0
+        } else if face.style == DbStyle::Normal {
+            10_000 // upright face, slope requested
+        } else if slant == DbStyle::Normal {
+            10_000 // slope face, upright requested (the old rule)
+        } else {
+            5_000 // Italic vs Oblique: closer than either extreme
         };
-        let penalty = slope + (face.weight.0 as i32 - 400).unsigned_abs();
-        if best.as_ref().map(|(b, _, _)| penalty < *b).unwrap_or(true) {
-            best = Some((penalty, face.weight.0, face.post_script_name.clone()));
+        let penalty = slope + (face.weight.0 as i32 - weight as i32).unsigned_abs();
+        if best.as_ref().map(|(b, _, _, _)| penalty < *b).unwrap_or(true) {
+            best = Some((
+                penalty,
+                face.weight.0,
+                face.style,
+                face.post_script_name.clone(),
+            ));
         }
     }
-    best.map(|(_, weight, postscript)| FacePick { postscript, weight })
+    best.map(|(_, weight, slant, postscript)| FacePick { postscript, weight, slant })
 }
 
-/// Resolve the upright weight deliberately, including families with Medium but
-/// no Regular. Keep the family name so SGR bold/italic can select sibling faces.
-pub fn pin_face(db: &Database, attrs: Attrs<'static>, family: &'static str) -> Attrs<'static> {
-    match pick_face(db, family) {
+/// Pin default-text attrs to a resolved face: the weight and slant the
+/// terminal draws ordinary text with. Keep the family name so SGR
+/// bold/italic can still select sibling faces.
+pub fn pin_face(
+    db: &Database,
+    attrs: Attrs<'static>,
+    family: &'static str,
+    weight: u16,
+    slant: DbStyle,
+) -> Attrs<'static> {
+    match pick_face_near(db, family, weight, slant) {
         Some(pick) => {
-            log::info!("family {family:?} pinned to {:?} (weight {})", pick.postscript, pick.weight);
+            log::info!(
+                "family {family:?} pinned to {:?} (weight {} {pick_slant:?})",
+                pick.postscript,
+                pick.weight,
+                pick_slant = pick.slant
+            );
             attrs
                 .family(Family::Name(family))
                 .weight(cosmic_weight(pick.weight))
-                .style(Style::Normal)
+                .style(match pick.slant {
+                    DbStyle::Normal => Style::Normal,
+                    DbStyle::Italic | DbStyle::Oblique => Style::Italic,
+                })
         },
-        None => attrs,
+        // Family unknown to the database: keep the name and let cosmic-text's
+        // own fallback do what it always did.
+        None => attrs.family(Family::Name(family)),
     }
 }
 
@@ -249,23 +305,29 @@ fn installed_families(db: &Database) -> Vec<String> {
     out
 }
 
-/// One selectable installed font for the configuration panel's font popup:
-/// the family name and the file that carries its regular face.
+/// One face of an installed family, as the font popup offers it.
+#[derive(Clone, Debug)]
+pub struct FaceChoice {
+    pub weight: u16,
+    pub slant: DbStyle,
+    pub path: std::path::PathBuf,
+    /// Face index within the file (matters for `.ttc` collections).
+    pub index: u32,
+}
+
+/// One selectable installed family: every file-backed face it ships, so the
+/// popup can offer its real styles and preview each one.
 #[derive(Clone, Debug)]
 pub struct FontChoice {
     pub name: String,
-    pub path: std::path::PathBuf,
-    /// Face index within the file (matters for `.ttc` collections).
-    pub face: u32,
+    pub faces: Vec<FaceChoice>,
 }
 
-/// One choice per installed family: the upright face nearest weight 400,
-/// because that is the face a terminal actually uses for its default text.
-/// Sorted by family name, case-insensitive.
+/// One choice per installed family, each carrying its faces sorted by weight
+/// then slant (duplicated (weight, slant) faces keep the first, database
+/// order). Sorted by family name, case-insensitive.
 pub fn font_choices(db: &Database) -> Vec<FontChoice> {
-    #[derive(Clone, Copy, PartialEq, PartialOrd)]
-    struct Score(u32, bool); // (distance from weight 400, not upright)
-    let mut best: std::collections::HashMap<String, (Score, u32, std::path::PathBuf)> =
+    let mut families: std::collections::HashMap<String, Vec<FaceChoice>> =
         std::collections::HashMap::new();
     for face in db.faces() {
         let Some((name, _)) = face.families.first() else {
@@ -274,21 +336,155 @@ pub fn font_choices(db: &Database) -> Vec<FontChoice> {
         let Some(path) = source_path(&face.source) else {
             continue;
         };
-        let score = Score(face.weight.0.abs_diff(400) as u32, face.style != DbStyle::Normal);
-        let entry = best.get_mut(name);
-        match entry {
-            Some((cur, _, _)) if *cur <= score => {}
-            _ => {
-                best.insert(name.clone(), (score, face.index, path));
-            }
-        }
+        families
+            .entry(name.clone())
+            .or_default()
+            .push(FaceChoice {
+                weight: face.weight.0,
+                slant: face.style,
+                path,
+                index: face.index,
+            });
     }
-    let mut out: Vec<FontChoice> = best
+    let mut out: Vec<FontChoice> = families
         .into_iter()
-        .map(|(name, (_, face, path))| FontChoice { name, path, face })
+        .map(|(name, mut faces)| {
+            faces.sort_by_key(|f| (f.weight, f.slant as u8));
+            faces.dedup_by(|a, b| a.weight == b.weight && a.slant == b.slant);
+            FontChoice { name, faces }
+        })
         .collect();
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
+}
+
+/// Style words a Pango font description can carry between the family and the
+/// size: (word, weight). "Regular" is a word too, so "Foo Regular 12" parses
+/// as well as it writes back.
+const WEIGHT_WORDS: &[(&str, u16)] = &[
+    ("Thin", 100),
+    ("UltraLight", 200),
+    ("ExtraLight", 200),
+    ("Light", 300),
+    ("Book", 400),
+    ("Regular", 400),
+    ("Medium", 500),
+    ("SemiBold", 600),
+    ("DemiBold", 600),
+    ("Bold", 700),
+    ("ExtraBold", 800),
+    ("UltraBold", 800),
+    ("Black", 900),
+    ("Heavy", 900),
+];
+
+/// The words the popup writes back; deliberately single tokens so a family
+/// name that swallows spaces ("Semi Bold" written back as "SemiBold") still
+/// round-trips through `split_style_suffix`.
+fn weight_word(weight: u16) -> &'static str {
+    match weight {
+        0..=150 => "Thin",
+        151..=250 => "UltraLight",
+        251..=350 => "Light",
+        351..=450 => "",
+        451..=550 => "Medium",
+        551..=650 => "SemiBold",
+        651..=750 => "Bold",
+        751..=850 => "ExtraBold",
+        _ => "Black",
+    }
+}
+
+fn slant_word(slant: DbStyle) -> &'static str {
+    match slant {
+        DbStyle::Normal => "",
+        DbStyle::Italic | DbStyle::Oblique => "Italic",
+    }
+}
+
+/// The style portion of a font description: "Bold Italic", "Light",
+/// "Italic", or "" for the plain upright face (then the caller writes just
+/// "Family Size").
+pub fn style_words(weight: u16, slant: DbStyle) -> String {
+    [weight_word(weight), slant_word(slant)]
+        .into_iter()
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Peel style words off the tail of a family spec: "Foo Bold Italic" ->
+/// ("Foo", 700, Italic). Returns None when the tail is not a style word or
+/// the whole spec would be consumed ("Bold" alone is a family name as far as
+/// we are concerned). Only used when the full spec does not name an
+/// installed family -- families that ARE named "Roboto Medium" keep winning.
+pub fn split_style_suffix(spec: &str) -> Option<(String, u16, DbStyle)> {
+    let tokens: Vec<&str> = spec.split_whitespace().collect();
+    let (mut weight, mut slant) = (None, None);
+    let mut end = tokens.len();
+    for _ in 0..2 {
+        let Some(t) = tokens.get(end.wrapping_sub(1)) else { break };
+        let low = t.to_lowercase();
+        if low == "italic" || low == "oblique" {
+            slant = Some(DbStyle::Italic);
+        } else if let Some((_, w)) = WEIGHT_WORDS.iter().find(|(n, _)| n.to_lowercase() == low) {
+            weight = Some(*w);
+        } else {
+            break;
+        }
+        end -= 1;
+    }
+    if weight.is_none() && slant.is_none() {
+        return None;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((
+        tokens[..end].join(" "),
+        weight.unwrap_or(400),
+        slant.unwrap_or(DbStyle::Normal),
+    ))
+}
+
+/// A font description's family spec resolved against the real database.
+pub struct ResolvedFont {
+    /// The installed family to ask for (the spec itself when it names one).
+    pub family: String,
+    /// Weight and slant to pin the default-text attrs to.
+    pub weight: u16,
+    pub slant: DbStyle,
+}
+
+/// Resolve a family spec (which may carry style words) against the database.
+///
+/// A spec that names an installed family is used whole, whatever it
+/// contains: some families ARE called "Roboto Medium", and peeling that to
+/// "Roboto" + 500 would change the design. Only an unknown spec is peeled
+/// ("Foo Bold 12" -> family "Foo", pinned to 700). With no match at all the
+/// spec passes through unchanged -- face matching then falls back exactly as
+/// it always has.
+pub fn resolve_font(db: &Database, spec: &str) -> ResolvedFont {
+    if is_family(db, spec) {
+        let (weight, slant) = pick_face_near(db, spec, 400, DbStyle::Normal)
+            .map(|p| (p.weight, p.slant))
+            .unwrap_or((400, DbStyle::Normal));
+        return ResolvedFont { family: spec.to_string(), weight, slant };
+    }
+    if let Some((base, weight, slant)) = split_style_suffix(spec) {
+        if is_family(db, &base) {
+            let (weight, slant) = pick_face_near(db, &base, weight, slant)
+                .map(|p| (p.weight, p.slant))
+                .unwrap_or((weight, slant));
+            return ResolvedFont { family: base, weight, slant };
+        }
+    }
+    ResolvedFont { family: spec.to_string(), weight: 400, slant: DbStyle::Normal }
+}
+
+fn is_family(db: &Database, name: &str) -> bool {
+    db.faces()
+        .any(|f| f.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)))
 }
 
 fn source_path(source: &glyphon::fontdb::Source) -> Option<std::path::PathBuf> {
@@ -380,7 +576,11 @@ pub fn build_font_system(primary_families: &[&str]) -> (FontSystem, Vec<String>)
 
     let mut chain: Vec<String> = Vec::new();
     for primary in primary_families {
-        for fam in icon_families(primary, &db) {
+        // Resolve style words first: icon siblings of "Foo Bold" are the ones
+        // of "Foo" ("Foo Nerd Font"), and a literal "Foo Bold Nerd Font"
+        // suffix almost never exists.
+        let resolved = resolve_font(&db, primary).family;
+        for fam in icon_families(&resolved, &db) {
             if !chain.contains(&fam) {
                 chain.push(fam);
             }
@@ -631,7 +831,7 @@ mod tests {
     fn row_height_matches_pango() {
         for (family, pt, want) in [("Cascadia Code", 9.0, 15.0), ("Terminus (TTF)", 12.0, 17.0)] {
             let (mut fs, _) = build_font_system(&[family]);
-            let lm = match line_metrics(&mut fs, family) {
+            let lm = match line_metrics(&mut fs, family, 400, DbStyle::Normal) {
                 Some(lm) => lm,
                 None => {
                     eprintln!("skipping {family}: not installed here");
@@ -643,6 +843,43 @@ mod tests {
                 want,
                 "{family} {pt}pt row height should match Pango"
             );
+        }
+    }
+
+    /// Pango style words: peeled from a spec only when the spec does not
+    /// name a real family; written back as single round-trippable words.
+    #[test]
+    fn style_suffix_parses_and_composes() {
+        assert_eq!(
+            split_style_suffix("Cascadia Code Bold Italic"),
+            Some(("Cascadia Code".to_string(), 700, DbStyle::Italic))
+        );
+        assert_eq!(
+            split_style_suffix("Mono Light"),
+            Some(("Mono".to_string(), 300, DbStyle::Normal))
+        );
+        assert_eq!(
+            split_style_suffix("Roboto BOOK"),
+            Some(("Roboto".to_string(), 400, DbStyle::Normal))
+        );
+        // No style tail: the spec is a plain family name.
+        assert_eq!(split_style_suffix("Cascadia Code"), None);
+        // Never peel the whole spec: a family really can be called "Bold".
+        assert_eq!(split_style_suffix("Bold"), None);
+        // Only the TAIL counts.
+        assert_eq!(split_style_suffix("Bold Sans"), None);
+
+        assert_eq!(style_words(400, DbStyle::Normal), "");
+        assert_eq!(style_words(700, DbStyle::Normal), "Bold");
+        assert_eq!(style_words(400, DbStyle::Italic), "Italic");
+        assert_eq!(style_words(700, DbStyle::Oblique), "Bold Italic");
+        // Words written back are words that parse again.
+        for (w, s) in [(100, DbStyle::Normal), (300, DbStyle::Italic), (700, DbStyle::Normal), (900, DbStyle::Italic)] {
+            let words = style_words(w, s);
+            let spec = format!("FontTest {words}");
+            let (base, pw, ps) = split_style_suffix(&spec).expect(&format!("round trip {words:?}"));
+            assert_eq!(base, "FontTest");
+            assert_eq!((pw, ps), (w, s), "round trip of {words:?} must recover weight/slant");
         }
     }
 
