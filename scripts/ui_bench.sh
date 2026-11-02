@@ -94,7 +94,8 @@ scenario() { # name setup-shell-code
 # first matching pattern)
 RUN=${1:-all}
 want() { [ "$RUN" = all ] || [ "$RUN" = "$1" ]; }
-want terminal     && scenario terminal     "sendkeys 'yes > /dev/null'"
+# bare `yes` -- `yes > /dev/null` writes nothing to the pty and floods nothing
+want terminal     && scenario terminal     "sendkeys 'yes'"
 want config       && scenario config       "say alt+shift+c"
 want config-idle  && scenario config-idle  "say ctrl+c"
 
