@@ -1080,14 +1080,47 @@ fn font_row(
                                 popup.style = nearest_style(&choices[i], want);
                             }
                             // ---- Size, OK, Cancel ----
+                            // Whole points only: sizes step by one and the
+                            // displayed/committed value never carries a
+                            // decimal. The number can still be typed, but
+                            // dragging is off (speed 0) -- a drag with
+                            // fractional speed was how this control used to
+                            // mint 11.5-pt fonts.
+                            popup.size_pt = popup.size_pt.round();
                             ui.horizontal(|ui| {
                                 ui.label("Size");
+                                let step = egui::Vec2::new(26.0, 20.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("\u{2212}").strong(),
+                                        )
+                                        .min_size(step),
+                                    )
+                                    .on_hover_text("one point smaller")
+                                    .clicked()
+                                {
+                                    popup.size_pt = (popup.size_pt - 1.0).max(4.0);
+                                }
                                 ui.add(
                                     egui::DragValue::new(&mut popup.size_pt)
                                         .range(4.0..=96.0)
-                                        .speed(0.5)
+                                        .speed(0.0)
+                                        .fixed_decimals(0)
                                         .suffix(" pt"),
                                 );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("+").strong(),
+                                        )
+                                        .min_size(step),
+                                    )
+                                    .on_hover_text("one point bigger")
+                                    .clicked()
+                                {
+                                    popup.size_pt = (popup.size_pt + 1.0).min(96.0);
+                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -1194,7 +1227,7 @@ fn seed_popup(
         family,
         family_idx: fam_idx.unwrap_or(usize::MAX),
         style,
-        size_pt: size,
+        size_pt: size.round(), // whole points; a hand-written 11.5 seeds 12
         list_cache: None,
     }
 }
@@ -1211,10 +1244,11 @@ fn compose_value(
 ) -> Option<String> {
     let face = face_of(choices, family, style)?;
     let words = crate::fonts::style_words(face.weight, face.slant);
+    let size = size_pt.round();
     Some(if words.is_empty() {
-        format!("{family} {size_pt}")
+        format!("{family} {size:.0}")
     } else {
-        format!("{family} {words} {size_pt}")
+        format!("{family} {words} {size:.0}")
     })
 }
 
@@ -1677,6 +1711,66 @@ mod input_regression {
             choices,
             last_popup_rect: None,
         }
+    }
+
+    #[test]
+    fn size_selector_is_whole_points_and_easy_to_step() {
+        let ctx = Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut db = glyphon::fontdb::Database::new();
+        db.load_system_fonts();
+        let choices = crate::fonts::font_choices(&db);
+        let mut st = UiState { font_popup: None };
+        let mut cfg = crate::config::Config::default();
+        let mid = choices[choices.len() / 2].name.clone();
+        // A hand-written decimal in the config must seed a whole point size.
+        st.font_popup = Some(seed_popup(FontWhich::Term, &format!("{mid} 12.5"), &choices));
+        let seeded = st.font_popup.as_ref().unwrap().size_pt;
+        assert_eq!(seeded, 13.0, "12.5 should seed the nearest whole point");
+        // A commit never writes a decimal, whatever was drafted.
+        let committed = compose_value(&choices, &mid, 0, 12.5).expect("commits");
+        assert!(committed.ends_with(" 13"), "commit carries a decimal: {committed}");
+
+        let mut open = true;
+        cfg.term_font = format!("{mid} 13");
+        let mut texts = |ctx: &Context| -> Vec<String> {
+            let mut full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1280.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    config_window(ui, &mut open, &mut cfg, &mut st, &choices);
+                },
+            );
+            full.textures_delta.clear();
+            full.shapes
+                .iter()
+                .filter_map(|cs| match cs {
+                    egui::epaint::ClippedShape { shape: egui::Shape::Text(t), .. } => {
+                        Some(t.galley.text().to_string())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let g = {
+            texts(&ctx);
+            texts(&ctx)
+        };
+        // egui renders a DragValue's number and suffix as separate galleys.
+        assert!(g.iter().any(|t| t.trim() == "13"), "no whole-point size label");
+        assert!(g.iter().any(|t| t.trim() == "pt"), "size label lost its unit");
+        assert!(
+            !g.iter().any(|t| t.trim() == "12.5" || t.trim() == "13.5"),
+            "a fractional size is on screen: {g:?}"
+        );
+        // One-click steppers flank the number.
+        assert!(g.iter().any(|t| t.trim() == "\u{2212}"), "no minus stepper");
+        assert!(g.iter().any(|t| t.trim() == "+"), "no plus stepper");
     }
 
     #[test]
