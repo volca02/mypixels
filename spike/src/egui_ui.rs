@@ -67,6 +67,9 @@ pub struct UiState {
     /// Set by `rename_box` when the user commits (Some(Some(_))) or cancels
     /// (Some(None)); the app applies and clears it after the frame.
     pub rename_out: Option<Option<String>>,
+    /// A font row toggled its popup closed on button-press; the matching
+    /// release must not count as a fresh open click (see `font_row`).
+    font_suppress: bool,
 }
 
 /// The rename box: a small frameless window with one text field. Enter
@@ -994,8 +997,23 @@ fn font_row(
     row(ui, label, |ui| {
         let shown: String = cfg_value.chars().take(30).collect();
         let r = ui.add(egui::Button::new(shown).min_size(egui::vec2(160.0, 0.0)));
-        if r.clicked() && st.font_popup.is_none() {
+        // One click does the whole job: closed opens, open (this row)
+        // closes, the *other* row's popup is swapped for this one. The
+        // toggle closes on PRESS, not on the click: a release-triggered
+        // close would run before this frame's `clicked()` and the same
+        // click would immediately re-open the popup (visible as "nothing
+        // happens"). The suppress flag swallows the matching release.
+        let same = st.font_popup.as_ref().is_some_and(|p| p.which == which);
+        let pressed = ui.input(|i| i.pointer.any_pressed());
+        if r.hovered() && pressed && same {
+            st.font_popup = None;
+            st.font_suppress = true;
+        }
+        if r.clicked() && !st.font_suppress && !same {
             st.font_popup = Some(seed_popup(which, cfg_value, choices));
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            st.font_suppress = false;
         }
         if !st.font_popup.as_ref().is_some_and(|p| p.which == which) {
             return;
