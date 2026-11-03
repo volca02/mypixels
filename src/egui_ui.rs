@@ -1214,28 +1214,62 @@ pub fn config_window(
             // Save right (the primary keeps the thumb's corner), and Save
             // is set in strong text so the pair reads as [secondary |
             // PRIMARY] rather than an apology.
+            // Standard nomenclature and standard colours, taken from the
+            // user's own palette: Cancel wears the palette's red, OK its
+            // green - so "discard" and "keep" read instantly and still
+            // belong to the theme (a Nord OK is blue-green, a dracula OK
+            // is dracula-green). Both close the panel: OK persists, Cancel
+            // discards; either way the errand is done.
             ui.separator();
             ui.add_space(2.0);
-            let gap = ui.style().spacing.item_spacing.x;
-            let half = (ui.available_width() - gap) / 2.0;
-            let row_h = 34.0;
-            let strong = ui.style().visuals.strong_text_color();
-            let revert = ui.add_sized(
-                [half, row_h],
-                egui::Button::new(egui::RichText::new("Revert").strong()),
-            );
-            ui.add_space(gap);
-            let save = ui.add_sized(
-                [half, row_h],
-                egui::Button::new(egui::RichText::new("Save").strong().color(strong)),
-            );
-            if save.clicked() {
+            let to_c32 = |rgb: crate::config::Rgb| {
+                let c = rgb.to_f32();
+                egui::Color32::from_rgb(
+                    (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                    (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                    (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                )
+            };
+            let red = to_c32(cfg.col[1]);
+            let green = to_c32(cfg.col[2]);
+            let mut ok = None;
+            let mut cancel = None;
+            ui.horizontal(|ui| {
+                // The panel auto-sizes from its content, and this footer
+                // *is* content: measuring the buttons against available_width
+                // while the panel is still measuring itself is a width
+                // feedback loop (available_width is infinite mid-measure, and
+                // the panel lands wherever egui's clamp felt like). The footer
+                // therefore speaks in the panel's own design width and takes
+                // exactly what it asked for.
+                let gap = ui.style().spacing.item_spacing.x;
+                let half = (380.0 - gap) / 2.0;
+                let row_h = 34.0;
+                let vis = ui.style().visuals.clone();
+                cancel = Some(ui.add_sized(
+                    [half, row_h],
+                    egui::Button::new(egui::RichText::new("Cancel").strong())
+                        .fill(mix_c(vis.panel_fill, red, 0.30))
+                        .stroke(egui::Stroke::new(1.0, mix_c(vis.panel_fill, red, 0.65))),
+                ));
+                ui.add_space(gap);
+                ok = Some(ui.add_sized(
+                    [half, row_h],
+                    egui::Button::new(egui::RichText::new("OK").strong())
+                        .fill(mix_c(vis.panel_fill, green, 0.34))
+                        .stroke(egui::Stroke::new(1.0, mix_c(vis.panel_fill, green, 0.7))),
+                ));
+            });
+            let (ok, cancel) = (ok.unwrap(), cancel.unwrap());
+            if ok.clicked() {
                 ev.save = true;
                 st.theme_fetched = false;
+                *open = false;
             }
-            if revert.clicked() {
+            if cancel.clicked() {
                 ev.revert = true;
                 st.theme_fetched = false;
+                *open = false;
             }
         });
     if !*open {
