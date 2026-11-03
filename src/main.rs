@@ -435,11 +435,12 @@ struct App {
     /// last few minutes, not a session manager; that is a different,
     /// harder promise, and half-measures should not pretend at it.
     closed_ring: std::collections::VecDeque<(String, Option<std::path::PathBuf>)>,
-    /// URLs found in the visible grid of the window being drawn, rebuilt
-    /// every frame (a grid scan the size of the screen is nothing; the
-    /// alternative - tracking damage and re-scanning rows - is a worse
-    /// cache with more ways to lie).
+    /// URLs on the row under the pointer (only that row can underline or
+    /// be clicked); reparsed only when the row's content hash moves.
     url_spans: Vec<UrlSpan>,
+    /// (row, content hash, spans) of the last row scanned, for the reuse
+    /// fast path in `scan_row_cached`.
+    url_cache: Option<(usize, u64, Vec<UrlSpan>)>,
     /// Index into url_spans under the pointer, for the underline.
     url_hover: Option<usize>,
     /// Where the cursor block was painted last frame, physical px, with its
@@ -699,6 +700,7 @@ impl App {
             cursor_pt: None,
             closed_ring: std::collections::VecDeque::new(),
             url_spans: Vec::new(),
+            url_cache: None,
             url_hover: None,
             _session,
             modifiers: ModifiersState::empty(),
@@ -1728,7 +1730,13 @@ impl App {
         // URLs: rescan the visible grid and locate the pointer on them.
         // Done before the window split-borrow below, which is where the
         // underline's rect actually gets pushed.
-        self.url_spans = self.scan_urls();
+        self.url_spans = match self.visual_cell(
+            self.wins[self.cur].pointer.0,
+            self.wins[self.cur].pointer.1,
+        ) {
+            Some((row, _)) => self.scan_row_cached(row),
+            None => Vec::new(),
+        };
         self.url_hover = {
             let (px, py) = self.wins[self.cur].pointer;
             self.visual_cell(px, py).and_then(|(row, col)| {
@@ -2586,69 +2594,109 @@ impl App {
         Some((row as usize, col))
     }
 
-    fn url_at(&self, px: f32, py: f32) -> Option<&str> {
+    /// The URL under a pointer position, rescanning that row through the
+    /// hash cache. Clicks use this rather than `url_spans` because the
+    /// pointer can move without a frame being drawn between; the click must
+    /// answer about the word it physically landed on.
+    fn url_at(&mut self, px: f32, py: f32) -> Option<String> {
         let (row, col) = self.visual_cell(px, py)?;
-        self.url_spans
-            .iter()
+        let spans = self.scan_row_cached(row);
+        spans
+            .into_iter()
             .find(|s| s.row == row && col >= s.start && col < s.end)
-            .map(|s| s.url.as_str())
+            .map(|s| s.url)
     }
 
-    /// Scan the visible grid for http(s) URLs. This is deliberately dumb:
-    /// terminals print URLs inside quotes, brackets, angle brackets and
-    /// ansi noise, so the rule is "start at the scheme, stop at whitespace
-    /// or control", then trim punctuation that a sentence would end with.
-    /// It will never be a proper URI parser; it is a finger for the
-    /// keyboard, and dumb rules you can read beat parsers you cannot trust.
-    fn scan_urls(&self) -> Vec<UrlSpan> {
-        let mut spans = Vec::new();
+    /// Find the URLs on ONE visual row of the grid.
+    ///
+    /// Laziness is the whole design: an underline or a click can only ever
+    /// concern the row the pointer is on, so only that row is ever scanned -
+    /// one row of <= a few hundred cells, with an early exit from the cell
+    /// iterator, no allocation per character, and a content hash so an
+    /// unchanged row reuses its spans without re-parsing at all. The former
+    /// version scanned every visible row into fresh Strings on every frame;
+    /// that showed up as O(row_len^2) per row (a `String` of every suffix
+    /// was built while hunting the scheme) multiplied by the whole screen
+    /// multiplied by every mouse-move-triggered redraw - needlessly rude to
+    /// the terminal lock the PTY reader also wants.
+    fn scan_row_cached(&mut self, row: usize) -> Vec<UrlSpan> {
+        let (hash, text) = self.row_text(row);
+        if let Some((r, h, spans)) = &self.url_cache {
+            if *r == row && *h == hash {
+                return spans.clone(); // tiny: a row holds at most a handful of URLs
+            }
+        }
+        let spans = url_spans_in_row(&text, row);
+        self.url_cache = Some((row, hash, spans.clone()));
+        spans
+    }
+
+    /// The row's visible text plus an FNV-1a hash of it, taken under one
+    /// terminal lock. The hash is the cache key; the text is usually
+    /// thrown away unexamined because the row has not moved.
+    fn row_text(&self, row: usize) -> (u64, Vec<char>) {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
-            return spans;
+            return (hash, Vec::new());
         };
         let term = tab.term.lock();
         let content = term.renderable_content();
-        let rows = self.wins[self.cur].rows;
-        let mut cur_row: Option<usize> = None;
-        let mut line = String::new();
-        let mut flush = |line: &mut String, row: usize, spans: &mut Vec<UrlSpan>| {
-            if line.len() < 8 {
-                return;
-            }
-            for (start, url) in url_spans_in_line(line) {
-                let end = start + url.chars().count();
-                spans.push(UrlSpan { row, start, end, url });
-            }
-            line.clear();
-        };
+        let mut chars: Vec<char> = Vec::new();
         for cell in content.display_iter {
-            let row = cell.point.line.0 + content.display_offset as i32;
-            if row < 0 {
+            let crow = cell.point.line.0 + content.display_offset as i32;
+            if crow < 0 {
                 continue;
             }
-            let row = row as usize;
-            if row >= rows {
-                break;
+            if (crow as usize) < row {
+                continue;
             }
-            if cur_row != Some(row) {
-                if let Some(r) = cur_row {
-                    flush(&mut line, r, &mut spans);
-                }
-                cur_row = Some(row);
-                line.clear();
+            if (crow as usize) > row {
+                break; // display_iter walks row by row
             }
             let col = cell.point.column.0;
-            if col > line.chars().count() {
-                // A gap (should not happen with display_iter) - do not
-                // glue unrelated words together.
-                line.extend(std::iter::repeat(' ').take(col - line.chars().count()));
+            while chars.len() < col {
+                chars.push(' ');
+                hash = (hash ^ b' ' as u64).wrapping_mul(0x100_0000_01b3);
             }
-            let ch: char = cell.c;
-            line.push(if ch.is_whitespace() || (ch as u32) < 0x20 { ' ' } else { ch });
+            let raw = cell.c;
+            let ch = if raw.is_whitespace() || (raw as u32) < 0x20 { ' ' } else { raw };
+            if col == chars.len() {
+                chars.push(ch);
+            }
+            hash = (hash ^ ch as u64).wrapping_mul(0x100_0000_01b3);
         }
-        if let Some(r) = cur_row {
-            flush(&mut line, r, &mut spans);
+        (hash, chars)
+    }
+
+    #[allow(dead_code)]
+    fn scan_row(&self, row: usize) -> Vec<UrlSpan> {
+        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
+            return Vec::new();
+        };
+        let term = tab.term.lock();
+        let content = term.renderable_content();
+        let mut chars: Vec<char> = Vec::new();
+        for cell in content.display_iter {
+            let crow = cell.point.line.0 + content.display_offset as i32;
+            if crow < 0 {
+                continue;
+            }
+            if (crow as usize) < row {
+                continue;
+            }
+            if (crow as usize) > row {
+                break; // display_iter walks row by row
+            }
+            let col = cell.point.column.0;
+            if col > chars.len() {
+                chars.extend(std::iter::repeat(' ').take(col - chars.len()));
+            }
+            let ch = cell.c;
+            if col == chars.len() {
+                chars.push(if ch.is_whitespace() || (ch as u32) < 0x20 { ' ' } else { ch });
+            }
         }
-        spans
+        url_spans_in_row(&chars, row)
     }
 
     fn open_url(url: &str) {
@@ -3668,6 +3716,7 @@ fn app_icon() -> Option<winit::window::Icon> {
 
 /// Where `active` lands when tabs `a` and `b` trade places.
 /// One URL found on one VISUAL row of the grid, in cell columns.
+#[derive(Clone)]
 struct UrlSpan {
     row: usize,
     start: usize,
@@ -3675,53 +3724,69 @@ struct UrlSpan {
     url: String,
 }
 
-/// URL spans within one row's text, as (column, str). See `App::scan_urls`
-/// for the philosophy; the trailing trim is where all the craft is: a URL
-/// ending in `.` or `)` is nearly always a URL followed by prose.
-fn url_spans_in_line(line: &str) -> Vec<(usize, String)> {
+/// URL spans within one row of cells. Deliberately dumb: terminals print
+/// URLs inside quotes, brackets and prose, so the rule is "start at the
+/// scheme, stop at whitespace", then peel trailing punctuation one
+/// character at a time - a ')' is prose only while it outranks its
+/// openings, a '.' belongs to the URL until it ends a sentence.
+///
+/// Cost shape matters as much as the rules: the scheme test compares
+/// characters in place (no per-suffix Strings - that made this O(n^2) in
+/// the row length), and exactly one small String is allocated per URL
+/// found, not per character examined.
+fn url_spans_in_row(chars: &[char], row: usize) -> Vec<UrlSpan> {
+    fn starts(chars: &[char], i: usize, pat: &str) -> bool {
+        if i + pat.chars().count() > chars.len() {
+            return false;
+        }
+        chars[i..].iter().zip(pat.chars()).all(|(c, p)| *c == p)
+    }
     let mut out = Vec::new();
-    let chars: Vec<char> = line.chars().collect();
     let mut i = 0usize;
     while i < chars.len() {
-        let rest: String = chars[i..].iter().collect();
-        if !(rest.starts_with("https://") || rest.starts_with("http://")) {
+        if chars[i] != 'h' || !(starts(chars, i, "https://") || starts(chars, i, "http://")) {
             i += 1;
             continue;
         }
         let mut j = i;
+        let mut opens = 0usize;
+        let mut closes = 0usize;
         while j < chars.len() && chars[j] != ' ' && !chars[j].is_control() {
+            match chars[j] {
+                '(' => opens += 1,
+                ')' => closes += 1,
+                _ => {}
+            }
             j += 1;
         }
-        let word: String = chars[i..j].iter().collect();
-        // Strip trailing prose one character at a time, because the two
-        // rules interact: a ')' is prose only while it outranks the
-        // openings, and a '.' belongs to the URL while it is inside the
-        // host/path and is prose the moment it ends a sentence. A loop
-        // with a balance counter reads worse than two trims and is the
-        // only version that is right.
-        let mut trimmed = word.as_str();
-        loop {
-            let Some(last) = trimmed.chars().last() else { break };
+        // Peel prose from the end, index-based: balance-aware for ')'.
+        let mut e = j;
+        while e > i {
+            let last = chars[e - 1];
             let prose = match last {
-                ')' => trimmed.matches(')').count() > trimmed.matches('(').count(),
+                ')' => closes > opens,
                 '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | ']' | '}' | '>' => true,
                 _ => break,
             };
             if !prose {
                 break;
             }
-            trimmed = &trimmed[..trimmed.len() - last.len_utf8()];
+            e -= 1;
+            if last == ')' {
+                closes -= 1;
+            }
         }
-        // A host needs a dot somewhere after the scheme to be a URL
-        // rather than `https://localhost` or a dangling `https://`.
-        let host = trimmed.trim_start_matches("https://").trim_start_matches("http://");
-        if trimmed.len() >= 9 && host.contains('.') {
-            out.push((i, trimmed.to_string()));
+        let host_starts = i + if starts(chars, i, "https://") { 8 } else { 7 };
+        let has_dot = chars[host_starts..e].iter().any(|c| *c == '.');
+        let word: String = chars[i..e].iter().collect();
+        if word.len() >= 9 && has_dot {
+            out.push(UrlSpan { row, start: i, end: e, url: word });
         }
-        i = j;
+        i = j.max(i + 1);
     }
     out
 }
+
 /// What a dying tab leaves behind for the reopen ring.
 fn tab_death(tab: &Tab) -> (String, Option<std::path::PathBuf>) {
     (tab.title.lock().unwrap().clone(), tab.cwd_raw())
@@ -4352,7 +4417,7 @@ impl ApplicationHandler for App {
                         // clipboard, so a "copy the link" click that also
                         // word-selected would have its own copy overwritten
                         // by the word's text one moment later.
-                        let url = self.url_at(at.0, at.1).unwrap().to_string();
+                        let url = self.url_at(at.0, at.1).unwrap();
                         if self.modifiers.control_key() {
                             Self::open_url(&url);
                         } else if let Some(cb) = self.clipboard.as_ref() {
@@ -5094,37 +5159,55 @@ mod tests {
 
 #[cfg(test)]
 mod url_tests {
-    use super::url_spans_in_line;
+    use super::url_spans_in_row;
+
+    fn spans(line: &str) -> Vec<(usize, String)> {
+        let chars: Vec<char> = line.chars().collect();
+        url_spans_in_row(&chars, 0)
+            .into_iter()
+            .map(|s| (s.start, s.url))
+            .collect()
+    }
 
     #[test]
     fn finds_links_and_drops_prose_punctuation() {
         let line = "see https://example.com/a?b=c. Also http://x.org, ok";
-        let got = url_spans_in_line(line);
+        let got = spans(line);
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0].1, "https://example.com/a?b=c");
         assert_eq!(got[1].1, "http://x.org");
-        // The column must be the cell the URL starts in.
+        assert_eq!(got[0].1, "https://example.com/a?b=c");
         assert_eq!(got[0].0, 4);
     }
 
     #[test]
-    fn keeps_balanced_parens_and_markdown_wrappers() {
+    fn keeps_balanced_parens_and_peels_extra_ones() {
         let line = "https://en.wikipedia.org/wiki/Rust_(language)";
-        let got = url_spans_in_line(line);
-        assert_eq!(got[0].1, line);
-        let line = "trailing close paren: https://a.io/x)";
-        let got = url_spans_in_line(line);
-        assert_eq!(got[0].1, "https://a.io/x");
+        assert_eq!(spans(line)[0].1, line);
+        assert_eq!(spans("trailing close: https://a.io/x)")[0].1, "https://a.io/x");
     }
 
     #[test]
     fn ignores_schemeish_noise() {
-        // No dot in the host: not a URL (localhost is a different feature).
-        assert!(url_spans_in_line("go to https://here now").is_empty());
-        // A bare scheme is noise.
-        assert!(url_spans_in_line("the http:// scheme").is_empty());
-        assert_eq!(url_spans_in_line("ftp://not.http").len(), 0); // http(s) only
-        // Dot in host, real shape: even short is fine - who am I to judge.
-        assert_eq!(url_spans_in_line("http://a.io").len(), 1);
+        assert!(spans("go to https://here now").is_empty()); // host needs a dot
+        assert!(spans("the http:// scheme").is_empty());
+        assert!(spans("ftp://not.http").is_empty()); // http(s) only
+        assert_eq!(spans("http://a.io").len(), 1);
+    }
+
+    /// The frame-budget guard. One row per redraw is the design; at 200
+    /// columns it must cost microseconds, because a mouse move redraws and
+    /// the terminal lock is not free. (Threshold is debug-build generous.)
+    #[test]
+    fn row_scan_is_fast() {
+        let line = "curl -sS https://example.com/some/path?query=1&x=2 | jq .  ".repeat(4);
+        let chars: Vec<char> = line.chars().collect();
+        let n = 20_000;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(url_spans_in_row(&chars, 0));
+        }
+        let per = t.elapsed() / n;
+        eprintln!("{:?} per {}-char row", per, chars.len());
+        assert!(per.as_micros() < 3000, "row scan too slow for a redraw path");
     }
 }
