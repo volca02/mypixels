@@ -425,14 +425,10 @@ struct App {
     /// so the eye can keep the pointer's agent when it slides across the
     /// grid (mouse-reporting apps, search jumps, wide terminals).
     ripple: Option<Ripple>,
-    /// Cell the cursor was on in the last drawn frame, for move detection.
-    last_cursor: Option<(u32, u32)>,
-    /// Last keypress that carried a real modifier (ctrl/alt/super). The
-    /// ripple listens only to these: ordinary typing moves the cursor
-    /// several times a second and pulsing at every letter turns a pointer
-    /// into a strobe. Modifier chords - word jumps, meta-f, search hops -
-    /// are precisely the moves the eye wants help catching.
-    last_mod_key: Option<Instant>,
+    /// Where the cursor block was painted last frame, physical px, with its
+    /// resolved colour. Key events need it without going through the frame
+    /// builder: the ripple rings AT the cursor when a modifier is pressed.
+    cursor_pt: Option<([f32; 2], [f32; 3])>,
     pending_move: Option<usize>,
     /// A context-menu choice, run by the drain (which has the event loop).
     pending_action: Option<String>,
@@ -680,8 +676,7 @@ impl App {
             pending_move: None,
             pending_action: None,
             ripple: None,
-            last_cursor: None,
-            last_mod_key: None,
+            cursor_pt: None,
             _session,
             modifiers: ModifiersState::empty(),
             program,
@@ -1909,21 +1904,15 @@ impl App {
                     [frame.cursor_color[0], frame.cursor_color[1], frame.cursor_color[2], 0.55],
                 );
             }
-            // Re-arm the pulse only on a real cell-to-cell move; appearing
-            // or vanishing (focus lost, app hid it) is not movement.
-            let cell = (cx, cy);
-            let modded = self.last_mod_key.is_some_and(|t| t.elapsed().as_millis() < 300);
-            if modded && self.last_cursor.is_some_and(|p| p != cell) {
-                self.ripple = Some(Ripple {
-                    x: cx as f32 * self.cell_w + self.cell_w * 0.5,
-                    y: strip_h + cy as f32 * self.cell_h + self.cell_h * 0.5,
-                    at: Instant::now(),
-                    color: frame.cursor_color,
-                });
-            }
-            self.last_cursor = Some(cell);
+            self.cursor_pt = Some((
+                [
+                    cx as f32 * self.cell_w + self.cell_w * 0.5,
+                    strip_h + cy as f32 * self.cell_h + self.cell_h * 0.5,
+                ],
+                frame.cursor_color,
+            ));
         } else {
-            self.last_cursor = None;
+            self.cursor_pt = None;
         }
 
         // --- Terminal text ---
@@ -2606,18 +2595,6 @@ impl App {
             .get(self.wins[self.cur].active)
             .is_some_and(|t| t.term.lock().mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR));
         if let Some(bytes) = key_bytes(key, self.modifiers, app_cursor) {
-            // Chord detector for the cursor ripple: a key that CARRIES a
-            // modifier (ctrl+arrow, meta-f...) - not a bare modifier key
-            // being pressed, which arrives here too as Named(Control) and
-            // must not arm anything (it encodes to no bytes, so key_bytes
-            // has already said no by this point).
-            if self.modifiers.intersects(
-                winit::keyboard::ModifiersState::CONTROL
-                    | winit::keyboard::ModifiersState::ALT
-                    | winit::keyboard::ModifiersState::SUPER,
-            ) {
-                self.last_mod_key = Some(Instant::now());
-            }
             // Typing counts as activity: keep the cursor solid (no blink)
             // right after a keypress.
             *self.last_activity.lock().unwrap() = std::time::Instant::now();
@@ -4240,6 +4217,29 @@ impl ApplicationHandler for App {
                 log::info!("mods changed -> {new:?}");
                 let alt_up = new.alt_key() && !self.modifiers.alt_key();
                 let alt_down = !new.alt_key() && self.modifiers.alt_key();
+                // The ripple: a modifier - any modifier - being pressed
+                // *bare* pulses the cursor. It answers "is my keyboard
+                // landing HERE" at the only place that question is ever
+                // asked: while typing, modifier state is invisible, and a
+                // stuck or missed Ctrl is discovered late. A chord does not
+                // ring (its keystroke already says where the cursor went);
+                // typing does not ring at all.
+                use winit::keyboard::ModifiersState as Ms;
+                let old = self.modifiers;
+                let fresh = (new.contains(Ms::CONTROL) && !old.contains(Ms::CONTROL))
+                    || (new.contains(Ms::SHIFT) && !old.contains(Ms::SHIFT))
+                    || (new.contains(Ms::ALT) && !old.contains(Ms::ALT))
+                    || (new.contains(Ms::SUPER) && !old.contains(Ms::SUPER));
+                // Adding a second modifier onto a held one is building a
+                // chord, not asking "is my keyboard here" - no ring.
+                let chorded = new.intersects(Ms::CONTROL | Ms::ALT | Ms::SUPER)
+                    && old.intersects(Ms::CONTROL | Ms::ALT | Ms::SUPER);
+                if fresh && !chorded {
+                    if let Some(([x, y], color)) = self.cursor_pt {
+                        self.ripple = Some(Ripple { x, y, at: Instant::now(), color });
+                        window.request_redraw();
+                    }
+                }
                 self.modifiers = new;
                 if alt_up {
                     // Alt pressed: start the switcher hold timer. Not while
