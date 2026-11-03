@@ -69,10 +69,10 @@ impl EventListener for SpikeListener {
 }
 
 /// Static-ish per-tab pty options.
-fn pty_options(program: String, args: Vec<String>) -> Options {
+fn pty_options(program: String, args: Vec<String>, cwd: Option<std::path::PathBuf>) -> Options {
     Options {
         shell: Some(Shell::new(program, args)),
-        working_directory: None,
+        working_directory: cwd,
         drain_on_exit: false,
         env: HashMap::new(),
     }
@@ -110,6 +110,7 @@ impl Tab {
         args: Vec<String>,
         shared: &SpikeListener,
         history: usize,
+        cwd: Option<std::path::PathBuf>,
     ) -> Tab {
         let listener = SpikeListener {
             window: Arc::clone(&shared.window),
@@ -130,7 +131,7 @@ impl Tab {
         )));
 
         tty::setup_env();
-        let pty = tty::new(&pty_options(program, args), window_size, tab_id as u64)
+        let pty = tty::new(&pty_options(program, args, cwd), window_size, tab_id as u64)
             .expect("failed to open pty");
 
         let title = Arc::clone(&listener.title);

@@ -25,6 +25,8 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 egui-winit = "0.37"
+zbus = "5"
+futures = "0.3.34"
 
 [profile.release]
 # Terminal emulator: throughput matters, and the default release profile leaves

@@ -10,6 +10,7 @@ mod egui_ui;
 mod fonts;
 mod gpu;
 mod tab;
+mod session;
 mod theme;
 
 use std::cell::RefCell;
@@ -394,6 +395,11 @@ struct App {
     /// `hover_tab`). Releasing anywhere ends the drag; the tabs stay where
     /// they were dropped, like dragging a browser tab past its neighbour.
     tab_drag: Option<usize>,
+    /// Daemon: tab/rise requests forwarded by other mypixels processes.
+    session_rx: std::sync::mpsc::Receiver<session::Request>,
+    /// Keeps the session-bus thread -- and with it the bus name -- alive for
+    /// as long as the app runs.
+    _session: Option<session::Server>,
     /// The tab drag crossed into another cell, so the press has become a
     /// reorder and the release must not also count as a click.
     tab_drag_moved: bool,
@@ -502,15 +508,33 @@ impl App {
         let fg = config.foreground_color.to_f32();
         let bg = crate::config::terminal_bg(&config).to_f32();
 
-        let args: Vec<String> = std::env::args().collect();
-        let (program, args) = if args.len() > 1 {
-            (args[1].clone(), args[2..].to_vec())
-        } else {
-            (std::env::var("SHELL").unwrap_or_else(|_| "bash".into()), vec![])
-        };
+        let (program, args) = term_command();
 
         let window_slot = Arc::new(Mutex::new(None));
         let key_rx = spawn_key_reader(Arc::clone(&window_slot));
+        // Daemon mode: claim this display's session name unless asked for a
+        // private instance. Another `mypixels` run will find us here and open
+        // its tab in *this* window instead of growing another frame; its
+        // request arrives on this channel (see the RedrawRequested drain).
+        let standalone = std::env::args()
+            .skip(1)
+            .take_while(|a| a.starts_with('-'))
+            .any(|a| a == "--standalone" || a == "-s");
+        let (session_tx, session_rx) = std::sync::mpsc::channel();
+        let _session = if standalone {
+            None
+        } else {
+            session::bus_name().and_then(|name| {
+                let slot = Arc::clone(&window_slot);
+                session::start(&name, session_tx, move || {
+                    if let Ok(slot) = slot.lock() {
+                        if let Some(w) = slot.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                })
+            })
+        };
         let shared = SpikeListener {
             window: Arc::clone(&window_slot),
             tab_id: 0,
@@ -642,6 +666,8 @@ impl App {
             last_activity,
             bell,
             tab_drag: None,
+            session_rx,
+            _session,
             tab_drag_moved: false,
             autoscroll_next: None,
             fifo_egui_events: Vec::new(),
@@ -684,6 +710,17 @@ impl App {
     }
 
     fn add_tab(&mut self) {
+        self.add_tab_with(None, None);
+    }
+
+    /// Open a tab, optionally overriding where it starts (`cwd`) and what it
+    /// runs. The daemon's OpenTab uses both: a tab beside the shell that ran
+    /// `mypixels`, in that shell's directory, doing what it asked.
+    fn add_tab_with(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        cmd: Option<(String, Vec<String>)>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         let window_size = WindowSize {
@@ -692,17 +729,63 @@ impl App {
             cell_width: self.cell_w as u16,
             cell_height: self.cell_h as u16,
         };
+        let (program, args) = match cmd {
+            Some(c) => c,
+            None => (self.program.clone(), self.args.clone()),
+        };
         let tab = Tab::new(
             id,
             &self.dims,
             window_size,
-            self.program.clone(),
-            self.args.clone(),
+            program,
+            args,
             &self.listener(),
             self.config.scrollback_lines,
+            cwd,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+    }
+
+    /// Handle what other mypixels processes asked of this session.
+    fn drain_session_requests(&mut self) {
+        let mut opened = false;
+        while let Ok(req) = self.session_rx.try_recv() {
+            match req {
+                session::Request::OpenTab { cwd, argv } => {
+                    // Trust but verify the directory: the caller may have
+                    // raced its own rmdir; a vanished cwd means "who cares",
+                    // not "fail".
+                    let cwd = cwd.map(std::path::PathBuf::from).filter(|p| p.is_dir());
+                    let cmd = if argv.is_empty() {
+                        None
+                    } else {
+                        Some((argv[0].clone(), argv[1..].to_vec()))
+                    };
+                    // The remote could name a program that does not exist,
+                    // and spawning one would take the whole session down
+                    // with the panic. Refusing the request is the polite
+                    // half of the deal; the log line is the other.
+                    if let Some((program, _)) = cmd.as_ref() {
+                        if !command_exists(program) {
+                            log::warn!("session: refusing unknown command {program:?}");
+                            continue;
+                        }
+                    }
+                    self.add_tab_with(cwd, cmd);
+                    opened = true;
+                }
+                session::Request::Raise => opened = true,
+            }
+        }
+        if opened {
+            if let Some(w) = &self.window {
+                // The compositor owns focus; an attention request is how a
+                // polite app says "over here" without stealing the keyboard.
+                w.request_user_attention(Some(winit::window::UserAttentionType::Critical));
+            }
+            log::info!("session: opened a remote tab (tabs={})", self.tabs.len());
+        }
     }
 
     fn listener(&self) -> SpikeListener {
@@ -2593,6 +2676,43 @@ fn preview_rects(
     v
 }
 
+/// The command line's leading flags and its command, cleanly separated.
+/// Flags are only flags *before* the first positional argument: `mypixels -s
+/// sh -c "sleep 1"` hands `-s` to us and `-c "sleep 1"` to the shell.
+fn leading_flags() -> Vec<String> {
+    std::env::args().skip(1).take_while(|a| a.starts_with('-')).collect()
+}
+
+fn positional_terms() -> Vec<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().position(|a| !a.starts_with('-')) {
+        Some(i) => args[i..].to_vec(),
+        None => vec![],
+    }
+}
+
+/// A PATH lookup, because a remote request is not trusted to name a real
+/// program and pty spawn failures are fatal in this codebase.
+fn command_exists(program: &str) -> bool {
+    if program.contains('/') {
+        return std::path::Path::new(program).exists();
+    }
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .any(|dir| dir.join(program).is_file())
+    })
+}
+
+/// The program every new tab runs when nothing else was asked for.
+fn term_command() -> (String, Vec<String>) {
+    let terms = positional_terms();
+    if terms.is_empty() {
+        (std::env::var("SHELL").unwrap_or_else(|_| "bash".into()), vec![])
+    } else {
+        (terms[0].clone(), terms[1..].to_vec())
+    }
+}
+
 /// Parse a test key spec like "alt+shift+t", "ctrl+c", "esc", "f5".
 /// Test hook: read key specs from the $SPIKE_KEYS FIFO in a background
 /// thread and forward them over a channel. Returns None when unset.
@@ -3043,6 +3163,7 @@ impl ApplicationHandler for App {
                 self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_test_keys(event_loop);
+                self.drain_session_requests();
                 // Open the Alt-held switcher if the clock asked and Alt is
                 // still held (guards against the press/release race).
                 if self.switcher_show_req.swap(false, Ordering::SeqCst)
@@ -3354,6 +3475,11 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             },
             WindowEvent::Focused(focused) => {
+                if focused {
+                    // The user answered an attention request by focusing us;
+                    // stop asking.
+                    window.request_user_attention(None);
+                }
                 if let Some(tab) = self.tabs.get(self.active) {
                     tab.term.lock().is_focused = focused;
                 }
@@ -3490,6 +3616,30 @@ fn alpha_probe(event_loop: &EventLoop<()>) {
 
 fn main() {
     env_logger::init();
+    let flags = leading_flags();
+    if flags.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "usage: mypixels [options] [command args...]\n\n\
+Options:\n  \
+  -s, --standalone   run a private instance: never join or host a session\n  \
+  -h, --help         show this text\n\n\
+Without --standalone, a mypixels already running on this display is found\n\
+over D-Bus and asked to open a tab for this command, in this directory.\n\
+With none, this process becomes that session."
+        );
+        return;
+    }
+    // Daemon mode, client half: if this display already hosts a mypixels
+    // session, hand it the command (in this working directory) and exit.
+    // Anything the bus cannot answer -- no bus, no session, a session too
+    // old to speak this protocol -- means "run locally", never "lose the
+    // command".
+    if !flags.iter().any(|a| a == "--standalone" || a == "-s") {
+        let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+        if session::remote_open(cwd, positional_terms()) {
+            return;
+        }
+    }
     let event_loop = EventLoop::new().expect("event loop");
     if std::env::args().any(|a| a == "--alpha-probe") {
         alpha_probe(&event_loop);
