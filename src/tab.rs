@@ -34,6 +34,10 @@ pub struct SpikeListener {
     /// (tab_id, time) of every BEL, for the app to turn into "a window you
     /// are not looking at has news": attention + tab-strip pulse.
     pub bells: Arc<Mutex<Vec<(usize, std::time::Instant)>>>,
+    /// Complete APC strings as dispatched: (tab_id, bytes, abs line, col).
+    /// The Kitty graphics protocol arrives this way; interpretation is the
+    /// application's `kitty::TabKitty` state machine's job.
+    pub apcs: Arc<Mutex<Vec<(usize, Vec<u8>, usize, usize)>>>,
     /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line).
     /// Order per tab is the stream's own; the app folds them into command
     /// blocks (see `App::drain_sems`).
@@ -59,6 +63,9 @@ impl EventListener for SpikeListener {
                 *self.title.lock().unwrap() = t;
                 *self.last_activity.lock().unwrap() = std::time::Instant::now();
                 self.notify_window();
+            },
+            Event::Apc { payload, line, col } => {
+                self.apcs.lock().unwrap().push((self.tab_id, payload, line, col));
             },
             Event::Semantic { code, exit, line, .. } => {
                 log::debug!("sem mark tab {} code {} exit {:?} line {}", self.tab_id, code, exit, line);
@@ -147,6 +154,7 @@ impl Tab {
             bell: Arc::clone(&shared.bell),
             bells: Arc::clone(&shared.bells),
             sems: Arc::clone(&shared.sems),
+            apcs: Arc::clone(&shared.apcs),
         };
 
         let term = Arc::new(FairMutex::new(Term::new(

@@ -9,6 +9,7 @@ mod config;
 mod egui_ui;
 mod fonts;
 mod gpu;
+mod kitty;
 mod tab;
 mod session;
 mod theme;
@@ -421,6 +422,11 @@ struct App {
     bell_pings: Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
     /// OSC 133 marks as dispatched, drained into per-tab command blocks
     sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize)>>>,
+    /// Complete APC strings awaiting graphics interpretation.
+    apcs_ring: Arc<std::sync::Mutex<Vec<(usize, Vec<u8>, usize, usize)>>>,
+    /// Per-tab Kitty graphics state, keyed by stable tab id; created on
+    /// first use, removed when the tab dies.
+    kitty: std::collections::HashMap<usize, kitty::TabKitty>,
     /// Per-tab command blocks, oldest first. Owned by the app, keyed by
     /// the stable tab id, so a tab that moves between windows keeps its
     /// history and a tab that dies simply leaves no trace.
@@ -596,9 +602,11 @@ impl App {
             bell: Arc::new(Mutex::new(None)),
             bells: Arc::new(Mutex::new(Vec::new())),
             sems: Arc::new(Mutex::new(Vec::new())),
+            apcs: Arc::new(Mutex::new(Vec::new())),
         };
         let bells = Arc::clone(&shared.bells);
         let sems = Arc::clone(&shared.sems);
+        let apcs = Arc::clone(&shared.apcs);
         let exited = Arc::clone(&shared.exited);
         let last_activity = Arc::clone(&shared.last_activity);
         let bell = Arc::clone(&shared.bell);
@@ -702,6 +710,8 @@ impl App {
             bell,
             bell_pings: bells,
             sems_ring: sems,
+            apcs_ring: apcs,
+            kitty: Default::default(),
             sem_blocks: Default::default(),
             session_rx,
             pending_move: None,
@@ -965,6 +975,7 @@ impl App {
             bell: Arc::clone(&self.bell),
             bells: Arc::clone(&self.bell_pings),
             sems: Arc::clone(&self.sems_ring),
+            apcs: Arc::clone(&self.apcs_ring),
         }
     }
 
@@ -984,6 +995,7 @@ impl App {
         }
         let dying_id = self.wins[self.cur].tabs[idx].id;
         self.sem_blocks.remove(&dying_id);
+        self.kitty.remove(&dying_id);
         self.remember_closed(tab_death(&self.wins[self.cur].tabs[idx]));
         // Stable ids: find the id of the tab being removed
         self.wins[self.cur].tabs.remove(idx);
@@ -2894,6 +2906,21 @@ impl App {
         }
     }
 
+    /// Hand complete APC strings to the per-tab Kitty state machine.
+    /// Decoding happens here, once, on the main thread: bounded, unit
+    /// tested, and never under the terminal lock.
+    fn drain_apcs(&mut self) {
+        let evs: Vec<(usize, Vec<u8>, usize, usize)> =
+            std::mem::take(&mut *self.apcs_ring.lock().unwrap());
+        for (tab_id, payload, line, col) in evs {
+            let live = self.wins.iter().any(|w| w.tabs.iter().any(|t| t.id == tab_id));
+            if !live {
+                continue;
+            }
+            self.kitty.entry(tab_id).or_default().on_apc(&payload, line, col);
+        }
+    }
+
     fn drain_clipboard(&mut self) {
         let events: Vec<_> = self.clipboard.as_ref().map(|c| c.events().collect()).unwrap_or_default();
         for event in events {
@@ -4265,6 +4292,7 @@ impl ApplicationHandler for App {
         self.drain_clipboard();
         self.drain_bell_pings();
         self.drain_sems();
+        self.drain_apcs();
         self.drain_test_keys(event_loop);
     }
 
@@ -4335,6 +4363,7 @@ impl ApplicationHandler for App {
                 self.drain_clipboard();
                 self.drain_bell_pings();
                 self.drain_sems();
+                self.drain_apcs();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
                 if let Some(action) = self.pending_action.take() {

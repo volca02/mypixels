@@ -498,6 +498,12 @@ pub trait Handler {
     /// upstream dispatch table (133 semantic prompts today).
     #[inline]
     fn osc_raw(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// A complete APC (or SOS/PM) string, before any consumer-specific
+    /// interpretation. mypixels patch - the Kitty graphics protocol lives
+    /// in APC (`ESC _ G ... ESC \`) and nothing upstream reads it.
+    #[inline]
+    fn apc_raw(&mut self, _bytes: &[u8]) {}
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
 
@@ -1532,6 +1538,11 @@ where
     #[inline]
     fn osc_raw(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.handler.osc_raw(params, bell_terminated);
+    }
+
+    #[inline]
+    fn apc_raw(&mut self, bytes: &[u8]) {
+        self.handler.apc_raw(bytes);
     }
 
     #[allow(clippy::cognitive_complexity)]

@@ -26,6 +26,7 @@ egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 egui-winit = "0.37"
 png = "0.17"
+base64 = "0.22"
 zbus = "5"
 futures = "0.3.34"
 

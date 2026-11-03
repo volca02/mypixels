@@ -70,6 +70,16 @@ pub enum Event {
         line: usize,
         col: usize,
     },
+
+    /// One complete APC string (mypixels patch; the Kitty graphics
+    /// protocol). Carries the cursor as an ABSOLUTE line + column at the
+    /// instant the sequence ended - the placement anchor, which must be
+    /// taken here and never reconstructed later.
+    Apc {
+        payload: Vec<u8>,
+        line: usize,
+        col: usize,
+    },
 }
 
 impl Debug for Event {
@@ -87,6 +97,7 @@ impl Debug for Event {
             Event::Wakeup => write!(f, "Wakeup"),
             Event::Bell => write!(f, "Bell"),
             Event::Semantic { .. } => write!(f, "Semantic"),
+            Event::Apc { payload, .. } => write!(f, "Apc({} bytes)", payload.len()),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
         }

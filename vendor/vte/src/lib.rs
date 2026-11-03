@@ -41,6 +41,11 @@ mod params;
 pub mod ansi;
 pub use params::{Params, ParamsIter};
 
+/// Hard cap on one collected APC string, in bytes (mypixels patch). A
+/// terminal application may ask for a big image; nothing gets an unlimited
+/// allowance from a parser.
+pub const APC_LIMIT: usize = 64 * 1024 * 1024;
+
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
@@ -67,6 +72,12 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
+    /// APC/SOS/PM bytes for the current string (mypixels patch: Kitty
+    /// graphics lives in APC and the bytes used to be dropped on the floor).
+    apc_raw: Vec<u8>,
+    /// Set once the current APC exceeded `APC_LIMIT`; the remainder is
+    /// dropped and the whole sequence is discarded at its end.
+    apc_overflow: bool,
 }
 
 impl Parser {
@@ -800,6 +811,10 @@ pub trait Perform {
     /// Raw OSC observation before dispatch routing. mypixels patch; see the
     /// same-named method on `ansi::Handler`.
     fn osc_raw(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// A complete APC (or SOS/PM) string, mypixels patch; see the
+    /// same-named method on `ansi::Handler`.
+    fn apc_raw(&mut self, _bytes: &[u8]) {}
 
     /// A final character has arrived for a CSI sequence
     ///

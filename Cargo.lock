@@ -1957,6 +1957,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "arc-swap",
+ "base64",
  "bytemuck",
  "dirs",
  "egui",

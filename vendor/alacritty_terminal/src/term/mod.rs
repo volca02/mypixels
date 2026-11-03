@@ -1071,6 +1071,21 @@ impl<T: EventListener> Handler for Term<T> {
     /// The terminating BEL/ST of the sequence is consumed by the parser as
     /// a terminator, never executed - so OSC 133 never rings the bell and
     /// cannot double-fire the app's failure notification.
+    /// Forward complete APC strings with the cursor's absolute position
+    /// (mypixels patch). Interpretation - the Kitty protocol's parameter
+    /// language, chunked transfers and image store - is deliberately NOT
+    /// here: the terminal hands over bytes and place, and the application's
+    /// own unit-tested parser decides what they mean.
+    #[inline]
+    fn apc_raw(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let line = self.grid.history_size() + self.grid.cursor.point.line.0.max(0) as usize;
+        let col = self.grid.cursor.point.column.0;
+        self.event_proxy.send_event(Event::Apc { payload: bytes.to_vec(), line, col });
+    }
+
     #[inline]
     fn osc_raw(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         if params.len() < 2 || params[0] != b"133" {
