@@ -1,7 +1,7 @@
 import os, pathlib, re, subprocess as sp, tempfile, time
 
-root = pathlib.Path(__file__).resolve().parents[2]
-assert os.environ.get('DISPLAY'), 'Run with xvfb-run -a python3 spike/tests/ui_smoke.py'
+root = pathlib.Path(__file__).resolve().parents[1]
+assert os.environ.get('DISPLAY'), 'Run with xvfb-run -a python3 tests/ui_smoke.py'
 work = pathlib.Path(tempfile.mkdtemp(prefix='mypixels-ui-'))
 (work / '.mypixels').write_text('term_font: Cascadia Code 9\ntablist_font: Terminus (TTF) 12\ndefault_width: 800\ndefault_height: 480\ndefault_maximize: false\nterm_opacity: 0\nhide_single_tab: false\n')
 helpers = work / 'helpers'
@@ -11,9 +11,9 @@ delayed.write_text('#!/usr/bin/python3\nimport os,sys,time\nif \"-o\" in sys.arg
 delayed.chmod(0o755)
 env = dict(os.environ, HOME=str(work), RUST_LOG='info', PATH=str(helpers)+os.pathsep+os.environ['PATH'])
 env.pop('WAYLAND_DISPLAY', None)
-env.pop('SPIKE_KEYS', None)
+env.pop('MYPIXELS_KEYS', None)
 log = (work / 'app.log').open('w')
-app = sp.Popen([os.environ.get('SPIKE_BIN', str(root / 'spike/target/debug/spike')), '/usr/bin/python3', str(root / 'spike/tests/pty_fixture.py'), str(work)], env=env, stdout=log, stderr=log)
+app = sp.Popen([(os.environ.get('MYPIXELS_BIN') or os.environ.get('MYPIXELS_BIN') or str(root / 'target/debug/mypixels')), '/usr/bin/python3', str(root / 'tests/pty_fixture.py'), str(work)], env=env, stdout=log, stderr=log)
 
 def run(*args, **kw):
     if args[0] == 'xsel': args = ('/usr/bin/xsel', *args[1:])

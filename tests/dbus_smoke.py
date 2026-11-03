@@ -11,11 +11,17 @@ Run inside a private bus and display:
 import os
 import subprocess as sp
 import sys
+
+
+def bin_from_env():
+    """The binary under test: MYPIXELS_BIN, or the deprecated SPIKE_BIN."""
+    import os
+    return os.environ.get('MYPIXELS_BIN') or os.environ.get('SPIKE_BIN') or 'target/debug/mypixels'
 import tempfile
 import time
 from pathlib import Path
 
-BIN = Path(os.environ.get('SPIKE_BIN', 'target/debug/spike')).resolve()
+BIN = Path(bin_from_env()).resolve()
 
 
 def home(tag, keys):
@@ -29,9 +35,9 @@ def home(tag, keys):
 
 
 def env_for(h, keys):
-    env = dict(os.environ, HOME=str(h), SPIKE_KEYS=str(h / keys),
+    env = dict(os.environ, HOME=str(h), MYPIXELS_KEYS=str(h / keys),
                HISTFILE=str(h / '.history'), RUST_LOG='info')
-    env.pop('SPIKE_CONFIG', None)
+    env.pop('MYPIXELS_CONFIG', None)
     return env
 
 

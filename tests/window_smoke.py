@@ -3,16 +3,22 @@
 same process; Alt+Shift+w sends the active tab there, closing the emptied
 first window. Driven entirely through the FIFO key harness.
 
-    SPIKE_BIN=target/release/spike xvfb-run -a python3 tests/window_smoke.py
+    MYPIXELS_BIN=target/release/mypixels xvfb-run -a python3 tests/window_smoke.py
 """
 import os
 import subprocess as sp
 import sys
+
+
+def bin_from_env():
+    """The binary under test: MYPIXELS_BIN, or the deprecated SPIKE_BIN."""
+    import os
+    return os.environ.get('MYPIXELS_BIN') or os.environ.get('SPIKE_BIN') or 'target/debug/mypixels'
 import tempfile
 import time
 from pathlib import Path
 
-BIN = Path(os.environ.get('SPIKE_BIN', 'target/debug/spike')).resolve()
+BIN = Path(bin_from_env()).resolve()
 
 
 def wait_for(lines, needle, seconds=15):
@@ -30,7 +36,7 @@ def main():
     os.mkfifo(keys)
     cfg = tmp / 'config.yml'
     cfg.write_text('default_width: 800\ndefault_height: 520\nwal_palette: ""\n')
-    env = dict(os.environ, SPIKE_KEYS=str(keys), SPIKE_CONFIG=str(cfg), RUST_LOG='info')
+    env = dict(os.environ, MYPIXELS_KEYS=str(keys), MYPIXELS_CONFIG=str(cfg), RUST_LOG='info')
     log = (tmp / 'app.log').open('w')
     app = sp.Popen([str(BIN), 'sh'], env=env, stdout=log, stderr=log)
     kf = None

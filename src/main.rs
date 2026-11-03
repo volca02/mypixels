@@ -198,10 +198,10 @@ fn run_sig(run: &Run, cell_w: f32) -> u64 {
 }
 
 /// Escape hatch to A/B the shaping cache against re-shaping everything
-/// (`SPIKE_NOCACHE=1`).
+/// (`MYPIXELS_NOCACHE=1`).
 fn shaping_cache_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPIKE_NOCACHE").is_none())
+    *ON.get_or_init(|| std::env::var_os("MYPIXELS_NOCACHE").is_none())
 }
 
 /// Append a run, dropping the ones that could never draw anything: padding in
@@ -420,7 +420,7 @@ struct App {
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
-    /// Test hook: receiver of key specs fed from the $SPIKE_KEYS FIFO by a
+    /// Test hook: receiver of key specs fed from the $MYPIXELS_KEYS FIFO by a
     /// reader thread (about_to_wait is rarely called on Wayland).
     key_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
@@ -944,7 +944,7 @@ impl App {
         // Benchmark hook: ask for a grid larger than the window allows, to
         // separate grid-walk and shaping cost from rasterisation when the test
         // display is software only.
-        if let Ok(g) = std::env::var("SPIKE_GRID") {
+        if let Ok(g) = std::env::var("MYPIXELS_GRID") {
             if let Some((c, r)) = g.split_once('x') {
                 ncols = c.parse().unwrap_or(ncols);
                 nrows = r.parse().unwrap_or(nrows);
@@ -2051,7 +2051,7 @@ impl App {
         }
         self.wins[self.cur].gpu = Some(gpu);
 
-        if std::env::var("SPIKE_TRACE").is_ok() {
+        if std::env::var("MYPIXELS_TRACE").is_ok() {
             let mut h: u64 = 0xcbf29ce484222325;
             for run in &frame.runs {
                 for b in run.text.as_bytes() {
@@ -2073,7 +2073,7 @@ impl App {
     // Actions
     // -----------------------------------------------------------------------
 
-    /// Test hook: drain key specs from the $SPIKE_KEYS reader thread and feed
+    /// Test hook: drain key specs from the $MYPIXELS_KEYS reader thread and feed
     /// them through the same path as real key events.
     fn drain_test_keys(&mut self, event_loop: &ActiveEventLoop) {
         let rx = match self.key_rx.as_ref() {
@@ -2906,12 +2906,14 @@ fn term_command() -> (String, Vec<String>) {
 }
 
 /// Parse a test key spec like "alt+shift+t", "ctrl+c", "esc", "f5".
-/// Test hook: read key specs from the $SPIKE_KEYS FIFO in a background
+/// Test hook: read key specs from the $MYPIXELS_KEYS FIFO in a background
 /// thread and forward them over a channel. Returns None when unset.
 fn spawn_key_reader(
     window_slot: Arc<Mutex<Vec<Arc<Window>>>>,
 ) -> Option<std::sync::mpsc::Receiver<String>> {
-    let path = std::env::var("SPIKE_KEYS").ok()?;
+    let path = std::env::var("MYPIXELS_KEYS")
+        .or_else(|_| std::env::var("SPIKE_KEYS"))
+        .ok()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
@@ -3866,7 +3868,7 @@ impl ApplicationHandler for App {
 }
 
 /// TEMPORARY compensation for the difference between our one alpha stage and the
-/// original's, applied by default; `SPIKE_OPACITY` replaces it outright.
+/// original's, applied by default; `MYPIXELS_OPACITY` replaces it outright.
 ///
 /// Two readings from the user, at the values actually used:
 ///   term_opacity 0.1 -> ours too dark (needs to be more see-through)
@@ -3883,7 +3885,7 @@ impl ApplicationHandler for App {
 fn effective_opacity(cfg: f32) -> f32 {
     static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     let over = *OVERRIDE.get_or_init(|| {
-        std::env::var("SPIKE_OPACITY")
+        std::env::var("MYPIXELS_OPACITY")
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))

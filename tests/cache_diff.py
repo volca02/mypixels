@@ -7,7 +7,7 @@ Cell content is deterministic for both runs; the only expected difference is
 cursor blink phase, worth about one cell, hence the 0.15% pixel tolerance.
 
 Usage:
-    OLD_BIN=... NEW_BIN=... xvfb-run -a python3 spike/tests/cache_diff.py
+    OLD_BIN=... NEW_BIN=... xvfb-run -a python3 tests/cache_diff.py
 """
 import os
 import re
@@ -20,8 +20,8 @@ from pathlib import Path
 from PIL import Image
 
 root = Path(__file__).resolve().parents[1]
-OLD = os.environ.get('OLD_BIN', str(root / 'target/debug/spike'))
-NEW = os.environ.get('NEW_BIN', str(root / 'target/release/spike'))
+OLD = os.environ.get('OLD_BIN', str(root / 'target/debug/mypixels'))
+NEW = os.environ.get('NEW_BIN', str(root / 'target/release/mypixels'))
 # Cursor blink is a free-running phase between runs (and the strip's clock
 # sits just outside the crop); a cell plus antialiasing is ~0.06%. Half a
 # percent still catches any real regression: the pre-cache-vs-cache bugs
@@ -48,8 +48,8 @@ def run_session(binary: str, tag: str) -> tuple[Path, dict]:
     (work / '.mypixels').write_text(CONFIG)
     keys = work / 'keys'
     os.mkfifo(keys)
-    env = dict(os.environ, HOME=str(work), SPIKE_CONFIG=str(work / '.mypixels'),
-               SPIKE_KEYS=str(keys), RUST_LOG='info', HISTFILE=str(work / '.history'))
+    env = dict(os.environ, HOME=str(work), MYPIXELS_CONFIG=str(work / '.mypixels'),
+               MYPIXELS_KEYS=str(keys), RUST_LOG='info', HISTFILE=str(work / '.history'))
     env.pop('WAYLAND_DISPLAY', None)
     log = (work / 'app.log').open('w')
     app = sp.Popen([binary, 'sh'], env=env, stdout=log, stderr=log)

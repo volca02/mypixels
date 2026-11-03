@@ -234,25 +234,26 @@ impl Config {
     }
 
     /// The file the configuration is read from (and written to on save):
-    /// $SPIKE_CONFIG, else $XDG_CONFIG_HOME/mypixels/config.yml
+    /// $MYPIXELS_CONFIG (or the deprecated $SPIKE_CONFIG), else
+    /// $XDG_CONFIG_HOME/mypixels/config.yml
     /// (~/.config/mypixels/config.yml by default). A legacy ~/.mypixels that
     /// predates the move keeps working while the XDG file does not exist --
     /// nobody's configuration gets orphaned by the relocation, and saving
     /// writes back to the very file that was loaded.
     pub fn config_path() -> Option<std::path::PathBuf> {
         Self::config_path_in(
-            std::env::var_os("SPIKE_CONFIG").map(std::path::PathBuf::from).as_deref(),
+            Self::env_override("MYPIXELS_CONFIG"),
             dirs::config_dir().as_deref(),
             dirs::home_dir().as_deref(),
         )
     }
 
     fn config_path_in(
-        spike: Option<&std::path::Path>,
+        override_: Option<std::path::PathBuf>,
         xdg: Option<&std::path::Path>,
         home: Option<&std::path::Path>,
     ) -> Option<std::path::PathBuf> {
-        if let Some(p) = spike {
+        if let Some(p) = override_.as_deref() {
             return Some(p.to_path_buf());
         }
         let modern = xdg?.join("mypixels").join("config.yml");
@@ -264,6 +265,16 @@ impl Config {
             return Some(legacy);
         }
         Some(modern)
+    }
+
+    /// A path environment override, current name first. The SPIKE_ spellings
+    /// predate the rename from prototype binary to product and still work --
+    /// muscle memory is a real interface.
+    pub(crate) fn env_override(name: &str) -> Option<std::path::PathBuf> {
+        let legacy = format!("SPIKE_{}", name.strip_prefix("MYPIXELS_")?);
+        std::env::var_os(name)
+            .or_else(|| std::env::var_os(legacy))
+            .map(std::path::PathBuf::from)
     }
 
     pub fn try_load() -> Result<Config, String> {
@@ -879,7 +890,7 @@ mod tests {
         assert_eq!(Config::config_path_in(None, Some(&xdg), Some(&home)).unwrap(), modern);
         // The test override still outranks everything.
         assert_eq!(
-            Config::config_path_in(Some(&root.join("env")), Some(&xdg), Some(&home)).unwrap(),
+            Config::config_path_in(Some(root.join("env")), Some(&xdg), Some(&home)).unwrap(),
             root.join("env")
         );
         std::fs::remove_dir_all(&root).unwrap();

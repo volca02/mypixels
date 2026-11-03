@@ -1,6 +1,6 @@
 """Real pixels, theme reload, OSC palette overrides, and the Alt-held switcher.
 
-Run against a disposable X server: xvfb-run -a python3 spike/tests/theme_smoke.py
+Run against a disposable X server: xvfb-run -a python3 tests/theme_smoke.py
 Requires xdotool, ImageMagick import, and Pillow. Never uses the desktop HOME.
 """
 import os
@@ -12,11 +12,11 @@ import time
 
 from PIL import Image
 
-root = pathlib.Path(__file__).resolve().parents[2]
+root = pathlib.Path(__file__).resolve().parents[1]
 assert os.environ.get('DISPLAY'), 'Run under xvfb-run'
 work = pathlib.Path(tempfile.mkdtemp(prefix='mypixels-themes-'))
 theme = work / 'live.yml'
-theme.write_text((root / 'spike/themes/dracula.yml').read_text())
+theme.write_text((root / 'themes/dracula.yml').read_text())
 config = work / '.mypixels'
 base = """wal_palette: ''
 term_font: Cascadia Code 12
@@ -56,11 +56,11 @@ while True:
     if b's' in data:
         os.write(1, b'\x1b]104;1\x07\x1b]111\x07')
 ''')
-env = dict(os.environ, HOME=str(work), SPIKE_CONFIG=str(config), RUST_LOG='info')
+env = dict(os.environ, HOME=str(work), MYPIXELS_CONFIG=str(config), RUST_LOG='info')
 env.pop('WAYLAND_DISPLAY', None)
-env.pop('SPIKE_KEYS', None)
+env.pop('MYPIXELS_KEYS', None)
 log = (work / 'app.log').open('w')
-app = sp.Popen([os.environ.get('SPIKE_BIN', str(root / 'spike/target/debug/spike')), '/usr/bin/python3',
+app = sp.Popen([(os.environ.get('MYPIXELS_BIN') or os.environ.get('MYPIXELS_BIN') or str(root / 'target/debug/mypixels')), '/usr/bin/python3',
                 str(fixture), str(work)], env=env, stdout=log, stderr=log)
 
 
@@ -129,7 +129,7 @@ try:
     wait(lambda: block(screenshot(), 1, 1) == (255, 85, 85), 'second tab output missing')
     # Atomic replacement, like editors and pywal, must wake an idle terminal.
     replacement = work / 'replacement.yml'
-    replacement.write_text((root / 'spike/themes/catppuccin-latte.yml').read_text())
+    replacement.write_text((root / 'themes/catppuccin-latte.yml').read_text())
     replacement.replace(theme)
     wait(lambda: background_is((239, 241, 245)), 'idle theme file did not reload')
     image = screenshot('latte')
@@ -144,7 +144,7 @@ try:
     theme.write_text('foreground_color: [')
     wait(lambda: 'Theme/config reload:' in (work / 'app.log').read_text(), 'invalid edit was not reported')
     assert background_is((239, 241, 245)), 'invalid edit replaced the last good theme'
-    theme.write_text((root / 'spike/themes/catppuccin-mocha.yml').read_text())
+    theme.write_text((root / 'themes/catppuccin-mocha.yml').read_text())
     wait(lambda: background_is((30, 30, 46)), 'theme did not recover after a valid edit')
     screenshot('mocha')
 

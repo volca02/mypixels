@@ -1,13 +1,13 @@
 # Regression checks
 
-Run `cargo test --offline` from `spike/` for font layout, configuration, clipboard
+Run `cargo test --offline` from the repo root for font layout, configuration, clipboard
 transfer bounds, and PTY paste encoding checks.
 
 For keyboard/mouse behavior, build the debug binary, then run from the repository
 root:
 
 ```sh
-xvfb-run -a python3 spike/tests/ui_smoke.py
+xvfb-run -a python3 tests/ui_smoke.py
 ```
 
 Requires Xvfb, xdotool, xsel, and ImageMagick's `import`. The test creates an
@@ -22,7 +22,7 @@ with its **isolated** runtime directory and display:
 ```sh
 MYPIXELS_ISOLATED_CLIPBOARD_TEST=1 \
 XDG_RUNTIME_DIR=/path/to/isolated/runtime WAYLAND_DISPLAY=wayland-1 \
-cargo test --offline --manifest-path spike/Cargo.toml \
+cargo test --offline \
   wayland_interoperability -- --ignored --nocapture
 ```
 
@@ -34,17 +34,17 @@ test flag prevents accidentally running it against a normal desktop.
 For an unpaced stream of changing paths (without filesystem traversal), launch:
 
 ```sh
-SPIKE_TRACE=1 spike/target/release/spike \
-  python3 spike/tests/output_flood.py 10 /tmp/mypixels-flood.json
+MYPIXELS_TRACE=1 target/release/mypixels \
+  python3 tests/output_flood.py 10 /tmp/mypixels-flood.json
 ```
 
-Use the same window size, compositor and GPU for comparisons. `SPIKE_TRACE`
+Use the same window size, compositor and GPU for comparisons. `MYPIXELS_TRACE`
 reports cumulative frame-build and text-preparation times plus total frame time;
 subtract build from text time to isolate layout. The JSON records lines produced
 and elapsed time. A software renderer's CPU use is not comparable to a desktop
 GPU's, and unpaced input tests throughput as well as rendering.
 
-For preview rendering without xdotool, run from `spike/`:
+For preview rendering without xdotool, run from the repo root:
 
 ```sh
 xvfb-run -a python3 tests/preview_smoke.py

@@ -243,18 +243,18 @@ numbers drove the metric and strip work; the spike was at 7.03 x 15.60 and 27px.
 
 ## Remaining validation (manual)
 
-Run a real agentic session inside `target/release/spike` and confirm the
+Run a real agentic session inside `target/release/mypixels` and confirm the
 feel under load on the real (non-Xvfb) GPU.
 
 ## Files
 
-- `spike/src/main.rs` — app, rendering, key dispatch (winit 0.30 + wgpu 30
+- `src/main.rs` — app, rendering, key dispatch (winit 0.30 + wgpu 30
   + glyphon 0.12 + alacritty_terminal 0.26)
-- `spike/src/config.rs` — `~/.mypixels` loading + keybindings
-- `spike/src/tab.rs` — pty + alacritty Terminal per tab
-- `spike/src/gpu.rs` — wgpu surface, rect + glyphon text pipelines
-- `spike/stress.py` — the stress test
-- `spike/cpusample.sh` — CPU sampler (not used in final protocol)
+- `src/config.rs` — `~/.mypixels` loading + keybindings
+- `src/tab.rs` — pty + alacritty Terminal per tab
+- `src/gpu.rs` — wgpu surface, rect + glyphon text pipelines
+- `stress.py` — the stress test
+- `cpusample.sh` — CPU sampler (not used in final protocol)
 
 ## 2026-10-31: fonts, clipboard, and scrolling regression
 

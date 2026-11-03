@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drive the real spike UI through the $SPIKE_KEYS test hook and profile the
+# Drive the real mypixels UI through the $MYPIXELS_KEYS test hook and profile the
 # live render loop with perf. Redraws happen when the app is woken, and
 # every FIFO line wakes it, so spamming "spy" (a hook line that only logs)
 # is a steady frame pump.
@@ -17,8 +17,8 @@
 # Needs the RELEASE binary: a debug build distorts everything perf says.
 set -uo pipefail
 
-SPIKE_DIR=${SPIKE_DIR:-$HOME/Projects/mypixels/spike}
-BIN=${BIN:-$SPIKE_DIR/target/release/spike}
+REPO_DIR=${REPO_DIR:-$HOME/Projects/mypixels}
+BIN=${BIN:-${REPO_DIR}/target/release/mypixels}
 SECS=${SECS:-8}
 PERF_F=${PERF_F:-299}
 OUT=${OUT:-/tmp/spike-perf}
@@ -33,7 +33,7 @@ mkfifo "$FIFO"
 LOG=$OUT/spike.log
 : > "$LOG"
 
-RUST_LOG=${RUST_LOG:-info} SPIKE_KEYS=$FIFO "$BIN" >"$LOG" 2>&1 &
+RUST_LOG=${RUST_LOG:-info} MYPIXELS_KEYS=$FIFO "$BIN" >"$LOG" 2>&1 &
 SPID=$!
 exec 3>"$FIFO"
 say() { printf '%s\n' "$1" >&3; }

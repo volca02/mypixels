@@ -1,6 +1,24 @@
 Mypixels
 ========
 
+A terminal emulator. The current implementation is **Rust** (wgpu + glyphon +
+winit + alacritty_terminal, with an egui layer for the config panel, font
+dialog and tab switcher) and lives at the root of this repo:
+
+    cargo build --release        # target/release/mypixels
+    cargo test                   # unit tests, no display needed
+    MYPIXELS_BIN=$PWD/target/release/mypixels xvfb-run -a python3 tests/preview_smoke.py
+
+Config is `$XDG_CONFIG_HOME/mypixels/config.yml` (the legacy `~/.mypixels`
+is still read until an XDG file exists). Themes are discovered in
+`~/.config/mypixels/themes`, `~/.local/share/mypixels/themes` and the XDG
+data dirs; see `themes/README.md`. `mypixels` run twice joins the existing
+session (D-Bus); `-n` opens another window of it, `-s` runs standalone.
+
+The original Python/GTK/VTE implementation — the behavioural reference this
+rewrite reproduces, down to the Alt-held tab switcher — is kept unchanged in
+[`legacy/mypixels`](legacy/mypixels). Its README follows verbatim.
+
 ![Alt text](https://cloud.githubusercontent.com/assets/1075171/14241115/1e141884-fa4a-11e5-8724-95decd9ed17d.png "Screenshot")
 
 Mypixels is a very simple terminal emulator written in python using python gtk bindings and python vte bindings.

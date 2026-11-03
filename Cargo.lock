@@ -1954,6 +1954,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "mypixels"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "arc-swap",
+ "bytemuck",
+ "dirs",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "env_logger",
+ "futures",
+ "glyphon",
+ "libc",
+ "log",
+ "portable-pty",
+ "serde_yaml",
+ "unicode-script",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "wgpu",
+ "winit",
+ "zbus",
+]
+
+[[package]]
 name = "naga"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3209,33 +3236,6 @@ name = "smol_str"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eeb7109d23f319619d4cc0de5464613c8b7b1a09db2774a58101459cf6be2f10"
-
-[[package]]
-name = "spike"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "arc-swap",
- "bytemuck",
- "dirs",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "env_logger",
- "futures",
- "glyphon",
- "libc",
- "log",
- "portable-pty",
- "serde_yaml",
- "unicode-script",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-wlr",
- "wgpu",
- "winit",
- "zbus",
-]
 
 [[package]]
 name = "spirv"
