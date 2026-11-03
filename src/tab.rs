@@ -38,6 +38,13 @@ pub struct SpikeListener {
     /// The Kitty graphics protocol arrives this way; interpretation is the
     /// application's `kitty::TabKitty` state machine's job.
     pub apcs: Arc<Mutex<Vec<(usize, Vec<u8>, usize, usize)>>>,
+    /// Replies the terminal owes the running programs - keyboard-mode
+    /// queries (`CSI ? u`), cursor position reports, device attributes -
+    /// as (tab_id, text). Before this existed such events hit the
+    /// listener's catch-all and evaporated: crossterm's support probe
+    /// timed out after a second, and broot (via termimad) refused to
+    /// start with "the keyboard enhancement status could not be read".
+    pub pty_writes: Arc<Mutex<Vec<(usize, String)>>>,
     /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line).
     /// Order per tab is the stream's own; the app folds them into command
     /// blocks (see `App::drain_sems`).
@@ -63,6 +70,9 @@ impl EventListener for SpikeListener {
                 *self.title.lock().unwrap() = t;
                 *self.last_activity.lock().unwrap() = std::time::Instant::now();
                 self.notify_window();
+            },
+            Event::PtyWrite(text) => {
+                self.pty_writes.lock().unwrap().push((self.tab_id, text));
             },
             Event::Apc { payload, line, col } => {
                 self.apcs.lock().unwrap().push((self.tab_id, payload, line, col));
@@ -155,11 +165,15 @@ impl Tab {
             bells: Arc::clone(&shared.bells),
             sems: Arc::clone(&shared.sems),
             apcs: Arc::clone(&shared.apcs),
+            pty_writes: Arc::clone(&shared.pty_writes),
         };
 
         let term = Arc::new(FairMutex::new(Term::new(
             TermConfig {
                 scrolling_history: history,
+                // The kitty keyboard flag stack is tracked for real (push,
+                // pop, set, query), and `kitty_kb` encodes keys to match it.
+                kitty_keyboard: true,
                 ..Default::default()
             },
             dims,

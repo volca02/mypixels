@@ -1329,15 +1329,20 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn report_keyboard_mode(&mut self) {
-        if !self.config.kitty_keyboard {
-            return;
-        }
-
+        // mypixels deviation (docs/graphics_osc133_implementation.md): the
+        // query is ALWAYS answered. Upstream stays silent unless
+        // kitty_keyboard is enabled, and silence is indistinguishable from
+        // a slow terminal: crossterm (via termimad, via broot) waits ~1s and
+        // then fails with "keyboard enhancement status could not be read
+        // within a normal duration". mypixels enables the protocol, so the
+        // answer is the real top-of-stack - see `src/kitty_kb.rs` for the
+        // encoder that keeps these reported bits true.
+        // The stack is only pushed while the protocol is enabled, so an
+        // empty stack (bits 0) is the honest answer whenever it is not.
         trace!("Reporting active keyboard mode");
         let current_mode =
             self.keyboard_mode_stack.last().unwrap_or(&KeyboardModes::NO_MODE).bits();
-        let text = format!("\x1b[?{current_mode}u");
-        self.event_proxy.send_event(Event::PtyWrite(text));
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[?{current_mode}u")));
     }
 
     #[inline]

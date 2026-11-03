@@ -10,6 +10,7 @@ mod egui_ui;
 mod fonts;
 mod gpu;
 mod kitty;
+mod kitty_kb;
 mod tab;
 mod session;
 mod theme;
@@ -424,6 +425,7 @@ struct App {
     sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize)>>>,
     /// Complete APC strings awaiting graphics interpretation.
     apcs_ring: Arc<std::sync::Mutex<Vec<(usize, Vec<u8>, usize, usize)>>>,
+    pty_writes_ring: Arc<std::sync::Mutex<Vec<(usize, String)>>>,
     /// Per-tab Kitty graphics state, keyed by stable tab id; created on
     /// first use, removed when the tab dies.
     kitty: std::collections::HashMap<usize, kitty::TabKitty>,
@@ -603,10 +605,12 @@ impl App {
             bells: Arc::new(Mutex::new(Vec::new())),
             sems: Arc::new(Mutex::new(Vec::new())),
             apcs: Arc::new(Mutex::new(Vec::new())),
+            pty_writes: Arc::new(Mutex::new(Vec::new())),
         };
         let bells = Arc::clone(&shared.bells);
         let sems = Arc::clone(&shared.sems);
         let apcs = Arc::clone(&shared.apcs);
+        let pty_writes = Arc::clone(&shared.pty_writes);
         let exited = Arc::clone(&shared.exited);
         let last_activity = Arc::clone(&shared.last_activity);
         let bell = Arc::clone(&shared.bell);
@@ -711,6 +715,7 @@ impl App {
             bell_pings: bells,
             sems_ring: sems,
             apcs_ring: apcs,
+            pty_writes_ring: pty_writes,
             kitty: Default::default(),
             sem_blocks: Default::default(),
             session_rx,
@@ -992,6 +997,7 @@ impl App {
             bells: Arc::clone(&self.bell_pings),
             sems: Arc::clone(&self.sems_ring),
             apcs: Arc::clone(&self.apcs_ring),
+            pty_writes: Arc::clone(&self.pty_writes_ring),
         }
     }
 
@@ -2570,7 +2576,7 @@ impl App {
                 // outside winit (pub(crate) extras), so translate to egui
                 // events directly -- the same things egui-winit would send.
                 if !self.test_key_to_egui(&key, mods) {
-                    self.handle_key(&key, event_loop);
+                    self.handle_key(&key, None, event_loop);
                 }
             }
         }
@@ -2993,6 +2999,60 @@ impl App {
         }
     }
 
+    /// Encode a key RELEASE for the active tab. Only the enhanced protocol
+    /// can carry a release; the legacy path simply has nothing to say, and
+    /// "send nothing" is decided explicitly here rather than by an encoder
+    /// accident. A release never touches selection, scroll or activity.
+    fn send_key_release(&mut self, ke: &winit::event::KeyEvent) {
+        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
+            return;
+        };
+        let (flags, app_cursor) = {
+            let term = tab.term.lock();
+            let m = *term.mode();
+            (
+                kitty_kb::active_flags(&m),
+                m.contains(alacritty_terminal::term::TermMode::APP_CURSOR),
+            )
+        };
+        if flags == 0 {
+            return;
+        }
+        if let Some(bytes) = kitty_kb::encode(&kitty_kb::Input {
+            key: &ke.logical_key,
+            text: ke.text.as_deref(),
+            physical: ke.physical_key,
+            location: ke.location,
+            release: true,
+            repeat: false,
+            mods: self.modifiers,
+            flags,
+            app_cursor,
+        }) {
+            if !bytes.is_empty() {
+                tab.write(&bytes);
+            }
+        }
+    }
+
+    /// Deliver the replies the terminal queued for its programs (keyboard
+    /// mode queries, cursor position reports). NOT entangled: a response
+    /// belongs to the tab that was asked, not to every mirrored shell.
+    fn drain_ptwrites(&mut self) {
+        let evs: Vec<(usize, String)> =
+            std::mem::take(&mut *self.pty_writes_ring.lock().unwrap());
+        for (tab_id, text) in evs {
+            if let Some(tab) = self
+                .wins
+                .iter()
+                .flat_map(|w| w.tabs.iter())
+                .find(|t| t.id == tab_id)
+            {
+                tab.write(text.as_bytes());
+            }
+        }
+    }
+
     fn drain_clipboard(&mut self) {
         let events: Vec<_> = self.clipboard.as_ref().map(|c| c.events().collect()).unwrap_or_default();
         for event in events {
@@ -3005,8 +3065,18 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+    fn handle_key(&mut self, key: &Key, kev: Option<&winit::event::KeyEvent>, event_loop: &ActiveEventLoop) {
         if self.wins[self.cur].drag.take().is_some() { self.publish_primary(); }
+        // A key release is not an action, never scrolls, never selects. Its
+        // only legitimate use is the Kitty keyboard protocol, where apps
+        // asked for release events; everything else about a release is the
+        // same key's press having already happened.
+        if let Some(ke) = kev {
+            if ke.state == winit::event::ElementState::Released {
+                self.send_key_release(ke);
+                return;
+            }
+        }
         // 0. The egui rename box owns the keyboard: egui consumes the keys
         //    it needs, and anything left over is swallowed here so a half-
         //    typed name can never leak into the shell. Escape is the app's
@@ -3047,11 +3117,40 @@ impl App {
             return;
         }
         // 3. Everything else goes to the active terminal
-        let app_cursor = self.wins[self.cur]
-            .tabs
-            .get(self.wins[self.cur].active)
-            .is_some_and(|t| t.term.lock().mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR));
-        if let Some(bytes) = key_bytes(key, self.modifiers, app_cursor) {
+        let (app_cursor, kb_flags) = match self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
+            Some(t) => {
+                let term = t.term.lock();
+                let m = *term.mode();
+                (
+                    m.contains(alacritty_terminal::term::TermMode::APP_CURSOR),
+                    kitty_kb::active_flags(&m),
+                )
+            },
+            None => (false, 0),
+        };
+        let bytes = if kb_flags != 0 {
+            match kev {
+                // Enhancement flags are active: the enhanced encoder owns
+                // this key. `None` from it means "nothing new to say" and
+                // the legacy table (byte-identical for these keys) speaks.
+                Some(ke) => kitty_kb::encode(&kitty_kb::Input {
+                    key,
+                    text: ke.text.as_deref(),
+                    physical: ke.physical_key,
+                    location: ke.location,
+                    release: false,
+                    repeat: ke.repeat,
+                    mods: self.modifiers,
+                    flags: kb_flags,
+                    app_cursor,
+                })
+                .or_else(|| key_bytes(key, self.modifiers, app_cursor)),
+                None => key_bytes(key, self.modifiers, app_cursor),
+            }
+        } else {
+            key_bytes(key, self.modifiers, app_cursor)
+        };
+        if let Some(bytes) = bytes.filter(|b| !b.is_empty()) {
             // Typing counts as activity: keep the cursor solid (no blink)
             // right after a keypress.
             *self.last_activity.lock().unwrap() = std::time::Instant::now();
@@ -4365,6 +4464,7 @@ impl ApplicationHandler for App {
         self.drain_bell_pings();
         self.drain_sems();
         self.drain_apcs();
+        self.drain_ptwrites();
         self.drain_test_keys(event_loop);
     }
 
@@ -4436,6 +4536,7 @@ impl ApplicationHandler for App {
                 self.drain_bell_pings();
                 self.drain_sems();
                 self.drain_apcs();
+                self.drain_ptwrites();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
                 if let Some(action) = self.pending_action.take() {
@@ -4774,7 +4875,13 @@ impl ApplicationHandler for App {
                     let repeatable = action.as_deref().is_none_or(|action| matches!(action,
                         "prev_tab" | "next_tab" | "prev_tab_row" | "next_tab_row" |
                         "scroll_page_up" | "scroll_page_down" | "enlarge_font" | "shrink_font"));
-                    if !key.repeat || repeatable { self.handle_key(&key.logical_key, event_loop); }
+                    if !key.repeat || repeatable {
+                        self.handle_key(&key.logical_key, Some(&key), event_loop);
+                    }
+                } else {
+                    // Releases flow to the enhanced protocol only (see
+                    // handle_key's early branch); cheaply, they no-op.
+                    self.handle_key(&key.logical_key, Some(&key), event_loop);
                 }
             },
             WindowEvent::MouseWheel { delta, .. } => {
