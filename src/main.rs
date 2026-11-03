@@ -5094,8 +5094,13 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        for tab in self.wins[self.cur].tabs.iter() {
-            let _ = tab.sender.send(Msg::Shutdown);
+        // `wins` is routinely empty here: closing the last window empties it
+        // before winit fires Exiting. And say goodbye to every window's
+        // tabs, not just the current one's.
+        for w in self.wins.iter_mut() {
+            for tab in w.tabs.iter() {
+                let _ = tab.sender.send(Msg::Shutdown);
+            }
         }
     }
 }
