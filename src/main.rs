@@ -425,6 +425,12 @@ struct App {
     /// so the eye can keep the pointer's agent when it slides across the
     /// grid (mouse-reporting apps, search jumps, wide terminals).
     ripple: Option<Ripple>,
+    /// Closed tabs, most recent last: (window title at death, working
+    /// directory at death). Ctrl+Shift+z respawns the newest from here, in
+    /// the window that asks. Bounded - a reopen history is a memory of the
+    /// last few minutes, not a session manager; that is a different,
+    /// harder promise, and half-measures should not pretend at it.
+    closed_ring: std::collections::VecDeque<(String, Option<std::path::PathBuf>)>,
     /// URLs found in the visible grid of the window being drawn, rebuilt
     /// every frame (a grid scan the size of the screen is nothing; the
     /// alternative - tracking damage and re-scanning rows - is a worse
@@ -684,6 +690,7 @@ impl App {
             pending_action: None,
             ripple: None,
             cursor_pt: None,
+            closed_ring: std::collections::VecDeque::new(),
             url_spans: Vec::new(),
             url_hover: None,
             _session,
@@ -772,6 +779,12 @@ impl App {
     /// windows must not be woken, nor kept alive by it), then the window
     /// itself; the last one exiting ends the session.
     fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
+        // A window dying takes its tabs with it; remember them all, oldest
+        // first, so Ctrl+Shift+z can walk them back one by one.
+        let deaths: Vec<_> = self.wins[i].tabs.iter().map(tab_death).collect();
+        for d in deaths {
+            self.remember_closed(d);
+        }
         if let Some(w) = self.wins[i].window.as_ref() {
             let id = w.id();
             self.window_slot.lock().unwrap().retain(|w| w.id() != id);
@@ -934,14 +947,28 @@ impl App {
         }
     }
 
+    /// Remember a tab's death in the reopen ring (bounded, oldest first out).
+    /// Takes the already-collected entry, not the tab: callers are holding a
+    /// borrow of the tab list that remembering must not fight with.
+    fn remember_closed(&mut self, entry: (String, Option<std::path::PathBuf>)) {
+        self.closed_ring.push_back(entry);
+        while self.closed_ring.len() > 8 {
+            self.closed_ring.pop_front();
+        }
+    }
+
     fn close_tab_at(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
         if idx >= self.wins[self.cur].tabs.len() {
             return;
         }
+        self.remember_closed(tab_death(&self.wins[self.cur].tabs[idx]));
         // Stable ids: find the id of the tab being removed
         self.wins[self.cur].tabs.remove(idx);
         if self.wins[self.cur].tabs.is_empty() {
-            event_loop.exit();
+            // The last tab closes its WINDOW, not the application: a second
+            // window must survive closing all of the first one's tabs.
+            // (close_window ends the app when this was the last window.)
+            self.close_window(self.cur, event_loop);
             return;
         }
         if self.wins[self.cur].active >= self.wins[self.cur].tabs.len() {
@@ -2949,6 +2976,14 @@ impl App {
                 }
             },
             "close_tab" => self.close_tab_at(self.wins[self.cur].active, event_loop),
+            "reopen_tab" => {
+                // The shell that died comes back where it died. The title it
+                // carried is remembered for context we do not yet spend;
+                // the directory is the whole value of this feature.
+                if let Some((_title, cwd)) = self.closed_ring.pop_back() {
+                    self.add_tab_with(cwd, None);
+                }
+            }
             "prev_tab" | "prev_tab_row" => {
                 if n > 1 {
                     self.wins[self.cur].active = (self.wins[self.cur].active + n - 1) % n;
@@ -3623,6 +3658,11 @@ fn url_spans_in_line(line: &str) -> Vec<(usize, String)> {
     }
     out
 }
+/// What a dying tab leaves behind for the reopen ring.
+fn tab_death(tab: &Tab) -> (String, Option<std::path::PathBuf>) {
+    (tab.title.lock().unwrap().clone(), tab.cwd_raw())
+}
+
 /// State of the cursor's movement pulse (see `App::ripple`).
 struct Ripple {
     /// Centre in PHYSICAL pixels (the draw path works there; egui divides

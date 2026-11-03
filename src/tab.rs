@@ -186,6 +186,15 @@ impl Tab {
         }
     }
 
+    /// The live working directory of this tab's shell, straight from
+    /// /proc - the same source the tab label uses, un-shortened, for
+    /// respawning where the tab lived.
+    pub fn cwd_raw(&self) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{}/cwd", self.child_pid?))
+            .ok()
+            .filter(|p| p.is_dir())
+    }
+
     pub fn write(&self, bytes: &[u8]) {
         let _ = self.sender.send(Msg::Input(std::borrow::Cow::Owned(bytes.to_vec())));
     }

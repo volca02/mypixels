@@ -137,6 +137,7 @@ impl Default for Config {
         bind("first_tab", &["MOD1+Home"]);
         bind("last_tab", &["MOD1+End"]);
         bind("close_tab", &["CONTROL+ALT+x", "CONTROL+ALT+q"]);
+        bind("reopen_tab", &["CONTROL+SHIFT+z"]);
         bind("new_tab", &["CONTROL+ALT+z", "CONTROL+SHIFT+t"]);
         bind("new_window", &["CONTROL+SHIFT+n"]);
         bind("send_tab_to_window", &["MOD1+SHIFT+w"]);
