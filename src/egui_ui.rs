@@ -464,7 +464,7 @@ pub struct SwitcherCard {
 // that is what makes the row grouping and centring exact.
 const CARD_PAD: f32 = 10.0;
 /// The widest the text column may be; longer titles truncate.
-const TITLE_MAX: f32 = 140.0;
+const TITLE_MAX: f32 = 170.0;
 const CARD_TXT_GAP: f32 = 8.0;
 const CARD_GAP: f32 = 12.0;
 
@@ -511,6 +511,20 @@ fn line_galley(
     center: bool,
 ) -> std::sync::Arc<egui::Galley> {
     let font_id = egui::FontSelection::Style(font).resolve(ui.style());
+    line_galley_f(ui, text, font_id, color, max_rows, center)
+}
+
+/// The same, with an explicit font id (the card header is set larger than
+/// `Body`: the switcher flashes by, and its text must be readable mid-gesture
+/// across a dimmed screen).
+fn line_galley_f(
+    ui: &egui::Ui,
+    text: &str,
+    font_id: egui::FontId,
+    color: egui::Color32,
+    max_rows: usize,
+    center: bool,
+) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::simple(
         text.to_string(),
         font_id,
@@ -525,6 +539,13 @@ fn line_galley(
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
+/// The card header's font: body text plus a step, rounded so a 1x display
+/// still gets crisp glyphs.
+fn header_font(ui: &egui::Ui) -> egui::FontId {
+    let body = ui.style().text_styles[&egui::TextStyle::Body].size;
+    egui::FontId::proportional((body + 4.0).min(24.0).round())
+}
+
 /// The card's text block: the title (the entangled `*` marker included), a
 /// "tab N" caption, and the working directory when present. Returns the
 /// block's (width, height); the width is the widest line, already truncated
@@ -533,42 +554,32 @@ fn line_galley(
 fn measure_card(ui: &egui::Ui, index: usize, card: &SwitcherCard) -> (f32, f32) {
     let text_color = ui.style().visuals.text_color();
     let weak_color = ui.style().visuals.weak_text_color();
-    let mut title = if card.marker {
+    let title = if card.marker {
         format!("* {}", card.title)
     } else {
         card.title.clone()
     };
-    if title.is_empty() {
-        title = format!("tab {}", index + 1);
-    }
-    // Titles wrap to two centered lines (the original's card labels: line
-    // wrap on, max_width_chars, centered); captions and cwd stay one line.
-    let g_title = line_galley(ui, &title, egui::TextStyle::Body, text_color, 2, true);
-    let g_cap = line_galley(
-        ui,
-        &format!("tab {}", index + 1),
-        egui::TextStyle::Small,
-        weak_color,
-        1,
-        false,
-    );
-    let g_cwd = card.cwd.as_ref().map(|c| {
-        line_galley(
-            ui,
-            c,
-            egui::TextStyle::Small,
-            egui::Color32::from_rgb(98, 102, 120),
-            1,
-            false,
-        )
-    });
-    let w = g_title.size().x
-        .max(g_cap.size().x)
-        .max(g_cwd.as_ref().map(|g| g.size().x).unwrap_or(0.0));
+    // Header: the name on the left, its index on the right - no "tab" word
+    // (a card in the tab switcher *is* a tab; spelling it out was filler),
+    // both at the larger header size.
+    let fid = header_font(ui);
+    let g_title = line_galley_f(ui, &title, fid.clone(), text_color, 2, false);
+    let g_num = line_galley_f(ui, &format!("{}", index + 1), fid, weak_color, 1, true);
+    let g_cwd = card
+        .cwd
+        .as_ref()
+        .map(|c| line_galley(ui, c, egui::TextStyle::Small, weak_color, 1, false));
+    let header_w = if title.is_empty() {
+        g_num.size().x
+    } else {
+        g_title.size().x + 6.0 + g_num.size().x
+    };
+    let w = header_w.max(g_cwd.as_ref().map(|g| g.size().x).unwrap_or(0.0));
     let gap = ui.style().spacing.item_spacing.y;
-    let h = g_title.size().y
-        + g_cap.size().y
-        + gap
+    let h = g_title
+        .size()
+        .y
+        .max(g_num.size().y)
         + g_cwd.as_ref().map(|g| g.size().y + gap).unwrap_or(0.0);
     (w, h)
 }
@@ -605,6 +616,73 @@ pub fn release_focus_if_closed(
         release_focus(ctx);
     }
     *prev = (open, popup_open);
+}
+
+/// egui's look, built from the terminal's own colours: an egui panel that
+/// ignores the theme the user configured for the terminal would be a second,
+/// uglier app sharing the window. Everything derived (weak text, panel mix,
+/// borders) is a mix between the configured background and foreground, so
+/// light *and* dark palettes both get a coherent UI.
+pub fn ui_theme(cfg: &crate::config::Config) -> egui::Visuals {
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| -> egui::Color32 {
+        let c = |i: usize| {
+            ((a[i] * (1.0 - t) + b[i] * t) * 255.0).round().clamp(0.0, 255.0) as u8
+        };
+        egui::Color32::from_rgb(c(0), c(1), c(2))
+    };
+    let bg = cfg.background_color.to_f32();
+    let fg = cfg.foreground_color.to_f32();
+    let accent = cfg.accent_color.to_f32();
+    let tablist = cfg.tablist_background.to_f32();
+    let black = [0.0f32; 3];
+    let mut v = egui::Visuals::dark();
+    // Panels sit between the terminal background and the tab-strip colour;
+    // windows (config panel, popups) nudge up from the background so they
+    // read as raised without needing an opinionated grey.
+    v.panel_fill = mix(bg, tablist, 0.5);
+    v.window_fill = mix(bg, fg, 0.05);
+    v.window_stroke = egui::Stroke::new(1.0, mix(bg, fg, 0.25));
+    v.faint_bg_color = mix(bg, fg, 0.08);
+    // Text inputs darker than the background: they must read as wells.
+    v.extreme_bg_color = mix(bg, black, 0.35);
+    v.hyperlink_color = mix(accent, fg, 0.2);
+    v.selection.bg_fill = mix(bg, accent, 0.4);
+    v.selection.stroke = egui::Stroke::new(1.0, mix(bg, fg, 0.9));
+    {
+        let mut w = v.widgets.clone();
+        let base = mix(bg, fg, 0.06);
+        w.inactive.bg_fill = base;
+        w.inactive.weak_bg_fill = base;
+        w.inactive.bg_stroke = egui::Stroke::new(1.0, mix(bg, fg, 0.2));
+        w.hovered.bg_fill = mix(bg, accent, 0.18);
+        w.hovered.weak_bg_fill = mix(bg, accent, 0.18);
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, mix(bg, accent, 0.6));
+        w.active.bg_fill = mix(bg, accent, 0.3);
+        w.active.weak_bg_fill = mix(bg, accent, 0.3);
+        w.active.bg_stroke = egui::Stroke::new(1.0, mix(bg, accent, 0.8));
+        w.open.bg_fill = base;
+        w.open.weak_bg_fill = base;
+        w.open.bg_stroke = egui::Stroke::new(1.0, mix(bg, accent, 0.6));
+        v.widgets = w;
+    }
+    {
+        let non = &mut v.widgets.noninteractive;
+        non.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(
+            (fg[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (fg[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (fg[2].clamp(0.0, 1.0) * 255.0) as u8));
+        // 0.37 derives weak/disabled text by tinting fg_stroke towards
+        // weak_bg_fill, so setting the base above themes all three at once.
+    }
+    v
+}
+
+/// Mix two egui colours in plain sRGB bytes (card fills etc. derived from
+/// the live visuals; perceptual subtleties are lost on 8-bit UI fills).
+fn mix_c(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let (x, y) = (a.to_array(), b.to_array());
+    let c = |i: usize| (x[i] as f32 * (1.0 - t) + y[i] as f32 * t).round().clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgba_unmultiplied(c(0), c(1), c(2), 255)
 }
 
 pub fn switcher_screen(
@@ -718,14 +796,20 @@ fn card_button(
     accent: egui::Color32,
     pick: &mut Option<usize>,
 ) {
+    // Fills derived from the frame's (themed) visuals: cards are the
+    // background lifted by successively more foreground the more they
+    // matter, so a Nord terminal gets a blue-grey switcher and a gruvbox
+    // one gets a brown it without any card knowing a palette.
+    let vis = ui.style().visuals.clone();
+    let fg = vis.text_color();
     let fill = if selected {
-        egui::Color32::from_rgb(42, 44, 54)
+        mix_c(vis.panel_fill, fg, 0.16)
     } else if card.active {
-        egui::Color32::from_rgb(31, 33, 41)
+        mix_c(vis.panel_fill, fg, 0.10)
     } else {
-        egui::Color32::from_rgb(23, 24, 30)
+        mix_c(vis.panel_fill, fg, 0.05)
     };
-    let stroke = if selected { accent } else { egui::Color32::from_rgb(68, 70, 84) };
+    let stroke = if selected { accent } else { mix_c(vis.panel_fill, fg, 0.25) };
     let (rect, r) = ui.allocate_exact_size(size, egui::Sense::hover());
 
     // Background and border. Drawn, not a `Frame`: a `Frame` sizes itself
@@ -828,8 +912,11 @@ impl egui::Widget for CardFace<'_> {
     }
 }
 
-/// The card's text, drawn as pre-laid-out galleys (the same `line_galley`
-/// call `measure_card` used, so the drawn width is the measured width).
+/// The card's text, drawn as pre-laid-out galleys (the same `line_galley_f`
+/// calls `measure_card` made, so the measured size is what gets painted).
+/// The header is one row: name left, index right, pinned to the card's
+/// inner edges (which the thumbnail may make wider than the text column -
+/// the number rides the card's right edge, not the text's).
 fn text_column(
     ui: &mut egui::Ui,
     index: usize,
@@ -841,45 +928,43 @@ fn text_column(
     } else {
         ui.style().visuals.text_color()
     };
-    let cap_color = ui.style().visuals.weak_text_color();
-    ui.vertical(|ui| {
-        let mut title = if card.marker {
-            format!("* {}", card.title)
-        } else {
-            card.title.clone()
-        };
-        if title.is_empty() {
-            title = format!("tab {}", index + 1);
-        }
-        // Same galley recipe as measure_card: identical string in, identical
-        // line breaks out, so the measured height is what gets painted.
+    let weak_color = ui.style().visuals.weak_text_color();
+    let title = if card.marker {
+        format!("* {}", card.title)
+    } else {
+        card.title.clone()
+    };
+    let fid = header_font(ui);
+    let g_title = line_galley_f(ui, &title, fid.clone(), title_color, 2, false);
+    let g_num = line_galley_f(ui, &format!("{}", index + 1), fid, weak_color, 1, true);
+    let avail = ui.available_width();
+    let top = ui.cursor().min.y;
+    let left = ui.cursor().min.x;
+    let th = g_title.size().y.max(g_num.size().y);
+    if !title.is_empty() {
+        ui.put(
+            egui::Rect::from_min_size(egui::pos2(left, top), g_title.size()),
+            egui::Label::new(g_title),
+        );
+    }
+    ui.put(
+        egui::Rect::from_min_size(
+            egui::pos2(left + (avail - g_num.size().x).max(0.0), top),
+            g_num.size(),
+        ),
+        egui::Label::new(g_num),
+    );
+    // Advance the layout cursor past the header row (the galleys were put,
+    // which paints without moving the cursor).
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+        egui::pos2(left, top),
+        egui::vec2(avail, th),
+    ));
+    if let Some(cwd) = &card.cwd {
         ui.add(egui::Label::new(line_galley(
-            ui,
-            &title,
-            egui::TextStyle::Body,
-            title_color,
-            2,
-            true,
+            ui, cwd, egui::TextStyle::Small, weak_color, 1, false,
         )));
-        ui.add(egui::Label::new(line_galley(
-            ui,
-            &format!("tab {}", index + 1),
-            egui::TextStyle::Small,
-            cap_color,
-            1,
-            false,
-        )));
-        if let Some(cwd) = &card.cwd {
-            ui.add(egui::Label::new(line_galley(
-                ui,
-                cwd,
-                egui::TextStyle::Small,
-                egui::Color32::from_rgb(98, 102, 120),
-                1,
-                false,
-            )));
-        }
-    });
+    }
 }
 
 /// Upload one pass's texture deltas, free the released textures, and clear
