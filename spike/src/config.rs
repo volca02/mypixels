@@ -138,6 +138,8 @@ impl Default for Config {
         bind("last_tab", &["MOD1+End"]);
         bind("close_tab", &["CONTROL+ALT+x", "CONTROL+ALT+q"]);
         bind("new_tab", &["CONTROL+ALT+z", "CONTROL+SHIFT+t"]);
+        bind("new_window", &["CONTROL+SHIFT+n"]);
+        bind("send_tab_to_window", &["MOD1+SHIFT+w"]);
         // Copy/paste follow the VTE and GNOME Terminal bindings the original gets
         // from GTK, so the fingers that already know them keep working. Selecting
         // text feeds the *primary* buffer separately and needs no key.
@@ -777,6 +779,23 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
 mod tests {
     use super::*;
     use winit::keyboard::ModifiersState as M;
+
+    #[test]
+    fn window_actions_are_bound_by_default() {
+        let cfg = Config::default();
+        assert_eq!(
+            find_action(&cfg.bindings, &Key::Character("N".into()), M::CONTROL | M::SHIFT, false)
+                .as_deref(),
+            Some("new_window"),
+            "Ctrl+Shift+n (what winit reports for the shifted key) opens a window"
+        );
+        assert_eq!(
+            find_action(&cfg.bindings, &Key::Character("W".into()), M::ALT | M::SHIFT, false)
+                .as_deref(),
+            Some("send_tab_to_window"),
+            "Alt+Shift+w sends the tab to another window"
+        );
+    }
 
     #[test]
     fn clipboard_shortcuts_accept_the_shifted_keys_winit_reports() {

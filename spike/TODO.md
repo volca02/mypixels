@@ -16,22 +16,22 @@ Current priorities:
 2. **Clipboard and selection (P0, completed).** Native Wayland plus compatibility
    paths, asynchronous paste with stable destinations, separate primary,
    bracketed paste, scrollback, and real keyboard/mouse tests. Details below.
-3. **Everyday interaction (P1).** Proper editable rename input with selected
-   initial text and clipboard support; IME; selection autoscroll at the
-   viewport edge. Done along the way: terminal mouse reporting with Shift
-   bypass, and HiDPI transitions (every metric is derived from the window
-   scale factor, and `ScaleFactorChanged` re-runs the font rebuilds).
-4. **Tab strip usability (P1).** Keep the active tab reachable with many tabs,
-   implement configured wrapping/placement, and verify full title updates and
-   consistent hover/focus states. Preserve the compact layout and familiar keys.
+3. **Everyday interaction (P1).** Done: editable rename input with selected
+   initial text (egui), selection autoscroll whose speed answers the pull,
+   drag-to-reorder tabs, select-all, Ctrl+wheel zoom, font dialog, themes.
+   Open: **IME** and keyboard-grown text selection (Shift+arrows).
+4. **Tab strip usability (P1).** Open: keep the active tab reachable with many
+   tabs, configured wrapping/placement, verify title-update cadence.
 5. **Search (P2).** A reusable inline text input, incremental search, next/previous
    matches, visible match state, and cancellation back to the terminal.
-6. **Multi-window (P2).** The original is multi-window (Gtk.Application):
-   `new_window`, `send_tab_to_window` with a window picker, tab moves between
-   windows. The rewrite is single-window; this needs a window manager in `App`
-   before anything else on this line.
-7. **Small parity gaps (P3).** See the feature-parity audit below: Ctrl+wheel
-   zoom, font selector, `bg_tint_color`, Wayland app-id and window icon, bell.
+6. **Multi-window: shipped.** One process hosts many windows: `Ctrl+Shift+n`,
+   `mypixels`/`mypixels -n` joining over D-Bus, `Alt+Shift+w` send-tab
+   (direct with two windows, egui picker with three+, "New window" detaches),
+   X11 drag a tab onto another window or off the border to detach.
+   Open: **TabMonitor** (Alt+Shift+m floating live snapshot).
+7. **Small parity gaps: closed.** Ctrl+wheel zoom, font selector,
+   `bg_tint_color`, Wayland app-id + window icon, visual bell, named
+   themes with XDG discovery and derived palettes.
 
 # Feature parity gaps (audit against the original source)
 
@@ -40,9 +40,13 @@ hide and placement, opacity, palette + pywal + themes + live reload, the full
 selection model, async clipboard, scrollback, cursor blink, the Alt-held
 switcher with live real-frame previews, and HiDPI.
 
-Working-tree state (uncommitted as of the audit): two-phase switcher render
-and scale-aware thumbnails, plus the terminal mouse reporting below. The
-last commit is the HiDPI scale fix (`Honor the window scale factor ...`).
+Known warts: a moved shell keeps its spawn-time `$MYPIXELS_WINDOW`, so
+`mypixels` typed in a window that RECEIVED a moved tab opens new tabs in the
+tab's old window (running environments cannot change; noted in `move_tab`).
+Cross-window tab drag needs out-of-window pointer motion: works on X11, not
+under Wayland's pointer confinement -- `Alt+Shift+w` is that gesture there.
+Dragging a tab onto foreign applications would need the compositor
+data-device protocol.
 
 ## Interaction
 
@@ -61,17 +65,25 @@ last commit is the HiDPI scale fix (`Honor the window scale factor ...`).
       bypass) -- it needs a machine with xdotool and xsel, which the
       headless build box lacks.
 - [ ] **IME.** GTK/VTE give it free; the rewrite has none.
-- [ ] **Selection autoscroll** when dragging outside the viewport; keyboard
-      selection.
-- [ ] **Ctrl+wheel zoom** (original zooms the font; the wheel only scrolls
-      here). Zoom keys already exist.
-- [ ] **Font selector** (Ctrl+Shift+f in the original: a font chooser that
-      rewrites `term_font`).
+- [x] **Selection autoscroll.** Dragging the selection edge into a band at
+      either grid edge scrolls that way, faster the deeper the pointer is
+      driven into the border (the pointer cannot leave the window, so depth
+      is the honest measure of the pull). The first version had both signs
+      inverted and dead trigger zones; see `autoscroll_tick` and its tests.
+      Keyboard-grown selection remains open (Shift+arrows) -- select-all
+      (`CONTROL+SHIFT+A`) exists.
+- [x] **Ctrl+wheel zoom.** Whole-point font steps, matching the zoom keys.
+- [x] **Font selector.** A classic family/style/size dialog with live preview
+      for both terminal and tab fonts, rewriting `term_font` / `tablist_font`.
 
 ## Windows
 
-- [ ] **`new_window`** (Ctrl+Shift+n) and **`send_tab_to_window`**
-      (Alt+Shift+w, window-picker dialog): multi-window support, see priority 6.
+- [x] **`new_window`** (Ctrl+Shift+n) and **`send_tab_to_window`**
+      (Alt+Shift+w): two windows means "to the other one", three+ opens the
+      egui picker with a "New window" detach entry. On X11 a tab can also be
+      dragged out of the window -- over another window it lands in that
+      window's strip, over nothing it detaches into a fresh window. An
+      emptied window closes; the last window's close ends the session.
 - [ ] **TabMonitor** (Alt+Shift+m): a floating window with a live 5fps
       snapshot of one tab. The offscreen preview machinery already renders a
       complete frame per tab, so this is a window + a copy of the texture.
@@ -90,17 +102,18 @@ last commit is the HiDPI scale fix (`Honor the window scale factor ...`).
       is open) moves by grid rows and predates this item; outside the switcher
       those keys remain linear prev/next, which is all a one-row strip can
       mean.
-- [ ] **Drag-to-reorder tabs** (original: `set_tab_reorderable`; here it is
-      keyboard-only).
+- [x] **Drag-to-reorder tabs.** Press arms, release decides; live swaps keep
+      neighbour order stable across wobble, and a press never steals the
+      scrolled view mid-reorder.
 
 ## Configuration / identity
 
-- [ ] **`bg_tint_color` is parsed and never applied** (the original tints the
-      background with it); dead key in the rewrite.
-- [ ] **Wayland app-id**: the original is `app-id="mypixels"` (Gtk.Application);
-      this binary is `spike`, so compositor rules written for the original do
-      not match. Check what winit 0.30 exposes before promising it.
-- [ ] **Window icon** (the original has a favicon); no bell handling either.
+- [x] **`bg_tint_color`** tints the terminal background when no palette
+      overrides it, as in the original.
+- [x] **Wayland app-id**: `with_name("mypixels", "mypixels")` sets app-id on
+      Wayland and WM_CLASS on X11.
+- [x] **Window icon** (generated in code, no asset) and **visual bell** (a
+      brief background lift).
 - [ ] `autohide_delay` is a dead key in *both* versions (the user config
       carries it); not a gap.
 

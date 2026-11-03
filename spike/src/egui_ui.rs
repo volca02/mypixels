@@ -75,6 +75,60 @@ pub struct UiState {
     /// A font row toggled its popup closed on button-press; the matching
     /// release must not count as a fresh open click (see `font_row`).
     font_suppress: bool,
+    /// The send-tab-to-window picker (Alt+Shift+w). Items and targets are
+    /// filled by the app when it opens the box; a click reports the target
+    /// window index, usize::MAX = "detach into a new window".
+    pub move_open: bool,
+    pub move_items: Vec<String>,
+    pub move_targets: Vec<usize>,
+    pub move_pos: [f32; 2],
+    /// Some(Some(t)) = move to target t, Some(None) = cancelled, None =
+    /// still open. Same shape as `rename_out` for the same reason: the
+    /// app must learn about dismissal, not only about choice.
+    pub move_out: Option<Option<usize>>,
+}
+
+/// The window picker for "send tab to window": one small frameless list,
+/// every live window plus an escape hatch into a new one. Click elsewhere
+/// or Escape and nothing happens, exactly like the rename box.
+pub fn move_pick_box(ui: &egui::Ui, st: &mut UiState) {
+    if !st.move_open {
+        st.move_out = None;
+        return;
+    }
+    let ctx = ui.ctx();
+    let pos = egui::pos2(st.move_pos[0], st.move_pos[1]);
+    let mut out: Option<Option<usize>> = None;
+    let mut area = egui::Rect::NOTHING;
+    egui::Window::new("move_tab_pick")
+        .id(egui::Id::new("move_tab_pick_box"))
+        .title_bar(false)
+        .movable(false)
+        .resizable(false)
+        .fixed_pos(pos)
+        .constrain(false)
+        .show(&ctx, |ui| {
+            ui.label("Send tab to:");
+            for (i, label) in st.move_items.iter().enumerate() {
+                if ui.button(label).clicked() {
+                    out = Some(Some(st.move_targets[i]));
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                out = Some(None);
+            }
+            area = ui.response().rect;
+        });
+    if out.is_none()
+        && ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape)
+                || (i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| !area.expand(8.0).contains(p)))
+        })
+    {
+        out = Some(None);
+    }
+    st.move_out = out;
 }
 
 /// The rename box: a small frameless window with one text field. Enter

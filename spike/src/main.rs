@@ -410,6 +410,10 @@ struct App {
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Daemon: tab/rise requests forwarded by other mypixels processes.
     session_rx: std::sync::mpsc::Receiver<session::Request>,
+    /// The egui window picker's answer, applied next frame by the drain
+    /// (which has the event loop; the draw path does not). usize::MAX =
+    /// detach into a fresh window.
+    pending_move: Option<usize>,
     /// Keeps the session-bus thread -- and with it the bus name -- alive for
     /// as long as the app runs.
     _session: Option<session::Server>,
@@ -650,6 +654,7 @@ impl App {
             last_activity,
             bell,
             session_rx,
+            pending_move: None,
             _session,
             modifiers: ModifiersState::empty(),
             program,
@@ -732,6 +737,96 @@ impl App {
     }
 
     /// Handle what other mypixels processes asked of this session.
+    /// Remove a window from the session: the wake-slot list first (dead
+    /// windows must not be woken, nor kept alive by it), then the window
+    /// itself; the last one exiting ends the session.
+    fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
+        if let Some(w) = self.wins[i].window.as_ref() {
+            let id = w.id();
+            self.window_slot.lock().unwrap().retain(|w| w.id() != id);
+        }
+        self.wins.remove(i);
+        self.cur = self.cur.min(self.wins.len().saturating_sub(1));
+        if self.wins.is_empty() {
+            event_loop.exit();
+        }
+    }
+
+    /// Hand a tab from one window to another. The tab object itself moves:
+    /// pty, child, terminal state, nothing respawned. The view follows the
+    /// tab (the user should see where it went, and an unfocused target
+    /// asks for attention), and a source window emptied of tabs closes.
+    /// The moved shell's $MYPIXELS_WINDOW still names the OLD window --
+    /// environment of a running process cannot change -- so `mypixels`
+    /// typed there afterwards opens tabs in the window it left. Known wart.
+    fn move_tab(
+        &mut self,
+        from: usize,
+        idx: usize,
+        to: usize,
+        insert: usize,
+        event_loop: &ActiveEventLoop,
+    ) {
+        if from == to || to >= self.wins.len() || idx >= self.wins[from].tabs.len() {
+            return;
+        }
+        let insert = insert.min(self.wins[to].tabs.len());
+        let flen = self.wins[from].tabs.len();
+        let active = self.wins[from].active;
+        let tab = self.wins[from].tabs.remove(idx);
+        log::info!("moved tab {:?} to window {}", tab.display_title(), to + 1);
+        self.wins[to].tabs.insert(insert, tab);
+        let emptied = self.wins[from].tabs.is_empty();
+        if !emptied {
+            self.wins[from].active = move_active_follow(flen, active, idx).unwrap_or(0);
+        }
+        let mut cur = to;
+        if emptied {
+            if to > from {
+                cur = to - 1;
+            }
+            self.close_window(from, event_loop);
+        }
+        self.cur = cur;
+        self.wins[cur].active = insert;
+        if let Some(w) = self.wins[cur].window.as_ref() {
+            if !self.wins[cur].focused {
+                w.request_user_attention(Some(winit::window::UserAttentionType::Critical));
+            }
+        }
+        for w in &self.wins {
+            if let Some(win) = &w.window {
+                win.request_redraw();
+            }
+        }
+    }
+
+    /// Which of this session's windows contains a GLOBAL point, and where
+    /// in that window's strip the point would insert a tab. Decorations
+    /// make outer_position a few pixels off from the inner origin; the use
+    /// (a drop target the width of a tab) forgives it.
+    fn win_at(&self, gx: f32, gy: f32) -> Option<(usize, usize)> {
+        for (i, w) in self.wins.iter().enumerate() {
+            let Some(win) = w.window.as_ref() else { continue };
+            let Ok(at) = win.outer_position() else { continue };
+            let size = win.outer_size();
+            let (x0, y0) = (at.x as f32, at.y as f32);
+            if gx < x0 || gx >= x0 + size.width as f32 || gy < y0 || gy >= y0 + size.height as f32 {
+                continue;
+            }
+            let lx = gx - x0;
+            let mut insert = w.tabs.len();
+            for (j, &(_, x1)) in w.tab_hits.iter().enumerate() {
+                if lx < x1 {
+                    insert = j;
+                    break;
+                }
+            }
+            return Some((i, insert));
+        }
+        None
+    }
+
     fn drain_session_requests(&mut self, event_loop: &ActiveEventLoop) {
         let mut opened = false;
         while let Ok(req) = self.session_rx.try_recv() {
@@ -780,7 +875,7 @@ impl App {
                     }
                     let cwd = cwd.map(std::path::PathBuf::from).filter(|p| p.is_dir());
                     log::info!("session: opened a remote window ({} windows now)", self.wins.len() + 1);
-                    self.make_window(event_loop, cmd, cwd);
+                    self.make_window(event_loop, cmd, cwd, true);
                     self.cur = self.wins.len() - 1;
                     opened = true;
                 }
@@ -1373,6 +1468,7 @@ impl App {
                         );
                     }
                     egui_ui::rename_box(ui, &mut egui.ui_state);
+                    egui_ui::move_pick_box(ui, &mut egui.ui_state);
                 });
                 // While the pointer is down on a slider, egui keeps asking
                 // for frames; forward that to winit's redraw path.
@@ -1395,8 +1491,18 @@ impl App {
                     }
                     window.request_redraw();
                 }
+                if let Some(pick) = egui.ui_state.move_out.take() {
+                    egui.ui_state.move_open = false;
+                    if let Some(t) = pick {
+                        // Deferred: making a window needs the event loop,
+                        // which the draw path does not have.
+                        self.pending_move = Some(t);
+                    }
+                    window.request_redraw();
+                }
                 let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open)
-                    || egui.ui_state.rename_open;
+                    || egui.ui_state.rename_open
+                    || egui.ui_state.move_open;
                 egui_ui::release_focus_if_closed(&ctx, egui.config_open, popup_open, &mut egui.open_prev);
                 full_output = Some(full);
             }
@@ -2404,6 +2510,47 @@ impl App {
         let n = self.wins[self.cur].tabs.len();
         match action {
             "new_tab" => self.add_tab(),
+            "new_window" => self.make_window(event_loop, None, None, true),
+            "send_tab_to_window" => {
+                if self.wins.len() < 2 {
+                    self.wins[self.cur].notice = Some((
+                        "No other window -- Ctrl+Shift+n opens one".to_string(),
+                        Instant::now(),
+                    ));
+                } else if self.wins.len() == 2 {
+                    // Exactly two: "to the other one" needs no dialog.
+                    let from = self.cur;
+                    let to = 1 - from;
+                    let idx = self.wins[from].active;
+                    let insert = self.wins[to].tabs.len();
+                    self.move_tab(from, idx, to, insert, event_loop);
+                } else {
+                    let mut items = Vec::new();
+                    let mut targets = Vec::new();
+                    for (i, w) in self.wins.iter().enumerate() {
+                        if i == self.cur {
+                            continue;
+                        }
+                        let title = w
+                            .tabs
+                            .get(w.active)
+                            .map(|t| t.display_title())
+                            .unwrap_or_else(|| "empty".to_string());
+                        items.push(format!("Window {} -- {} ({} tabs)", i + 1, title, w.tabs.len()));
+                        targets.push(i);
+                    }
+                    items.push("New window".to_string());
+                    targets.push(usize::MAX);
+                    if let Some(egui) = self.wins[self.cur].egui.as_mut() {
+                        let st = &mut egui.ui_state;
+                        st.move_items = items;
+                        st.move_targets = targets;
+                        st.move_pos = [12.0, self.tab_h + 6.0];
+                        st.move_open = true;
+                        st.move_out = None;
+                    }
+                }
+            }
             "copy" => {
                 if let Some(text) = self.wins[self.cur].tabs.get(self.wins[self.cur].active).and_then(|t| t.selected_text()) {
                     self.copy_text(clipboard::Kind::Clipboard, text);
@@ -2814,11 +2961,14 @@ impl App {
 /// One more window of this session: window, GPU, egui, and a first tab
     /// running `cmd` (default shell) in `cwd`. Called at startup and on the
     /// session bus' NewWindow -- `mypixels -n` from any shell lands here.
+    /// `with_tab` = false builds a bare window, for callers that immediately
+    /// hand it a tab of their own (detach-to-new-window).
     fn make_window(
         &mut self,
         event_loop: &ActiveEventLoop,
         cmd: Option<(String, Vec<String>)>,
         cwd: Option<std::path::PathBuf>,
+        with_tab: bool,
     ) {
         {
             // The metrics were computed at scale 1.0 and the window is
@@ -2916,7 +3066,8 @@ impl App {
                 notice: None,
                 focused: true,
             });
-            self.cur = 0;
+            // The newest window is the one the user just asked for.
+            self.cur = self.wins.len() - 1;
             self.init_gpu(event_loop, &window);
             let slot = Arc::clone(&self.window_slot);
             if self.theme_watcher.is_none() {
@@ -2945,10 +3096,13 @@ impl App {
             }
             }
             self.window_slot.lock().unwrap().push(Arc::clone(&window));
+            log::info!("session: window {} up", self.wins.len());
             self.sync_term_size();
-            // Every window of a session is born with one tab: the shell the
-            // request asked for, in the directory it asked from.
-            self.add_tab_with(cwd, cmd);
+            if with_tab {
+                // Every ordinary window is born with one tab: the shell the
+                // request asked for, in the directory it asked from.
+                self.add_tab_with(cwd, cmd);
+            }
         }
         let _ = event_loop;
     }
@@ -3009,6 +3163,23 @@ fn app_icon() -> Option<winit::window::Icon> {
 }
 
 /// Where `active` lands when tabs `a` and `b` trade places.
+/// Which index is active in a tab list after the tab at `removed` leaves
+/// for another window: slots after it shift down; if it WAS the active
+/// tab, the neighbour that slides into its place takes over; a list that
+/// held one tab simply has none (the window closes).
+fn move_active_follow(len: usize, active: usize, removed: usize) -> Option<usize> {
+    if len <= 1 {
+        return None;
+    }
+    if active > removed {
+        Some(active - 1)
+    } else if active < removed {
+        Some(active)
+    } else {
+        Some(active.min(len - 2))
+    }
+}
+
 fn swap_follow(a: usize, b: usize, active: usize) -> usize {
     if active == a {
         b
@@ -3218,7 +3389,7 @@ fn mouse_report_bytes(mode: TermMode, code: u16, col: u16, row: u16, release: bo
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.wins.is_empty() {
-            self.make_window(event_loop, None, None);
+            self.make_window(event_loop, None, None, true);
         }
     }
 
@@ -3278,17 +3449,25 @@ impl ApplicationHandler for App {
                 // A window closes; its tabs die with it (they are pty
                 // children and nowhere else to go). The session ends with
                 // the last window, like the original's GApplication.
-                self.wins.remove(self.cur);
-                self.cur = self.cur.min(self.wins.len().saturating_sub(1));
-                if self.wins.is_empty() {
-                    event_loop.exit();
-                }
+                self.close_window(self.cur, event_loop);
             },
             WindowEvent::RedrawRequested => {
                 self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
+                if let Some(target) = self.pending_move.take() {
+                    let from = self.cur;
+                    let idx = self.wins[from].active;
+                    if target == usize::MAX {
+                        self.make_window(event_loop, None, None, false);
+                        let to = self.wins.len() - 1;
+                        self.move_tab(from, idx, to, 0, event_loop);
+                    } else if target < self.wins.len() && target != from {
+                        let insert = self.wins[target].tabs.len();
+                        self.move_tab(from, idx, target, insert, event_loop);
+                    }
+                }
                 // Open the Alt-held switcher if the clock asked and Alt is
                 // still held (guards against the press/release race).
                 if self.switcher_show_req.swap(false, Ordering::SeqCst)
@@ -3483,6 +3662,45 @@ impl ApplicationHandler for App {
                 // leave the drag armed. A release without a reorder was a
                 // click: that is the moment the tab actually activates.
                 if let Some(idx) = self.wins[self.cur].tab_drag.take() {
+                    // Cross-window drop. X11 keeps reporting the pointer
+                    // while it is outside the window, so a release can name
+                    // one of our other windows (the tab moves there) or no
+                    // window at all (the tab detaches into a new one).
+                    // Wayland confines the pointer, so it never leaves and
+                    // this branch never fires there; Alt+Shift+w with the
+                    // picker is that gesture on Wayland.
+                    let outside = self.wins[self.cur]
+                        .window
+                        .as_ref()
+                        .and_then(|w| w.outer_position().ok().map(|_| w.outer_size()))
+                        .is_some_and(|size| {
+                            let (px, py) = self.wins[self.cur].pointer;
+                            px < 0.0
+                                || py < 0.0
+                                || px >= size.width as f32
+                                || py >= size.height as f32
+                        });
+                    if outside && idx < self.wins[self.cur].tabs.len() {
+                        if let Some(win) = self.wins[self.cur].window.as_ref() {
+                            if let Ok(at) = win.outer_position() {
+                                let (px, py) = self.wins[self.cur].pointer;
+                                let (gx, gy) = (at.x as f32 + px, at.y as f32 + py);
+                                match self.win_at(gx, gy) {
+                                    Some((to, insert)) if to != self.cur => {
+                                        self.move_tab(self.cur, idx, to, insert, event_loop);
+                                        return;
+                                    }
+                                    None => {
+                                        self.make_window(event_loop, None, None, false);
+                                        let to = self.wins.len() - 1;
+                                        self.move_tab(self.cur, idx, to, 0, event_loop);
+                                        return;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                     if !self.wins[self.cur].tab_drag_moved && idx < self.wins[self.cur].tabs.len() && idx != self.wins[self.cur].active {
                         let cur_active = self.wins[self.cur].active;
                         if let Some(t) = self.wins[self.cur].tabs.get_mut(cur_active) {
@@ -3952,6 +4170,15 @@ mod tests {
         assert_eq!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).map(|(d, _)| d), Some(1));
         assert_eq!(App::autoscroll_tick(1.0, 0.0, 400.0, 16.0), Some((1, 3))); // near the border: three
         assert!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).unwrap().1 <= cap);
+    }
+
+    #[test]
+    fn a_moved_tabs_window_chooses_a_new_active() {
+        assert_eq!(move_active_follow(1, 0, 0), None, "the window closes");
+        assert_eq!(move_active_follow(3, 2, 2), Some(1), "active leaves: the neighbour before");
+        assert_eq!(move_active_follow(3, 0, 2), Some(0), "another tab leaves: unaffected");
+        assert_eq!(move_active_follow(3, 2, 0), Some(1), "a lower tab leaves: shift down");
+        assert_eq!(move_active_follow(2, 1, 1), Some(0), "last index clamps after removal");
     }
 
     #[test]
