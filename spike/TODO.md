@@ -80,9 +80,16 @@ last commit is the HiDPI scale fix (`Honor the window scale factor ...`).
 
 ## Tab strip
 
-- [ ] **Multiline tab labels** (`multiline_tabs`, original wraps labels; the
-      key is not even parsed here) and **row navigation** for `prev_tab_row`/
-      `next_tab_row` (currently aliased to linear prev/next).
+- [x] **Multiline tab labels** and row navigation. What the original actually
+      does: the *strip* label is `line_wrap(False)` (one truncated line -- what
+      we always drew), and its `multiline_tabs` key does not exist there at
+      all; the wrapping happens on the **overview cards** (`line_wrap(True)`,
+      max width, centered), now reproduced: card titles take the full string
+      and wrap to two centered lines, ellipsizing only at the third. Row
+      navigation (`prev_tab_row`/`next_tab_row`, Alt+Up/Down while the switcher
+      is open) moves by grid rows and predates this item; outside the switcher
+      those keys remain linear prev/next, which is all a one-row strip can
+      mean.
 - [ ] **Drag-to-reorder tabs** (original: `set_tab_reorderable`; here it is
       keyboard-only).
 

@@ -386,6 +386,8 @@ fn line_galley(
     text: &str,
     font: egui::TextStyle,
     color: egui::Color32,
+    max_rows: usize,
+    center: bool,
 ) -> std::sync::Arc<egui::Galley> {
     let font_id = egui::FontSelection::Style(font).resolve(ui.style());
     let mut job = egui::text::LayoutJob::simple(
@@ -394,8 +396,11 @@ fn line_galley(
         color,
         TITLE_MAX,
     );
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
+    job.wrap.max_rows = max_rows;
+    job.wrap.break_anywhere = max_rows == 1;
+    if center {
+        job.halign = egui::Align::Center;
+    }
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
@@ -415,12 +420,16 @@ fn measure_card(ui: &egui::Ui, index: usize, card: &SwitcherCard) -> (f32, f32) 
     if title.is_empty() {
         title = format!("tab {}", index + 1);
     }
-    let g_title = line_galley(ui, &title, egui::TextStyle::Body, text_color);
+    // Titles wrap to two centered lines (the original's card labels: line
+    // wrap on, max_width_chars, centered); captions and cwd stay one line.
+    let g_title = line_galley(ui, &title, egui::TextStyle::Body, text_color, 2, true);
     let g_cap = line_galley(
         ui,
         &format!("tab {}", index + 1),
         egui::TextStyle::Small,
         weak_color,
+        1,
+        false,
     );
     let g_cwd = card.cwd.as_ref().map(|c| {
         line_galley(
@@ -428,6 +437,8 @@ fn measure_card(ui: &egui::Ui, index: usize, card: &SwitcherCard) -> (f32, f32) 
             c,
             egui::TextStyle::Small,
             egui::Color32::from_rgb(98, 102, 120),
+            1,
+            false,
         )
     });
     let w = g_title.size().x
@@ -719,17 +730,23 @@ fn text_column(
         if title.is_empty() {
             title = format!("tab {}", index + 1);
         }
+        // Same galley recipe as measure_card: identical string in, identical
+        // line breaks out, so the measured height is what gets painted.
         ui.add(egui::Label::new(line_galley(
             ui,
             &title,
             egui::TextStyle::Body,
             title_color,
+            2,
+            true,
         )));
         ui.add(egui::Label::new(line_galley(
             ui,
             &format!("tab {}", index + 1),
             egui::TextStyle::Small,
             cap_color,
+            1,
+            false,
         )));
         if let Some(cwd) = &card.cwd {
             ui.add(egui::Label::new(line_galley(
@@ -737,6 +754,8 @@ fn text_column(
                 cwd,
                 egui::TextStyle::Small,
                 egui::Color32::from_rgb(98, 102, 120),
+                1,
+                false,
             )));
         }
     });

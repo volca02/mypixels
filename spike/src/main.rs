@@ -1198,18 +1198,12 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| {
-                    let mut title = t.display_title();
-                    let limit = if i == self.active {
-                        self.config.tab_title_short_current
-                    } else {
-                        self.config.tab_title_max_length
-                    };
+                    let title = t.display_title();
+                    // No strip truncation here: the strip's character budget
+                    // is not the card's. The card lays the full title out and
+                    // wraps it to two lines, ellipsizing only what a third
+                    // line would need -- the original's overview labels.
                     let cwd_line = t.current_dir().filter(|c| c != &title);
-                    if limit > 0 && title.chars().count() > limit {
-                        title =
-                            title.chars().take(limit).collect::<String>()
-                                + &self.config.tab_shorten_str;
-                    }
                     let thumb = self
                         .sw_thumbs
                         .get(i)
