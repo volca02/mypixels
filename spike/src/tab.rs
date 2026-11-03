@@ -69,12 +69,24 @@ impl EventListener for SpikeListener {
 }
 
 /// Static-ish per-tab pty options.
-fn pty_options(program: String, args: Vec<String>, cwd: Option<std::path::PathBuf>) -> Options {
+fn pty_options(
+    program: String,
+    args: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+    window: u32,
+) -> Options {
+    let mut env = HashMap::new();
+    if window > 0 {
+        // The shell now knows which window it lives in, so `mypixels` typed
+        // in it joins THIS window rather than whichever is the session's
+        // first. 0 (standalone) deliberately says nothing: nothing to join.
+        env.insert("MYPIXELS_WINDOW".to_string(), window.to_string());
+    }
     Options {
         shell: Some(Shell::new(program, args)),
         working_directory: cwd,
         drain_on_exit: false,
-        env: HashMap::new(),
+        env,
     }
 }
 
@@ -111,6 +123,7 @@ impl Tab {
         shared: &SpikeListener,
         history: usize,
         cwd: Option<std::path::PathBuf>,
+        window: u32,
     ) -> Tab {
         let listener = SpikeListener {
             window: Arc::clone(&shared.window),
@@ -131,7 +144,7 @@ impl Tab {
         )));
 
         tty::setup_env();
-        let pty = tty::new(&pty_options(program, args, cwd), window_size, tab_id as u64)
+        let pty = tty::new(&pty_options(program, args, cwd, window), window_size, tab_id as u64)
             .expect("failed to open pty");
 
         let title = Arc::clone(&listener.title);

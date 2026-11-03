@@ -400,6 +400,9 @@ struct App {
     /// Keeps the session-bus thread -- and with it the bus name -- alive for
     /// as long as the app runs.
     _session: Option<session::Server>,
+    /// This window's slot once the bus thread has claimed one (0 = not yet /
+    /// never). Tabs pass it to their shells as $MYPIXELS_WINDOW.
+    session_index: Arc<std::sync::atomic::AtomicU32>,
     /// The tab drag crossed into another cell, so the press has become a
     /// reorder and the release must not also count as a click.
     tab_drag_moved: bool,
@@ -521,19 +524,24 @@ impl App {
             .take_while(|a| a.starts_with('-'))
             .any(|a| a == "--standalone" || a == "-s");
         let (session_tx, session_rx) = std::sync::mpsc::channel();
-        let _session = if standalone {
-            None
+        let (_session, session_index) = if standalone {
+            (None, Arc::new(std::sync::atomic::AtomicU32::new(0)))
         } else {
-            session::bus_name().and_then(|name| {
-                let slot = Arc::clone(&window_slot);
-                session::start(&name, session_tx, move || {
-                    if let Ok(slot) = slot.lock() {
-                        if let Some(w) = slot.as_ref() {
-                            w.request_redraw();
+            session::bus_name()
+                .and_then(|name| {
+                    let slot = Arc::clone(&window_slot);
+                    session::start(&name, session_tx, move || {
+                        if let Ok(slot) = slot.lock() {
+                            if let Some(w) = slot.as_ref() {
+                                w.request_redraw();
+                            }
                         }
-                    }
+                    })
                 })
-            })
+                .map(|(srv, idx)| (Some(srv), idx))
+                .unwrap_or_else(|| {
+                    (None, Arc::new(std::sync::atomic::AtomicU32::new(0)))
+                })
         };
         let shared = SpikeListener {
             window: Arc::clone(&window_slot),
@@ -668,6 +676,7 @@ impl App {
             tab_drag: None,
             session_rx,
             _session,
+            session_index,
             tab_drag_moved: false,
             autoscroll_next: None,
             fifo_egui_events: Vec::new(),
@@ -742,6 +751,7 @@ impl App {
             &self.listener(),
             self.config.scrollback_lines,
             cwd,
+            self.session_index.load(std::sync::atomic::Ordering::SeqCst),
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -3621,23 +3631,40 @@ fn main() {
         println!(
             "usage: mypixels [options] [command args...]\n\n\
 Options:\n  \
+  -n, --new-window   open a new window instead of joining the session\n  \
   -s, --standalone   run a private instance: never join or host a session\n  \
   -h, --help         show this text\n\n\
-Without --standalone, a mypixels already running on this display is found\n\
+Without flags, a mypixels window already running on this display is found\n\
 over D-Bus and asked to open a tab for this command, in this directory.\n\
-With none, this process becomes that session."
+Typed inside a window, the tab opens in that same window. With no session\n\
+to answer -- or with -n -- this process becomes a window of the session."
         );
         return;
     }
-    // Daemon mode, client half: if this display already hosts a mypixels
-    // session, hand it the command (in this working directory) and exit.
-    // Anything the bus cannot answer -- no bus, no session, a session too
-    // old to speak this protocol -- means "run locally", never "lose the
-    // command".
-    if !flags.iter().any(|a| a == "--standalone" || a == "-s") {
+    // Daemon mode, client half: if the window this command was typed in (or,
+    // outside any terminal, the session itself) is reachable, hand it the
+    // command and exit. Anything the bus cannot answer -- no bus, no such
+    // window, a session too old to speak this protocol -- means "become a
+    // window yourself", never "lose the command". -n skips asking entirely:
+    // an explicit second window.
+    let standalone = flags.iter().any(|a| a == "--standalone" || a == "-s");
+    if !standalone && !flags.iter().any(|a| a == "--new-window" || a == "-n") {
         let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
         if session::remote_open(cwd, positional_terms()) {
             return;
+        }
+    }
+    // Running our own window from here. The shells this window spawns must
+    // describe THIS window: a joiner's inherited $MYPIXELS_WINDOW would
+    // point at the window we left, and --standalone must point at no
+    // session at all (0). The bus thread overwrites 0 with the real slot
+    // number in each tab's own environment (see Tab::new). Safe: no other
+    // thread of this process exists yet.
+    unsafe {
+        if standalone {
+            std::env::set_var("MYPIXELS_WINDOW", "0");
+        } else {
+            std::env::remove_var("MYPIXELS_WINDOW");
         }
     }
     let event_loop = EventLoop::new().expect("event loop");

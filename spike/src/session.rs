@@ -9,12 +9,20 @@
 //! current session" is for. (The original opened a new window there; that
 //! lands properly when the port has real multi-window support.)
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{mpsc, Arc};
 
 /// Serves the bus name on a dedicated thread: zbus is async-only, so the
 /// thread owns a `block_on` future, and requests cross over on a channel the
 /// event loop drains.
 pub struct Server;
+
+/// A window's place in the session: 1 is the session proper (the bare
+/// display name), 2.. run under numbered suffixes. Tabs hand their shells
+/// this number in $MYPIXELS_WINDOW, so a `mypixels` typed in a shell joins
+/// *its* window, not whatever happens to be the primary -- and a second
+/// window can exist long before the single-window engine learns to hold two.
+pub type SessionIndex = Arc<AtomicU32>;
 
 pub enum Request {
     /// Open a tab running `argv` (empty = the default shell), starting in
@@ -39,6 +47,24 @@ pub fn bus_name() -> Option<String> {
     bus_name_for(&disp)
 }
 
+/// Name of a window's bus slot. Window 1 owns the bare name -- the session
+/// everyone finds when they have no better idea.
+pub fn slot_name(base: &str, index: u32) -> String {
+    if index <= 1 {
+        base.to_string()
+    } else {
+        format!("{base}_{index}")
+    }
+}
+
+/// Which window this process was launched *from*: inherited by every shell
+/// from its tab's window. 0 marks a standalone window's children -- a tab
+/// in a --standalone instance joins nothing, not even a foreign session.
+/// Unset means "outside any terminal": join the session's first window.
+pub fn launch_window() -> Option<u32> {
+    std::env::var("MYPIXELS_WINDOW").ok()?.trim().parse::<u32>().ok()
+}
+
 fn bus_name_for(disp: &str) -> Option<String> {
     let mut safe: String = disp
         .chars()
@@ -56,34 +82,50 @@ fn bus_name_for(disp: &str) -> Option<String> {
 /// errors -- mypixels with a broken or absent session bus is still a
 /// terminal.
 pub fn start(
-    name: &str,
+    base: &str,
     tx: mpsc::Sender<Request>,
     wake: impl Fn() + Send + 'static,
-) -> Option<Server> {
-    let name = name.to_string();
+) -> Option<(Server, SessionIndex)> {
+    let base = base.to_string();
+    let index: SessionIndex = Arc::new(AtomicU32::new(0));
+    let thread_index = Arc::clone(&index);
     std::thread::Builder::new()
         .name("session-dbus".into())
         .spawn(move || {
-            if let Err(e) = futures::executor::block_on(serve(&name, tx, wake)) {
+            if let Err(e) = futures::executor::block_on(serve(&base, thread_index, tx, wake)) {
                 log::warn!("session bus: {e}; running without single-instance");
             }
         })
         .ok()?;
-    Some(Server)
+    Some((Server, index))
 }
 
-async fn serve(name: &str, tx: mpsc::Sender<Request>, wake: impl Fn()) -> zbus::Result<()> {
+async fn serve(
+    base: &str,
+    index: SessionIndex,
+    tx: mpsc::Sender<Request>,
+    wake: impl Fn(),
+) -> zbus::Result<()> {
     let conn = zbus::Connection::session().await?;
-    // The plain request queues nothing: if another session holds the name,
-    // this comes back an error (name taken) and we simply are not the
-    // session -- which is the normal state of the second, third, ... window
-    // request, not a failure.
-    match conn.request_name(name).await {
-        Ok(()) => log::info!("session registered as {name}"),
-        Err(e) => {
-            log::debug!("session {name} not acquired ({e}); another instance is up");
-            return Ok(());
+    // Take the lowest free window slot. Plain requests queue nothing on the
+    // bus, so each try answers immediately: a taken slot is the normal lot of
+    // every window after the first, not a failure. 64 windows deep is a
+    // terminal session problem no bus policy will outvote.
+    let mut name = String::new();
+    for want in 1..=64u32 {
+        name = slot_name(base, want);
+        match conn.request_name(&*name).await {
+            Ok(()) => {
+                index.store(want, Ordering::SeqCst);
+                log::info!("session registered as {name} (window {want})");
+                break;
+            }
+            Err(e) => log::debug!("slot {name} unavailable ({e})"),
         }
+    }
+    if index.load(Ordering::SeqCst) == 0 {
+        log::warn!("no free session slot for {base}; this window hosts nothing");
+        return Ok(());
     }
     let mut stream = zbus::MessageStream::from(&conn);
     while let Some(msg) = futures::StreamExt::next(&mut stream).await {
@@ -132,8 +174,23 @@ async fn serve(name: &str, tx: mpsc::Sender<Request>, wake: impl Fn()) -> zbus::
 /// locally. Errors are reported and also answered with false: a bus that
 /// throws is a reason to run, not a reason to lose the user's command.
 pub fn remote_open(cwd: Option<String>, argv: Vec<String>) -> bool {
-    let Some(name) = bus_name() else { return false };
-    match futures::executor::block_on(remote_open_async(&name, cwd, argv)) {
+    let Some(base) = bus_name() else { return false };
+    // A shell carries its window's number; outside any terminal, the session
+    // proper (window 1) is the addressee. 0 means "inside a --standalone
+    // window": that window joined no session, so neither do its tabs.
+    match launch_window() {
+        Some(0) => return false,
+        Some(index) => return try_slot(&slot_name(&base, index), cwd, argv),
+        None => {
+            // Outside a terminal, or a shell whose window died mid-life: the
+            // session proper answers if anybody home is there.
+            return try_slot(&slot_name(&base, 1), cwd, argv);
+        }
+    }
+}
+
+fn try_slot(name: &str, cwd: Option<String>, argv: Vec<String>) -> bool {
+    match futures::executor::block_on(remote_open_async(name, cwd, argv)) {
         Ok(sent) => sent,
         Err(e) => {
             log::warn!("session lookup failed ({e}); starting a new instance");
@@ -182,6 +239,12 @@ async fn remote_open_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_slots_number_from_the_session_up() {
+        assert_eq!(slot_name("com.x.d_wayland_0", 1), "com.x.d_wayland_0");
+        assert_eq!(slot_name("com.x.d_wayland_0", 2), "com.x.d_wayland_0_2");
+    }
 
     #[test]
     fn display_scopes_the_bus_name() {
