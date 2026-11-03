@@ -427,6 +427,12 @@ struct App {
     ripple: Option<Ripple>,
     /// Cell the cursor was on in the last drawn frame, for move detection.
     last_cursor: Option<(u32, u32)>,
+    /// Last keypress that carried a real modifier (ctrl/alt/super). The
+    /// ripple listens only to these: ordinary typing moves the cursor
+    /// several times a second and pulsing at every letter turns a pointer
+    /// into a strobe. Modifier chords - word jumps, meta-f, search hops -
+    /// are precisely the moves the eye wants help catching.
+    last_mod_key: Option<Instant>,
     pending_move: Option<usize>,
     /// A context-menu choice, run by the drain (which has the event loop).
     pending_action: Option<String>,
@@ -675,6 +681,7 @@ impl App {
             pending_action: None,
             ripple: None,
             last_cursor: None,
+            last_mod_key: None,
             _session,
             modifiers: ModifiersState::empty(),
             program,
@@ -1905,7 +1912,8 @@ impl App {
             // Re-arm the pulse only on a real cell-to-cell move; appearing
             // or vanishing (focus lost, app hid it) is not movement.
             let cell = (cx, cy);
-            if self.last_cursor.is_some_and(|p| p != cell) {
+            let modded = self.last_mod_key.is_some_and(|t| t.elapsed().as_millis() < 300);
+            if modded && self.last_cursor.is_some_and(|p| p != cell) {
                 self.ripple = Some(Ripple {
                     x: cx as f32 * self.cell_w + self.cell_w * 0.5,
                     y: strip_h + cy as f32 * self.cell_h + self.cell_h * 0.5,
@@ -2598,6 +2606,18 @@ impl App {
             .get(self.wins[self.cur].active)
             .is_some_and(|t| t.term.lock().mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR));
         if let Some(bytes) = key_bytes(key, self.modifiers, app_cursor) {
+            // Chord detector for the cursor ripple: a key that CARRIES a
+            // modifier (ctrl+arrow, meta-f...) - not a bare modifier key
+            // being pressed, which arrives here too as Named(Control) and
+            // must not arm anything (it encodes to no bytes, so key_bytes
+            // has already said no by this point).
+            if self.modifiers.intersects(
+                winit::keyboard::ModifiersState::CONTROL
+                    | winit::keyboard::ModifiersState::ALT
+                    | winit::keyboard::ModifiersState::SUPER,
+            ) {
+                self.last_mod_key = Some(Instant::now());
+            }
             // Typing counts as activity: keep the cursor solid (no blink)
             // right after a keypress.
             *self.last_activity.lock().unwrap() = std::time::Instant::now();
