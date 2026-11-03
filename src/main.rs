@@ -338,6 +338,8 @@ struct Win {
     notice: Option<(String, Instant)>,
     /// Winit's focus report. The switcher and the attention request consult
     /// it, so a background window's blink never steals a foreground gesture.
+    /// Tab cell ringing a red pulse after a BEL arrived unseen (drain_bell_pings).
+    bell_pulse: Option<(usize, Instant)>,
     focused: bool,
 }
 
@@ -415,6 +417,8 @@ struct App {
     last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
     /// last BEL seen anywhere (visual bell; see bell_flash)
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// every BEL as (tab_id, time), drained into attention + pulses
+    bell_pings: Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
     /// Daemon: tab/rise requests forwarded by other mypixels processes.
     session_rx: std::sync::mpsc::Receiver<session::Request>,
     /// The egui window picker's answer, applied next frame by the drain
@@ -583,7 +587,9 @@ impl App {
             exited: Arc::new(Mutex::new(Vec::new())),
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             bell: Arc::new(Mutex::new(None)),
+            bells: Arc::new(Mutex::new(Vec::new())),
         };
+        let bells = Arc::clone(&shared.bells);
         let exited = Arc::clone(&shared.exited);
         let last_activity = Arc::clone(&shared.last_activity);
         let bell = Arc::clone(&shared.bell);
@@ -685,6 +691,7 @@ impl App {
             cursor_blink,
             last_activity,
             bell,
+            bell_pings: bells,
             session_rx,
             pending_move: None,
             pending_action: None,
@@ -944,6 +951,7 @@ impl App {
             exited: Arc::clone(&self.exited),
             last_activity: Arc::clone(&self.last_activity),
             bell: Arc::clone(&self.bell),
+            bells: Arc::clone(&self.bell_pings),
         }
     }
 
@@ -1904,6 +1912,24 @@ impl App {
                         // grey, so hover matches whatever theme is configured.
                         push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [fgc[0], fgc[1], fgc[2], 0.12]);
                     }
+                    if let Some((pi, pat)) = self.wins[self.cur].bell_pulse {
+                        if pi == i {
+                            let t = pat.elapsed().as_secs_f32() / 0.9;
+                            if t < 1.0 {
+                                // The palette's own red, fading off the tab -
+                                // unreadable-news marker, not a fire alarm.
+                                let rc = self.config.col[1].to_f32();
+                                push_rect(
+                                    &mut gpu.rects,
+                                    x,
+                                    0.0,
+                                    face.w,
+                                    body_h,
+                                    [rc[0], rc[1], rc[2], 0.4 * (1.0 - t)],
+                                );
+                            }
+                        }
+                    }
                     let marker_slot = slot;
                     let label_slot = slot + if face.marker { 1 } else { 0 };
                     let mut tx = x + TAB_PAD;
@@ -2702,6 +2728,43 @@ impl App {
         let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else { return };
         let result = self.clipboard.as_ref().ok_or_else(|| "Clipboard unavailable".to_string()).and_then(|c| c.paste(kind, tab.id));
         if let Err(e) = result { self.show_error(e); }
+    }
+
+    /// Turn BELs into escalation where they are unseen: attention knocks at
+    /// the compositor and the tab strip pulses that cell in the palette's
+    /// red. A bell in the window you are looking at, on the tab you are
+    /// reading, stays a bell — the visual flash already says what happened;
+    /// escalation is for news nobody is watching. Shell integration hooks
+    /// (scripts/shell_integration.*) ring this bell on failed commands,
+    /// which is "notify me when the build breaks" without a D-Bus daemon.
+    fn drain_bell_pings(&mut self) {
+        for w in self.wins.iter_mut() {
+            if w.bell_pulse.is_some_and(|(_, at)| at.elapsed().as_secs_f32() > 0.9) {
+                w.bell_pulse = None;
+                if let Some(win) = w.window.as_ref() {
+                    win.request_redraw();
+                }
+            }
+        }
+        let pings: Vec<(usize, Instant)> =
+            std::mem::take(&mut *self.bell_pings.lock().unwrap());
+        for (tab_id, at) in pings {
+            for (wi, w) in self.wins.iter_mut().enumerate() {
+                if let Some(ti) = w.tabs.iter().position(|t| t.id == tab_id) {
+                    let seen = wi == self.cur && w.active == ti && w.focused;
+                    if !seen {
+                        w.bell_pulse = Some((ti, at));
+                        if let Some(win) = w.window.as_ref() {
+                            win.request_user_attention(Some(
+                                winit::window::UserAttentionType::Critical,
+                            ));
+                            win.request_redraw();
+                        }
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     fn drain_clipboard(&mut self) {
@@ -3504,6 +3567,7 @@ impl App {
                 tab_drag_moved: false,
                 fifo_egui_events: Vec::new(),
                 notice: None,
+                bell_pulse: None,
                 focused: true,
             });
             // The newest window is the one the user just asked for.
@@ -4008,6 +4072,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.check_theme_files();
         self.drain_clipboard();
+        self.drain_bell_pings();
         self.drain_test_keys(event_loop);
     }
 
@@ -4076,6 +4141,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.check_theme_files();
                 self.drain_clipboard();
+                self.drain_bell_pings();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
                 if let Some(action) = self.pending_action.take() {

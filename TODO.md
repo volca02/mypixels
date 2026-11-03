@@ -22,14 +22,23 @@ Current priorities:
    Open: **IME** and keyboard-grown text selection (Shift+arrows).
 4. **Tab strip usability (P1).** Open: keep the active tab reachable with many
    tabs, configured wrapping/placement, verify title-update cadence.
-5. **Search (P2).** A reusable inline text input, incremental search, next/previous
+5. **Task-done notifications: shipped.** An unseen BEL (window unfocused,
+   or a tab you are not looking at) becomes a compositor attention request
+   plus a red pulse on that tab's cell. `scripts/shell_integration.{bash,
+   zsh,fish}` ring the bell on failed commands - "notify me when the build
+   breaks" with no daemon, working across ssh. Full OSC 133 semantics
+   (prompt jump, copy-last-output) need a pty byte-tap: the library parses
+   OSC internally and offers no hook; replicating its reader loop is the
+   open step. Bell escalation and shell cwd (/proc) already cover the two
+   most-wanted 133 use cases.
+6. **Search (P2).** A reusable inline text input, incremental search, next/previous
    matches, visible match state, and cancellation back to the terminal.
-6. **Multi-window: shipped.** One process hosts many windows: `Ctrl+Shift+n`,
+7. **Multi-window: shipped.** One process hosts many windows: `Ctrl+Shift+n`,
    `mypixels`/`mypixels -n` joining over D-Bus, `Alt+Shift+w` send-tab
    (direct with two windows, egui picker with three+, "New window" detaches),
    X11 drag a tab onto another window or off the border to detach.
    Open: **TabMonitor** (Alt+Shift+m floating live snapshot).
-7. **Small parity gaps: closed.** Ctrl+wheel zoom, font selector,
+8. **Small parity gaps: closed.** Ctrl+wheel zoom, font selector,
    `bg_tint_color`, Wayland app-id + window icon, visual bell, named
    themes with XDG discovery and derived palettes.
 
