@@ -324,6 +324,9 @@ struct Win {
     thumb_rr: usize,
     /// last BEL seen anywhere (visual bell; see bell_flash)
     autoscroll_next: Option<Instant>,
+    /// One-shot: the next frame renders the active tab through the preview
+    /// path and copies the result to the clipboard as a PNG.
+    shot: bool,
     tab_drag: Option<usize>,
     /// The tab drag crossed into another cell, so the press has become a
     /// reorder and the release must not also count as a click.
@@ -391,6 +394,10 @@ struct App {
     term_weight: u16,
     term_slant: fonts::DbStyle,
     term_pt: f32,
+    /// The size the terminal font was loaded at: what "Reset zoom" returns
+    /// to, immune to whatever the config's string happens to say after a
+    /// zoom-and-save cycle this session.
+    orig_term_pt: f32,
     /// Alt-held tab switcher timing, shared with a background clock thread.
     /// `switcher_alt_at` is when Alt went down (None when released); the clock
     /// opens the switcher after the configured delay (`tab_overview_delay_ms`)
@@ -414,6 +421,8 @@ struct App {
     /// (which has the event loop; the draw path does not). usize::MAX =
     /// detach into a fresh window.
     pending_move: Option<usize>,
+    /// A context-menu choice, run by the drain (which has the event loop).
+    pending_action: Option<String>,
     /// Keeps the session-bus thread -- and with it the bus name -- alive for
     /// as long as the app runs.
     _session: Option<session::Server>,
@@ -647,6 +656,7 @@ impl App {
             term_weight,
             term_slant,
             term_pt,
+            orig_term_pt: term_pt,
             switcher_alt_at,
             switcher_show_req,
             switcher_open,
@@ -655,6 +665,7 @@ impl App {
             bell,
             session_rx,
             pending_move: None,
+            pending_action: None,
             _session,
             modifiers: ModifiersState::empty(),
             program,
@@ -1177,6 +1188,41 @@ impl App {
         self.rebuild_term_font();
     }
 
+    /// The right-click menu, as (label, action, enabled) rows plus the
+    /// indices where separators go. Actions are `do_action` names, so the
+    /// menu can never offer something no binding could do.
+    fn menu_rows(&self) -> (Vec<(String, String, bool)>, Vec<usize>) {
+        let w = &self.wins[self.cur];
+        let has_tab = w.active < w.tabs.len();
+        let has_sel = w
+            .tabs
+            .get(w.active)
+            .is_some_and(|t| t.term.lock().selection_to_string().is_some());
+        let mut items: Vec<(String, String, bool)> = Vec::new();
+        let mut seps: Vec<usize> = Vec::new();
+        let mut add = |label: &str, action: &str, enabled: bool, sep: bool| {
+            if sep {
+                seps.push(items.len());
+            }
+            items.push((label.to_string(), action.to_string(), enabled));
+        };
+        add("Copy", "copy", has_sel, false);
+        add("Paste", "paste", true, false);
+        add("Paste primary", "paste_primary", true, false);
+        add("Select all", "select_all", has_tab, true);
+        add("Copy as image", "copy_as_image", has_tab, true);
+        add("New tab", "new_tab", true, true);
+        add("Rename tab", "rename_tab", has_tab, false);
+        add("Close tab", "close_tab", has_tab, false);
+        add("New window", "new_window", true, true);
+        add("Send tab to new window", "send_tab_new_window", has_tab, false);
+        add("Zoom in", "enlarge_font", has_tab, true);
+        add("Zoom out", "shrink_font", has_tab, false);
+        add("Reset zoom", "reset_font", has_tab, false);
+        add("Settings...", "show_config", true, true);
+        (items, seps)
+    }
+
     fn build_frame(&self, tab: &Tab, show_cursor: bool) -> FrameData {
         let term = tab.term.lock();
         let content = term.renderable_content();
@@ -1367,6 +1413,18 @@ impl App {
             self.bg = bell_mix(self.bg, bell_k);
             window.request_redraw();
         }
+        // "Copy as image" outside the switcher: no per-tab frames exist
+        // then, so the shot builds its own (one frame's cost, once).
+        let shot_frame: Option<FrameData> = if self.wins[self.cur].shot
+            && self.wins[self.cur].overview.is_none()
+        {
+            self.wins[self.cur]
+                .tabs
+                .get(self.wins[self.cur].active)
+                .map(|t| self.build_frame(t, false))
+        } else {
+            None
+        };
         let ov_frames: Vec<FrameData> = if self.wins[self.cur].overview.is_some() {
             self.wins[self.cur].tabs.iter().map(|t| self.build_frame(t, true)).collect()
         } else {
@@ -1469,6 +1527,7 @@ impl App {
                     }
                     egui_ui::rename_box(ui, &mut egui.ui_state);
                     egui_ui::move_pick_box(ui, &mut egui.ui_state);
+                    egui_ui::ctx_menu(ui, &mut egui.ui_state);
                 });
                 // While the pointer is down on a slider, egui keeps asking
                 // for frames; forward that to winit's redraw path.
@@ -1500,9 +1559,17 @@ impl App {
                     }
                     window.request_redraw();
                 }
+                if let Some(pick) = egui.ui_state.menu_out.take() {
+                    egui.ui_state.menu_open = false;
+                    if let Some(action) = pick {
+                        self.pending_action = Some(action);
+                    }
+                    window.request_redraw();
+                }
                 let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open)
                     || egui.ui_state.rename_open
-                    || egui.ui_state.move_open;
+                    || egui.ui_state.move_open
+                    || egui.ui_state.menu_open;
                 egui_ui::release_focus_if_closed(&ctx, egui.config_open, popup_open, &mut egui.open_prev);
                 full_output = Some(full);
             }
@@ -1943,6 +2010,54 @@ impl App {
             }
             }
         }
+        // One-shot screenshot: shape the captured frame into the preview
+        // slot and queue the offscreen render. The readback happens after
+        // render_frame -- same textures, same pipeline the switcher uses,
+        // just at native resolution and exactly once.
+        let mut shot_at: Option<usize> = None;
+        if self.wins[self.cur].shot {
+            let a = self.wins[self.cur].active;
+            if a < self.wins[self.cur].tabs.len() {
+                gpu.ensure_previews(a + 1, (w, h));
+                if let Some(fd) = ov_frames.get(a).or(shot_frame.as_ref()) {
+                    let metrics = gpu.pool[0].metrics();
+                    let buffers = &mut gpu.prev_bufs[a];
+                    let runs = &fd.runs[..fd.runs.len().min(MAX_RUNS)];
+                    buffers.resize_with(runs.len(), || Buffer::new(&mut self.font_system, metrics));
+                    for (buffer, run) in buffers.iter_mut().zip(runs) {
+                        buffer.set_metrics(metrics);
+                        fonts::shape_terminal_run(
+                            buffer, &mut self.font_system, &run.text, run.attrs, &run.cells, self.cell_w,
+                        );
+                    }
+                    gpu.set_prev_sig(a, frame_sig(fd, self.cell_w));
+                    jobs.push(gpu::PreviewJob {
+                        idx: a,
+                        bounds,
+                        text: runs.iter().map(|run| gpu::PreviewText {
+                            left: run.col as f32 * self.cell_w,
+                            top: strip_h + run.row as f32 * self.cell_h,
+                            color: run.fg,
+                        }).collect(),
+                        rects: preview_rects(
+                            fd,
+                            &fd.bg,
+                            &self.config.tablist_background.to_f32(),
+                            &fd.cursor_color,
+                            self.cell_w,
+                            self.cell_h,
+                            strip_h,
+                            self.wins[self.cur].rows,
+                            w,
+                            h,
+                        ),
+                    });
+                    shot_at = Some(a);
+                }
+            } else {
+                self.wins[self.cur].shot = false;
+            }
+        }
         let egui_frame = match (full_output.as_mut(), self.wins[self.cur].egui.as_mut()) {
             (Some(full), Some(egui)) => {
                 // Take the shapes out: `full` is behind a reference, and the
@@ -1964,6 +2079,38 @@ impl App {
             _ => None,
         };
         gpu.render_frame(&mut self.font_system, areas, jobs, window, egui_frame);
+
+        // Finish the screenshot: read the offscreen frame (already rendered
+        // this pass) at full resolution and hand a PNG to the clipboard.
+        if let Some(a) = shot_at {
+            self.wins[self.cur].shot = false;
+            match gpu.readback_preview(a, 0, (w, h)) {
+                Some(rgba) => {
+                    let png = png_rgba(w, h, &rgba);
+                    let png_len = png.len();
+                    let result = match self.clipboard.as_ref() {
+                        None => Err("no clipboard backend".to_string()),
+                        Some(_) if png.is_empty() => Err("PNG encoding failed".to_string()),
+                        Some(cb) => cb.set_image(clipboard::Kind::Clipboard, png),
+                    };
+                    match result {
+                        Ok(()) => {
+                            log::info!("copy as image: {w}x{h} png {png_len} bytes");
+                            self.wins[self.cur].notice =
+                                Some(("Screen copied as image".to_string(), Instant::now()));
+                        }
+                        Err(e) => {
+                            log::warn!("copy as image failed: {e}");
+                            self.show_error(format!("Copy as image: {e}"));
+                        }
+                    }
+                }
+                None => {
+                    log::warn!("copy as image: readback failed");
+                    self.show_error("Copy as image: capture failed".to_string());
+                }
+            }
+        }
 
         // The egui switcher's live thumbnails: read the freshly rendered
         // preview textures back for a few tabs per frame (same 60/200ms
@@ -2135,6 +2282,11 @@ impl App {
                     });
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
+                continue;
+            }
+            if line == "shot" {
+                // Test hook: fire the context menu's "Copy as image".
+                self.do_action("copy_as_image", event_loop);
                 continue;
             }
             if line == "alt_up" {
@@ -2651,6 +2803,24 @@ impl App {
                 }
             },
             "enlarge_font" => self.zoom_term(true),
+            "reset_font" => {
+                if (self.term_pt - self.orig_term_pt).abs() >= 0.5 {
+                    self.term_pt = self.orig_term_pt;
+                    self.rebuild_term_font();
+                }
+            }
+            "send_tab_new_window" => {
+                self.pending_move = Some(usize::MAX);
+                for w in self.window_slot.lock().unwrap().iter() {
+                    w.request_redraw();
+                }
+            }
+            "copy_as_image" => {
+                self.wins[self.cur].shot = true;
+                for w in self.window_slot.lock().unwrap().iter() {
+                    w.request_redraw();
+                }
+            }
             "shrink_font" => self.zoom_term(false),
             "select_all" => {
                 let cur_active = self.wins[self.cur].active;
@@ -3062,6 +3232,7 @@ impl App {
                 sw_thumbs: Vec::new(),
                 thumb_rr: 0,
                 autoscroll_next: None,
+                shot: false,
                 tab_drag: None,
                 tab_drag_moved: false,
                 fifo_egui_events: Vec::new(),
@@ -3165,6 +3336,21 @@ fn app_icon() -> Option<winit::window::Icon> {
 }
 
 /// Where `active` lands when tabs `a` and `b` trade places.
+/// RGBA pixels -> PNG. The screenshot path; egui textures and glyphon
+/// agree on RGBA, so this is a header plus a pass-through.
+fn png_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        if let Ok(mut writer) = enc.write_header() {
+            let _ = writer.write_image_data(rgba);
+        }
+    }
+    out
+}
+
 /// Which index is active in a tab list after the tab at `removed` leaves
 /// for another window: slots after it shift down; if it WAS the active
 /// tab, the neighbour that slides into its place takes over; a list that
@@ -3458,6 +3644,9 @@ impl ApplicationHandler for App {
                 self.drain_clipboard();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
+                if let Some(action) = self.pending_action.take() {
+                    self.do_action(&action, event_loop);
+                }
                 if let Some(target) = self.pending_move.take() {
                     let from = self.cur;
                     let idx = self.wins[from].active;
@@ -3612,7 +3801,25 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
-                if button == MouseButton::Middle {
+                if button == MouseButton::Right {
+                    // The context menu: the app's own actions, offered to
+                    // people who have not memorised the bindings. A right
+                    // press the terminal wants to REPORT never reaches here
+                    // (handled above), and one egui wants never reaches here
+                    // either (egui_consumed) -- so vim and tmux keep their
+                    // right button, exactly like every other one.
+                    let (rows, seps) = self.menu_rows();
+                    let (mx, my) = self.wins[self.cur].pointer;
+                    if let Some(egui) = self.wins[self.cur].egui.as_mut() {
+                        let st = &mut egui.ui_state;
+                        st.menu_items = rows;
+                        st.menu_seps = seps;
+                        st.menu_pos = [mx, my];
+                        st.menu_open = true;
+                        st.menu_out = None;
+                    }
+                    window.request_redraw();
+                } else if button == MouseButton::Middle {
                     // Middle click pastes the primary selection -- the X11
                     // convention the original gets free from VTE.
                     if self.cell_at(at.0, at.1).is_some() { self.request_paste(clipboard::Kind::Primary); }
@@ -4172,6 +4379,26 @@ mod tests {
         assert_eq!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).map(|(d, _)| d), Some(1));
         assert_eq!(App::autoscroll_tick(1.0, 0.0, 400.0, 16.0), Some((1, 3))); // near the border: three
         assert!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).unwrap().1 <= cap);
+    }
+
+    #[test]
+    fn png_rgba_round_trips_through_a_real_decoder() {
+        // A quarter of the encoder's contract, proved against the decoder:
+        // size, colour type, and exact pixels.
+        let (w, h) = (4u32, 2u32);
+        let mut rgba = Vec::new();
+        for i in 0..(w * h) as usize {
+            rgba.extend_from_slice(&[i as u8, 255 - i as u8, (i * 7) as u8, 255]);
+        }
+        let png = png_rgba(w, h, &rgba);
+        assert!(!png.is_empty() && png[..8] == *b"\x89PNG\r\n\x1a\n");
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (w, h));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(&buf[..rgba.len()], &rgba[..]);
     }
 
     #[test]

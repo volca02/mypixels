@@ -60,7 +60,7 @@ impl Drop for WriterSlot {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
-fn write_source(file: File, text: Arc<str>, writers: &Arc<AtomicUsize>) {
+fn write_source(file: File, payload: Arc<crate::clipboard::Payload>, writers: &Arc<AtomicUsize>) {
     if writers
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             (n < 8).then_some(n + 1)
@@ -76,7 +76,7 @@ fn write_source(file: File, text: Arc<str>, writers: &Arc<AtomicUsize>) {
         .name("clipboard-write".into())
         .spawn(move || {
             let _slot = slot;
-            if let Err(e) = transfer::write(file, text.as_bytes(), deadline) {
+            if let Err(e) = transfer::write(file, payload.bytes(), deadline) {
                 log::debug!("clipboard reader disconnected: {e}");
             }
         })
@@ -173,9 +173,12 @@ macro_rules! client {
                 if kind == Kind::Primary && !self.state.primary { return Err(cmd) }
                 let index = kind.index();
                 match cmd {
-                    Command::Set(_, text) => {
-                        let source = self.state.manager.as_ref().unwrap().create_data_source(&self.queue.handle(), text);
-                        for mime in MIMES { source.offer(mime.into()); }
+                    Command::Set(_, payload) => {
+                        let source = self.state.manager.as_ref().unwrap().create_data_source(&self.queue.handle(), Arc::clone(&payload));
+                        match &*payload {
+                            crate::clipboard::Payload::Text(_) => { for mime in MIMES { source.offer(mime.into()); } }
+                            crate::clipboard::Payload::Png(_) => source.offer("image/png".into()),
+                        }
                         let device = self.state.device.as_ref().unwrap();
                         if index == 0 { device.set_selection(Some(&source)); } else { device.set_primary_selection(Some(&source)); }
                         if let Some(old) = self.state.sources[index].replace(source) { old.destroy(); }
@@ -240,10 +243,13 @@ macro_rules! client {
                 if let offer::Event::Offer { mime_type } = event { mimes.lock().unwrap().push(mime_type); }
             }
         }
-        impl Dispatch<Source, Arc<str>> for State {
-            fn event(state: &mut Self, source: &Source, event: source::Event, text: &Arc<str>, _: &Connection, _: &QueueHandle<Self>) {
+        impl Dispatch<Source, std::sync::Arc<crate::clipboard::Payload>> for State {
+            fn event(state: &mut Self, source: &Source, event: source::Event, text: &Arc<crate::clipboard::Payload>, _: &Connection, _: &QueueHandle<Self>) {
                 match event {
-                    source::Event::Send { mime_type, fd } if MIMES.contains(&mime_type.as_str()) => write_source(File::from(fd), text.clone(), &state.writers),
+                    source::Event::Send { mime_type, fd }
+                        if matches!(&**text, crate::clipboard::Payload::Text(_)) && MIMES.contains(&mime_type.as_str())
+                            || matches!(&**text, crate::clipboard::Payload::Png(_)) && mime_type == "image/png" =>
+                    { write_source(File::from(fd), text.clone(), &state.writers) }
                     source::Event::Cancelled => {
                         if let Some(slot) = state.sources.iter_mut().find(|s| s.as_ref() == Some(source)) { *slot = None; }
                         if source.is_alive() { source.destroy(); }

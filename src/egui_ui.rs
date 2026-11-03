@@ -86,6 +86,60 @@ pub struct UiState {
     /// still open. Same shape as `rename_out` for the same reason: the
     /// app must learn about dismissal, not only about choice.
     pub move_out: Option<Option<usize>>,
+    /// The right-click context menu. Rows are (label, action, enabled);
+    /// `menu_seps` are the indices a separator goes BEFORE. Actions are the
+    /// app's own `do_action` names, so the menu adds no new machinery.
+    pub menu_open: bool,
+    pub menu_items: Vec<(String, String, bool)>,
+    pub menu_seps: Vec<usize>,
+    pub menu_pos: [f32; 2],
+    /// Some(Some(action)) = run this, Some(None) = dismissed, None = open.
+    pub menu_out: Option<Option<String>>,
+}
+
+/// The context menu: a borderless popup at the pointer, one button per row.
+/// Same open/click-away/Escape contract as the rename box and the window
+/// picker -- the three small popups should behave identically or they lie
+/// about being the same kind of thing.
+pub fn ctx_menu(ui: &egui::Ui, st: &mut UiState) {
+    if !st.menu_open {
+        st.menu_out = None;
+        return;
+    }
+    let ctx = ui.ctx();
+    let pos = egui::pos2(st.menu_pos[0], st.menu_pos[1]);
+    let mut out: Option<Option<String>> = None;
+    let mut area = egui::Rect::NOTHING;
+    egui::Window::new("ctx_menu")
+        .id(egui::Id::new("ctx_menu_box"))
+        .title_bar(false)
+        .movable(false)
+        .resizable(false)
+        .fixed_pos(pos)
+        .constrain(true)
+        .show(&ctx, |ui| {
+            ui.set_width(210.0);
+            for (i, (label, action, enabled)) in st.menu_items.iter().enumerate() {
+                if st.menu_seps.contains(&i) {
+                    ui.separator();
+                }
+                let resp = ui.add_enabled(*enabled, egui::Button::new(label).min_size(egui::vec2(198.0, 0.0)));
+                if resp.clicked() {
+                    out = Some(Some(action.clone()));
+                }
+            }
+            area = ui.response().rect;
+        });
+    if out.is_none()
+        && ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape)
+                || (i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| !area.expand(4.0).contains(p)))
+        })
+    {
+        out = Some(None);
+    }
+    st.menu_out = out;
 }
 
 /// The window picker for "send tab to window": one small frameless list,

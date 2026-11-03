@@ -45,8 +45,26 @@ pub enum Event {
     },
     Error(String),
 }
+/// What this instance owns for a clipboard buffer. Images travel as PNG and
+/// are offered under image/png; the "Copy as image" feature is the only
+/// producer, and a Png payload replaces the text ownership like any set.
+#[derive(Clone)]
+pub enum Payload {
+    Text(Arc<str>),
+    Png(Arc<[u8]>),
+}
+
+impl Payload {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Payload::Text(t) => t.as_bytes(),
+            Payload::Png(b) => b,
+        }
+    }
+}
+
 enum Command {
-    Set(Kind, Arc<str>),
+    Set(Kind, Arc<Payload>),
     Get(Kind, usize),
 }
 
@@ -144,13 +162,40 @@ impl Clipboard {
         if text.len() > transfer::MAX_BYTES {
             return Err("Selection exceeds the 16 MiB clipboard limit".into());
         }
-        self.send(Command::Set(kind, text.into()))
+        self.send(Command::Set(kind, Arc::new(Payload::Text(text.into()))))
+    }
+
+    /// Own the buffer with a PNG image (the terminal-screenshot feature).
+    pub fn set_image(&self, kind: Kind, png: Vec<u8>) -> Result<(), String> {
+        if png.len() > transfer::MAX_BYTES {
+            return Err("Image exceeds the 16 MiB clipboard limit".into());
+        }
+        self.send(Command::Set(kind, Arc::new(Payload::Png(png.into()))))
     }
     pub fn paste(&self, kind: Kind, target: usize) -> Result<(), String> {
         self.send(Command::Get(kind, target))
     }
     pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
         self.events.try_iter()
+    }
+}
+
+/// The image-write command of each fallback path. xsel can carry no mime
+/// types, so X11 image copying is xclip's alone; the absence is reported as
+/// a named helper to install, not a shrug.
+fn image_argv(backend: Backend, kind: Kind) -> Option<Vec<&'static str>> {
+    match (backend, kind == Kind::Primary) {
+        (Backend::None, _) => None,
+        (Backend::Wayland, false) => Some(vec!["wl-copy", "--type", "image/png"]),
+        (Backend::Wayland, true) => {
+            Some(vec!["wl-copy", "--type", "image/png", "--primary"])
+        }
+        (Backend::X11, false) => {
+            Some(vec!["xclip", "-selection", "clipboard", "-t", "image/png", "-i"])
+        }
+        (Backend::X11, true) => {
+            Some(vec!["xclip", "-selection", "primary", "-t", "image/png", "-i"])
+        }
     }
 }
 
@@ -185,6 +230,46 @@ impl Drop for Helper {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// Pipe an image to the helper that understands mimes on this display.
+fn execute_image(backend: Backend, kind: Kind, png: &[u8]) -> Result<(), String> {
+    let args = image_argv(backend, kind)
+        .ok_or("Clipboard unavailable for images on this display")?;
+    let deadline = Instant::now() + transfer::TIMEOUT;
+    let child = Process::new(args[0])
+        .args(&args[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            log::warn!("{} failed: {e}", args[0]);
+            if e.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "Copying an image needs {} -- install it or use Wayland",
+                    if backend == Backend::Wayland { "wl-clipboard" } else { "xclip" }
+                )
+            } else {
+                format!("Could not start {}: {e}", args[0])
+            }
+        })?;
+    let mut child = child;
+    if let Some(stdin) = child.stdin.take() {
+        // Deadline-aware: a helper that never reads gets dropped, we never hang.
+        let _ = transfer::write(stdin, png, deadline);
+    }
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(format!("Clipboard helper exited with {status}")),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                return Err("Clipboard transfer timed out".into());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
     }
 }
 
@@ -241,11 +326,18 @@ fn execute(backend: Backend, kind: Kind, text: Option<&str>) -> Result<String, S
 
 fn helper(backend: Backend, command: Command, reply: &Reply) {
     match command {
-        Command::Set(kind, text) => {
-            if let Err(e) = execute(backend, kind, Some(&text)) {
-                reply.send(Event::Error(e));
+        Command::Set(kind, payload) => match &*payload {
+            Payload::Text(text) => {
+                if let Err(e) = execute(backend, kind, Some(text)) {
+                    reply.send(Event::Error(e));
+                }
             }
-        }
+            Payload::Png(png) => {
+                if let Err(e) = execute_image(backend, kind, png) {
+                    reply.send(Event::Error(e));
+                }
+            }
+        },
         Command::Get(kind, target) => reply.send(Event::Paste {
             target,
             result: execute(backend, kind, None),
