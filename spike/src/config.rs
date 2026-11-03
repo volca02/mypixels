@@ -140,6 +140,7 @@ impl Default for Config {
         // text feeds the *primary* buffer separately and needs no key.
         bind("copy", &["CONTROL+SHIFT+c"]);
         bind("paste", &["CONTROL+SHIFT+v"]);
+        bind("select_all", &["CONTROL+SHIFT+a"]);
         bind("paste_primary", &["SHIFT+Insert"]);
         bind("scroll_page_up", &["SHIFT+Page_Up"]);
         bind("scroll_page_down", &["SHIFT+Page_Down"]);

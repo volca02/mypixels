@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::index::{Point, Side};
+use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
@@ -179,10 +180,30 @@ impl Tab {
     }
 
     /// Grow the selection to a cell while dragging.
-    pub fn update_selection(&mut self, at: Point, side: Side) {
+    pub fn update_selection(&self, at: Point, side: Side) {
         if let Some(sel) = self.term.lock().selection.as_mut() {
             sel.update(at, side);
         }
+    }
+
+    /// Select everything: the whole scrollback and the visible screen. This
+    /// is VTE's keyboard-side selection (`select-all`, Ctrl+Shift+A); the
+    /// original has no cursor-key selection at all, so neither do we.
+    pub fn select_all(&mut self) {
+        let mut term = self.term.lock();
+        // Buffer line coordinates: scrollback is negative, the viewport ends
+        // at screen_lines - 1, whatever the display offset shows.
+        let (total, lines, cols) = (term.total_lines(), term.screen_lines(), term.columns());
+        let top = Line(lines as i32 - total as i32);
+        let bottom = Line(lines as i32 - 1);
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(top, Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(bottom, Column(cols.saturating_sub(1))), Side::Right);
+        sel.include_all();
+        term.selection = Some(sel);
     }
 
     pub fn clear_selection(&mut self) {

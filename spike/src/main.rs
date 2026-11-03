@@ -387,6 +387,8 @@ struct App {
     last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
     /// last BEL seen anywhere (visual bell; see bell_flash)
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// next tick of selection-drag autoscroll (see the block in `draw`)
+    autoscroll_next: Option<Instant>,
     /// A left button is held on a tab-strip entry and is dragging it: the
     /// index is the tab's current position (live swaps keep it equal to
     /// `hover_tab`). Releasing anywhere ends the drag; the tabs stay where
@@ -637,6 +639,7 @@ impl App {
             last_activity,
             bell,
             tab_drag: None,
+            autoscroll_next: None,
             fifo_egui_events: Vec::new(),
             modifiers: ModifiersState::empty(),
             program,
@@ -1083,6 +1086,47 @@ impl App {
     /// off to the gpu pass.
     fn draw(&mut self, window: &Window) {
         if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.notice = None; }
+        // Selection-drag autoscroll: hold the dragged edge above or below
+        // the grid and the history travels under it at 20 lines/second,
+        // the selection tracking the edge cell. Frame-driven -- each tick
+        // asks for the next frame while the pointer stays outside.
+        {
+            let (px, py) = self.pointer;
+            let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
+            let bottom = strip_h + self.rows as f32 * self.cell_h;
+            let dir = if self.drag.is_some() && !self.tabs.is_empty() {
+                if py < strip_h {
+                    Some(-1i32)
+                } else if py > bottom {
+                    Some(1i32)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(d) = dir {
+                if self.autoscroll_next.map_or(true, |t| Instant::now() >= t) {
+                    self.autoscroll_next = Some(Instant::now() + std::time::Duration::from_millis(50));
+                    let tab = &self.tabs[self.active];
+                    tab.scroll(alacritty_terminal::grid::Scroll::Delta(d));
+                    // Same buffer-line transform as `cell_at`, applied to
+                    // the edge row of the post-scroll view.
+                    let col = ((px / self.cell_w).floor() as usize).min(self.cols.saturating_sub(1));
+                    let within = px / self.cell_w - (px / self.cell_w).floor();
+                    let side = if within < 0.5 { Side::Left } else { Side::Right };
+                    let vis_row = if d < 0 { 0 } else { self.rows as i32 - 1 };
+                    let off = tab.term.lock().grid().display_offset() as i32;
+                    tab.update_selection(
+                        Point { line: Line(vis_row - off), column: Column(col) },
+                        side,
+                    );
+                    window.request_redraw();
+                }
+            } else {
+                self.autoscroll_next = None;
+            }
+        }
         let t_start = Instant::now();
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -2337,6 +2381,13 @@ impl App {
             },
             "enlarge_font" => self.zoom_term(true),
             "shrink_font" => self.zoom_term(false),
+            "select_all" => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.select_all();
+                }
+                // VTE feeds the primary selection from select-all too.
+                self.publish_primary();
+            },
             "rename_tab" => {
                 // The rename box is an egui text entry, so it and the Alt-
                 // held switcher cannot share the screen: they share Mod1,
