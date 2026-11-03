@@ -425,6 +425,13 @@ struct App {
     /// so the eye can keep the pointer's agent when it slides across the
     /// grid (mouse-reporting apps, search jumps, wide terminals).
     ripple: Option<Ripple>,
+    /// URLs found in the visible grid of the window being drawn, rebuilt
+    /// every frame (a grid scan the size of the screen is nothing; the
+    /// alternative - tracking damage and re-scanning rows - is a worse
+    /// cache with more ways to lie).
+    url_spans: Vec<UrlSpan>,
+    /// Index into url_spans under the pointer, for the underline.
+    url_hover: Option<usize>,
     /// Where the cursor block was painted last frame, physical px, with its
     /// resolved colour. Key events need it without going through the frame
     /// builder: the ripple rings AT the cursor when a modifier is pressed.
@@ -677,6 +684,8 @@ impl App {
             pending_action: None,
             ripple: None,
             cursor_pt: None,
+            url_spans: Vec::new(),
+            url_hover: None,
             _session,
             modifiers: ModifiersState::empty(),
             program,
@@ -1681,6 +1690,29 @@ impl App {
 
         let strip_h = if show_strip { self.tab_h } else { 0.0 };
 
+        // URLs: rescan the visible grid and locate the pointer on them.
+        // Done before the window split-borrow below, which is where the
+        // underline's rect actually gets pushed.
+        self.url_spans = self.scan_urls();
+        self.url_hover = {
+            let (px, py) = self.wins[self.cur].pointer;
+            self.visual_cell(px, py).and_then(|(row, col)| {
+                self.url_spans
+                    .iter()
+                    .position(|s| s.row == row && col >= s.start && col < s.end)
+            })
+        };
+        let url_underline: Option<(f32, f32, f32)> = match self.url_hover.and_then(|i| self.url_spans.get(i)) {
+            Some(sp) => {
+                let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
+                Some((
+                    sp.start as f32 * self.cell_w,
+                    strip_h + (sp.row + 1) as f32 * self.cell_h - (self.cell_h * 0.07).max(2.0),
+                    (sp.end - sp.start) as f32 * self.cell_w,
+                ))
+            }
+            None => None,
+        };
         gpu.rects.clear();
         // Convert pixel coords to clip space. Clip is -1..1 on both axes with
         // +y pointing up, screen pixels have y pointing down, so flip y.
@@ -1902,6 +1934,19 @@ impl App {
                     self.cell_w,
                     self.cell_h,
                     [frame.cursor_color[0], frame.cursor_color[1], frame.cursor_color[2], 0.55],
+                );
+            }
+            if let Some((ux, uy, uw)) = url_underline {
+                // One hair under the word: enough to say "this is a link
+                // and you are on it", too quiet to compete with real
+                // underlines the shell itself may print.
+                push_rect(
+                    &mut gpu.rects,
+                    ux,
+                    uy,
+                    uw,
+                    (self.cell_h * 0.07).max(2.0),
+                    [frame.fg[0], frame.fg[1], frame.fg[2], 0.7],
                 );
             }
             self.cursor_pt = Some((
@@ -2472,6 +2517,102 @@ impl App {
 
     /// Cell under the pointer, in grid coordinates, plus which half of it.
     /// None outside the terminal area: the tab strip is not text.
+    /// Visual cell under a pointer position (no scroll-offset adjustment:
+    /// url spans are keyed by visual rows, which is also what painting
+    /// wants).
+    fn visual_cell(&self, px: f32, py: f32) -> Option<(usize, usize)> {
+        let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
+        if py < strip_h {
+            return None;
+        }
+        let col = (px / self.cell_w).floor() as usize;
+        let row = ((py - strip_h) / self.cell_h).floor();
+        if row < 0.0 || col >= self.wins[self.cur].cols || row as usize >= self.wins[self.cur].rows {
+            return None;
+        }
+        Some((row as usize, col))
+    }
+
+    fn url_at(&self, px: f32, py: f32) -> Option<&str> {
+        let (row, col) = self.visual_cell(px, py)?;
+        self.url_spans
+            .iter()
+            .find(|s| s.row == row && col >= s.start && col < s.end)
+            .map(|s| s.url.as_str())
+    }
+
+    /// Scan the visible grid for http(s) URLs. This is deliberately dumb:
+    /// terminals print URLs inside quotes, brackets, angle brackets and
+    /// ansi noise, so the rule is "start at the scheme, stop at whitespace
+    /// or control", then trim punctuation that a sentence would end with.
+    /// It will never be a proper URI parser; it is a finger for the
+    /// keyboard, and dumb rules you can read beat parsers you cannot trust.
+    fn scan_urls(&self) -> Vec<UrlSpan> {
+        let mut spans = Vec::new();
+        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
+            return spans;
+        };
+        let term = tab.term.lock();
+        let content = term.renderable_content();
+        let rows = self.wins[self.cur].rows;
+        let mut cur_row: Option<usize> = None;
+        let mut line = String::new();
+        let mut flush = |line: &mut String, row: usize, spans: &mut Vec<UrlSpan>| {
+            if line.len() < 8 {
+                return;
+            }
+            for (start, url) in url_spans_in_line(line) {
+                let end = start + url.chars().count();
+                spans.push(UrlSpan { row, start, end, url });
+            }
+            line.clear();
+        };
+        for cell in content.display_iter {
+            let row = cell.point.line.0 + content.display_offset as i32;
+            if row < 0 {
+                continue;
+            }
+            let row = row as usize;
+            if row >= rows {
+                break;
+            }
+            if cur_row != Some(row) {
+                if let Some(r) = cur_row {
+                    flush(&mut line, r, &mut spans);
+                }
+                cur_row = Some(row);
+                line.clear();
+            }
+            let col = cell.point.column.0;
+            if col > line.chars().count() {
+                // A gap (should not happen with display_iter) - do not
+                // glue unrelated words together.
+                line.extend(std::iter::repeat(' ').take(col - line.chars().count()));
+            }
+            let ch: char = cell.c;
+            line.push(if ch.is_whitespace() || (ch as u32) < 0x20 { ' ' } else { ch });
+        }
+        if let Some(r) = cur_row {
+            flush(&mut line, r, &mut spans);
+        }
+        spans
+    }
+
+    fn open_url(url: &str) {
+        // The portal-first, xdg-standard route; detached so a browser that
+        // never forks is not our child to reap.
+        match std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => log::info!("opened url: {url}"),
+            Err(e) => log::warn!("xdg-open {url}: {e}"),
+        }
+    }
+
     fn cell_at(&self, px: f32, py: f32) -> Option<(Point, Side)> {
         let tab = self.wins[self.cur].tabs.get(self.wins[self.cur].active)?;
         let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
@@ -3427,6 +3568,61 @@ fn app_icon() -> Option<winit::window::Icon> {
 }
 
 /// Where `active` lands when tabs `a` and `b` trade places.
+/// One URL found on one VISUAL row of the grid, in cell columns.
+struct UrlSpan {
+    row: usize,
+    start: usize,
+    end: usize,
+    url: String,
+}
+
+/// URL spans within one row's text, as (column, str). See `App::scan_urls`
+/// for the philosophy; the trailing trim is where all the craft is: a URL
+/// ending in `.` or `)` is nearly always a URL followed by prose.
+fn url_spans_in_line(line: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let rest: String = chars[i..].iter().collect();
+        if !(rest.starts_with("https://") || rest.starts_with("http://")) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && chars[j] != ' ' && !chars[j].is_control() {
+            j += 1;
+        }
+        let word: String = chars[i..j].iter().collect();
+        // Strip trailing prose one character at a time, because the two
+        // rules interact: a ')' is prose only while it outranks the
+        // openings, and a '.' belongs to the URL while it is inside the
+        // host/path and is prose the moment it ends a sentence. A loop
+        // with a balance counter reads worse than two trims and is the
+        // only version that is right.
+        let mut trimmed = word.as_str();
+        loop {
+            let Some(last) = trimmed.chars().last() else { break };
+            let prose = match last {
+                ')' => trimmed.matches(')').count() > trimmed.matches('(').count(),
+                '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | ']' | '}' | '>' => true,
+                _ => break,
+            };
+            if !prose {
+                break;
+            }
+            trimmed = &trimmed[..trimmed.len() - last.len_utf8()];
+        }
+        // A host needs a dot somewhere after the scheme to be a URL
+        // rather than `https://localhost` or a dangling `https://`.
+        let host = trimmed.trim_start_matches("https://").trim_start_matches("http://");
+        if trimmed.len() >= 9 && host.contains('.') {
+            out.push((i, trimmed.to_string()));
+        }
+        i = j;
+    }
+    out
+}
 /// State of the cursor's movement pulse (see `App::ripple`).
 struct Ripple {
     /// Centre in PHYSICAL pixels (the draw path works there; egui divides
@@ -4039,6 +4235,25 @@ impl ApplicationHandler for App {
                         if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) { tab.clear_selection(); }
                         self.add_tab();
                         window.request_redraw();
+                    } else if button == MouseButton::Left
+                        && self.url_at(at.0, at.1).is_some()
+                        && (self.modifiers.control_key() || self.modifiers.shift_key())
+                    {
+                        // A modifier+click on a link belongs to the link,
+                        // not to the grid: Ctrl opens it, Shift copies it,
+                        // and neither starts a selection. That last part is
+                        // not politeness - selection autosends to the
+                        // clipboard, so a "copy the link" click that also
+                        // word-selected would have its own copy overwritten
+                        // by the word's text one moment later.
+                        let url = self.url_at(at.0, at.1).unwrap().to_string();
+                        if self.modifiers.control_key() {
+                            Self::open_url(&url);
+                        } else if let Some(cb) = self.clipboard.as_ref() {
+                            if let Err(e) = cb.set(clipboard::Kind::Clipboard, url) {
+                                log::warn!("copy url: {e}");
+                            }
+                        }
                     } else if let Some((pt, side)) = self.cell_at(at.0, at.1) {
                         // Alt+drag is a rectangular selection gesture. It must
                         // not open the Alt-held switcher halfway through a drag.
@@ -4768,5 +4983,42 @@ mod tests {
         assert_eq!(swap_follow(2, 0, 0), 2);
         // A reorder that does not involve the active tab leaves it alone.
         assert_eq!(swap_follow(1, 2, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::url_spans_in_line;
+
+    #[test]
+    fn finds_links_and_drops_prose_punctuation() {
+        let line = "see https://example.com/a?b=c. Also http://x.org, ok";
+        let got = url_spans_in_line(line);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].1, "https://example.com/a?b=c");
+        assert_eq!(got[1].1, "http://x.org");
+        // The column must be the cell the URL starts in.
+        assert_eq!(got[0].0, 4);
+    }
+
+    #[test]
+    fn keeps_balanced_parens_and_markdown_wrappers() {
+        let line = "https://en.wikipedia.org/wiki/Rust_(language)";
+        let got = url_spans_in_line(line);
+        assert_eq!(got[0].1, line);
+        let line = "trailing close paren: https://a.io/x)";
+        let got = url_spans_in_line(line);
+        assert_eq!(got[0].1, "https://a.io/x");
+    }
+
+    #[test]
+    fn ignores_schemeish_noise() {
+        // No dot in the host: not a URL (localhost is a different feature).
+        assert!(url_spans_in_line("go to https://here now").is_empty());
+        // A bare scheme is noise.
+        assert!(url_spans_in_line("the http:// scheme").is_empty());
+        assert_eq!(url_spans_in_line("ftp://not.http").len(), 0); // http(s) only
+        // Dot in host, real shape: even short is fine - who am I to judge.
+        assert_eq!(url_spans_in_line("http://a.io").len(), 1);
     }
 }
