@@ -48,3 +48,11 @@ strip = false
 # looks blurry. The vendored copy is trimmed of tests/docs otherwise.
 [patch.crates-io]
 cosmic-text = { path = "vendor/cosmic-text" }
+# Vendored so OSC 133 (and later graphics APC) can be parsed INSIDE the VTE
+# state machine, where the cursor and the chunk boundaries actually live -
+# docs/graphics_osc133_implementation.md M0. Keep in sync with upstream
+# 0.26.0 except for the documented patches in src/term/ and src/event.rs.
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+# Vendored to add the osc_raw observer hook (see vendor/vte/src comments):
+# the OSC types we care about have no dispatch slot in the upstream table.
+vte = { path = "vendor/vte" }

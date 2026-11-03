@@ -34,6 +34,10 @@ pub struct SpikeListener {
     /// (tab_id, time) of every BEL, for the app to turn into "a window you
     /// are not looking at has news": attention + tab-strip pulse.
     pub bells: Arc<Mutex<Vec<(usize, std::time::Instant)>>>,
+    /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line).
+    /// Order per tab is the stream's own; the app folds them into command
+    /// blocks (see `App::drain_sems`).
+    pub sems: Arc<Mutex<Vec<(usize, u8, Option<i32>, usize)>>>,
 }
 
 impl SpikeListener {
@@ -55,6 +59,9 @@ impl EventListener for SpikeListener {
                 *self.title.lock().unwrap() = t;
                 *self.last_activity.lock().unwrap() = std::time::Instant::now();
                 self.notify_window();
+            },
+            Event::Semantic { code, exit, line, .. } => {
+                self.sems.lock().unwrap().push((self.tab_id, code, exit, line));
             },
             Event::Bell => {
                 log::info!("bell received (tab {})", self.tab_id);
@@ -138,6 +145,7 @@ impl Tab {
             last_activity: Arc::clone(&shared.last_activity),
             bell: Arc::clone(&shared.bell),
             bells: Arc::clone(&shared.bells),
+            sems: Arc::clone(&shared.sems),
         };
 
         let term = Arc::new(FairMutex::new(Term::new(

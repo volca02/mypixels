@@ -100,6 +100,9 @@ pub struct Config {
     pub tab_overview_thumb_height: u32,
     pub focus_new_tabs: bool,
     pub hide_single_tab: bool,
+    /// OSC 133 semantic shell integration: fold the shell's prompt/command
+    /// marks into navigable command blocks (scripts/shell_integration.*).
+    pub osc133: bool,
     pub multiline_tabs: bool,
     pub tablist_top: bool,
     pub tablist_hide: bool,
@@ -137,6 +140,8 @@ impl Default for Config {
         bind("first_tab", &["MOD1+Home"]);
         bind("last_tab", &["MOD1+End"]);
         bind("close_tab", &["CONTROL+ALT+x", "CONTROL+ALT+q"]);
+        bind("prev_command", &["CONTROL+ALT+Up"]);
+        bind("next_command", &["CONTROL+ALT+Down"]);
         bind("reopen_tab", &["CONTROL+SHIFT+z"]);
         bind("new_tab", &["CONTROL+ALT+z", "CONTROL+SHIFT+t"]);
         bind("new_window", &["CONTROL+SHIFT+n"]);
@@ -208,6 +213,7 @@ impl Default for Config {
             tab_overview_thumb_height: 225,
             focus_new_tabs: true,
             hide_single_tab: false,
+            osc133: true,
             multiline_tabs: true,
             tablist_top: true,
             tablist_hide: false,
@@ -350,6 +356,7 @@ impl Config {
             ("tab_overview_thumb_height".into(), self.tab_overview_thumb_height.to_string()),
             ("focus_new_tabs".into(), self.focus_new_tabs.to_string()),
             ("hide_single_tab".into(), self.hide_single_tab.to_string()),
+            ("osc133".into(), self.osc133.to_string()),
             ("multiline_tabs".into(), self.multiline_tabs.to_string()),
             ("tablist_top".into(), self.tablist_top.to_string()),
             ("tablist_hide".into(), self.tablist_hide.to_string()),
@@ -589,6 +596,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "hide_single_tab" => {
                     if let Some(b) = val.as_bool() {
                         cfg.hide_single_tab = b;
+                    }
+                },
+                "osc133" => {
+                    if let Some(b) = val.as_bool() {
+                        cfg.osc133 = b;
                     }
                 },
                 "multiline_tabs" => {

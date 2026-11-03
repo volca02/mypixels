@@ -419,6 +419,12 @@ struct App {
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// every BEL as (tab_id, time), drained into attention + pulses
     bell_pings: Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
+    /// OSC 133 marks as dispatched, drained into per-tab command blocks
+    sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize)>>>,
+    /// Per-tab command blocks, oldest first. Owned by the app, keyed by
+    /// the stable tab id, so a tab that moves between windows keeps its
+    /// history and a tab that dies simply leaves no trace.
+    sem_blocks: std::collections::HashMap<usize, std::collections::VecDeque<CommandBlock>>,
     /// Daemon: tab/rise requests forwarded by other mypixels processes.
     session_rx: std::sync::mpsc::Receiver<session::Request>,
     /// The egui window picker's answer, applied next frame by the drain
@@ -589,8 +595,10 @@ impl App {
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             bell: Arc::new(Mutex::new(None)),
             bells: Arc::new(Mutex::new(Vec::new())),
+            sems: Arc::new(Mutex::new(Vec::new())),
         };
         let bells = Arc::clone(&shared.bells);
+        let sems = Arc::clone(&shared.sems);
         let exited = Arc::clone(&shared.exited);
         let last_activity = Arc::clone(&shared.last_activity);
         let bell = Arc::clone(&shared.bell);
@@ -693,6 +701,8 @@ impl App {
             last_activity,
             bell,
             bell_pings: bells,
+            sems_ring: sems,
+            sem_blocks: Default::default(),
             session_rx,
             pending_move: None,
             pending_action: None,
@@ -954,6 +964,7 @@ impl App {
             last_activity: Arc::clone(&self.last_activity),
             bell: Arc::clone(&self.bell),
             bells: Arc::clone(&self.bell_pings),
+            sems: Arc::clone(&self.sems_ring),
         }
     }
 
@@ -971,6 +982,8 @@ impl App {
         if idx >= self.wins[self.cur].tabs.len() {
             return;
         }
+        let dying_id = self.wins[self.cur].tabs[idx].id;
+        self.sem_blocks.remove(&dying_id);
         self.remember_closed(tab_death(&self.wins[self.cur].tabs[idx]));
         // Stable ids: find the id of the tab being removed
         self.wins[self.cur].tabs.remove(idx);
@@ -2815,6 +2828,70 @@ impl App {
         }
     }
 
+    /// Fold dispatched OSC 133 marks into per-tab command blocks. The hard
+    /// part - WHERE a mark sits - was done by the state machine at dispatch
+    /// time; this only associates marks into blocks and forgets tabs that
+    /// are gone (a mark racing its tab's death is simply irrelevant).
+    fn drain_sems(&mut self) {
+        let evs: Vec<(usize, u8, Option<i32>, usize)> =
+            std::mem::take(&mut *self.sems_ring.lock().unwrap());
+        if !self.config.osc133 {
+            return;
+        }
+        let live: std::collections::HashSet<usize> = self
+            .wins
+            .iter()
+            .flat_map(|w| w.tabs.iter().map(|t| t.id))
+            .collect();
+        for (tab_id, code, exit, line) in evs {
+            if live.contains(&tab_id) {
+                apply_sem_mark(
+                    self.sem_blocks.entry(tab_id).or_default(),
+                    code,
+                    exit,
+                    line,
+                );
+            }
+        }
+    }
+
+    /// Scroll so the viewport top lands on the previous/next command's
+    /// prompt. Positions are absolute logical lines; the viewport offset
+    /// that shows one is `history_size - line`, clamped by the grid.
+    fn jump_command(&mut self, back: bool) {
+        self.drain_sems();
+        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
+            return;
+        };
+        let blocks: Vec<CommandBlock> = self
+            .sem_blocks
+            .get(&tab.id)
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+        if blocks.is_empty() {
+            return;
+        }
+        let (hist, cur) = {
+            let term = tab.term.lock();
+            (term.grid().history_size(), term.grid().display_offset())
+        };
+        let cur_top = hist - cur;
+        let target = if back {
+            blocks.iter().map(|b| b.prompt_line).filter(|l| *l < cur_top).max()
+        } else {
+            blocks.iter().map(|b| b.prompt_line).filter(|l| *l > cur_top).min()
+        };
+        if let Some(t) = target {
+            let want = hist.saturating_sub(t);
+            tab.scroll(alacritty_terminal::grid::Scroll::Delta(
+                want as i32 - cur as i32,
+            ));
+            if let Some(w) = &self.wins[self.cur].window {
+                w.request_redraw();
+            }
+        }
+    }
+
     fn drain_clipboard(&mut self) {
         let events: Vec<_> = self.clipboard.as_ref().map(|c| c.events().collect()).unwrap_or_default();
         for event in events {
@@ -3087,6 +3164,8 @@ impl App {
                 }
             },
             "close_tab" => self.close_tab_at(self.wins[self.cur].active, event_loop),
+            "prev_command" => self.jump_command(true),
+            "next_command" => self.jump_command(false),
             "reopen_tab" => {
                 // The shell that died comes back where it died. The title it
                 // carried is remembered for context we do not yet spend;
@@ -3787,6 +3866,51 @@ fn url_spans_in_row(chars: &[char], row: usize) -> Vec<UrlSpan> {
     out
 }
 
+/// One shell command delimited by OSC 133 A..D marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandBlock {
+    /// Absolute logical line of the prompt, as the state machine saw it
+    /// when the prompt-start mark was dispatched.
+    pub prompt_line: usize,
+    /// Command exit status, when the shell reported one.
+    pub exit: Option<i32>,
+    /// A D mark has landed. `exit == None` means "closed without a
+    /// status", not "still open" - the two states must not share a
+    /// sentinel, or a second D would reopen a finished command.
+    pub done: bool,
+}
+
+/// Fold one mark into a tab's blocks. Deliberately pure - the position was
+/// already computed where it was true; this only associates.
+fn apply_sem_mark(
+    blocks: &mut std::collections::VecDeque<CommandBlock>,
+    code: u8,
+    exit: Option<i32>,
+    line: usize,
+) {
+    match code {
+        // A: prompt start opens a block.
+        0 => {
+            blocks.push_back(CommandBlock { prompt_line: line, exit: None, done: false });
+            while blocks.len() > 512 {
+                blocks.pop_front();
+            }
+        },
+        // D: command end closes the newest still-open block. A D with no
+        // open A (marks started mid-session, or a shell that skips A) is
+        // not an error - nothing to close, and the next A opens fresh.
+        3 => {
+            if let Some(b) = blocks.iter_mut().rev().find(|b| !b.done) {
+                b.exit = exit;
+                b.done = true;
+            }
+        },
+        // B (prompt end) and C (command start) carry no position the v1 UI
+        // needs; the marks are consumed so they cannot misattribute later.
+        _ => {},
+    }
+}
+
 /// What a dying tab leaves behind for the reopen ring.
 fn tab_death(tab: &Tab) -> (String, Option<std::path::PathBuf>) {
     (tab.title.lock().unwrap().clone(), tab.cwd_raw())
@@ -4138,6 +4262,7 @@ impl ApplicationHandler for App {
         self.check_theme_files();
         self.drain_clipboard();
         self.drain_bell_pings();
+        self.drain_sems();
         self.drain_test_keys(event_loop);
     }
 
@@ -4207,6 +4332,7 @@ impl ApplicationHandler for App {
                 self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_bell_pings();
+                self.drain_sems();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
                 if let Some(action) = self.pending_action.take() {
@@ -5209,5 +5335,47 @@ mod url_tests {
         let per = t.elapsed() / n;
         eprintln!("{:?} per {}-char row", per, chars.len());
         assert!(per.as_micros() < 3000, "row scan too slow for a redraw path");
+    }
+}
+
+#[cfg(test)]
+mod sem_tests {
+    use super::apply_sem_mark;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn marks_fold_into_blocks() {
+        let mut b: VecDeque<super::CommandBlock> = VecDeque::new();
+        apply_sem_mark(&mut b, 0, None, 10); // A
+        apply_sem_mark(&mut b, 1, None, 10); // B
+        apply_sem_mark(&mut b, 2, None, 11); // C
+        apply_sem_mark(&mut b, 3, Some(0), 40); // D;0
+        apply_sem_mark(&mut b, 0, None, 41); // A
+        apply_sem_mark(&mut b, 3, Some(1), 55); // D;1
+        assert_eq!(b.len(), 2);
+        assert_eq!((b[0].prompt_line, b[0].exit), (10, Some(0)));
+        assert_eq!((b[1].prompt_line, b[1].exit), (41, Some(1)));
+    }
+
+    #[test]
+    fn stray_and_missing_marks_survive() {
+        let mut b: VecDeque<super::CommandBlock> = VecDeque::new();
+        apply_sem_mark(&mut b, 3, Some(2), 5); // D without A: no block, no panic
+        assert!(b.is_empty());
+        apply_sem_mark(&mut b, 0, None, 6); // A
+        apply_sem_mark(&mut b, 3, None, 9); // D with unknown status
+        apply_sem_mark(&mut b, 3, Some(7), 9); // second D must not reopen D
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].exit, None); // first D won with "unknown"
+    }
+
+    #[test]
+    fn ring_is_bounded() {
+        let mut b: VecDeque<super::CommandBlock> = VecDeque::new();
+        for i in 0..600 {
+            apply_sem_mark(&mut b, 0, None, i);
+        }
+        assert_eq!(b.len(), 512);
+        assert_eq!(b.front().unwrap().prompt_line, 88);
     }
 }
