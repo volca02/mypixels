@@ -387,6 +387,11 @@ struct App {
     last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
     /// last BEL seen anywhere (visual bell; see bell_flash)
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// A left button is held on a tab-strip entry and is dragging it: the
+    /// index is the tab's current position (live swaps keep it equal to
+    /// `hover_tab`). Releasing anywhere ends the drag; the tabs stay where
+    /// they were dropped, like dragging a browser tab past its neighbour.
+    tab_drag: Option<usize>,
     /// egui events synthesized from FIFO key specs, queued for the next
     /// RawInput. Events pushed straight into `ctx.input_mut` are wiped by
     /// `start_pass` before the UI reads them; only `RawInput.events` ride
@@ -631,6 +636,7 @@ impl App {
             cursor_blink,
             last_activity,
             bell,
+            tab_drag: None,
             fifo_egui_events: Vec::new(),
             modifiers: ModifiersState::empty(),
             program,
@@ -2646,6 +2652,17 @@ fn app_icon() -> Option<winit::window::Icon> {
     .map(|a| (**a).clone())
 }
 
+/// Where `active` lands when tabs `a` and `b` trade places.
+fn swap_follow(a: usize, b: usize, active: usize) -> usize {
+    if active == a {
+        b
+    } else if active == b {
+        a
+    } else {
+        active
+    }
+}
+
 fn egui_mods(m: ModifiersState) -> egui::Modifiers {
     let mut out = egui::Modifiers::NONE;
     if m.shift_key() {
@@ -3035,6 +3052,18 @@ impl ApplicationHandler for App {
                     let (a0, a1) = self.add_hit;
                     hover_add = px >= a0 && px < a1;
                 }
+                // Drag reorder: the held tab trades places every time the
+                // pointer crosses into another tab's cell. Swapping (rather
+                // than shifting) keeps the neighbour order stable when the
+                // pointer wobbles across a boundary.
+                if let Some(from) = self.tab_drag {
+                    if hover < self.tabs.len() && hover != from {
+                        self.tabs.swap(from, hover);
+                        self.active = swap_follow(from, hover, self.active);
+                        self.tab_drag = Some(hover);
+                        window.request_redraw();
+                    }
+                }
                 if hover != self.hover_tab || hover_add != self.hover_add {
                     self.hover_tab = hover;
                     self.hover_add = hover_add;
@@ -3094,6 +3123,9 @@ impl ApplicationHandler for App {
                             self.active = self.hover_tab;
                             window.request_redraw();
                         }
+                        // And it may become a drag: crossing into a neighbour
+                        // reorders from here (browser behaviour).
+                        self.tab_drag = Some(self.hover_tab);
                     } else if self.hover_add {
                         self.drag = None;
                         if let Some(tab) = self.tabs.get_mut(self.active) { tab.clear_selection(); }
@@ -3125,6 +3157,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
+                // A tab drag ends wherever the button comes up -- even over
+                // egui, whose panels would otherwise swallow the release and
+                // leave the drag armed.
+                self.tab_drag = None;
                 if egui_consumed {
                     return;
                 }
@@ -3498,5 +3534,22 @@ mod mouse_report_tests {
         // motion with the left button held
         assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0 | 32, 3, 9, false)).unwrap(), "\x1b[32;3;9M");
         assert_eq!(String::from_utf8(mouse_report_bytes(mode, 3 | 8, 3, 9, true)).unwrap(), "\x1b[11;3;9m");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::swap_follow;
+
+    #[test]
+    fn dragging_a_tab_moves_the_active_index_with_it() {
+        // Dragging the active tab: it follows to the drop cell.
+        assert_eq!(swap_follow(0, 2, 0), 2);
+        // Dragging another tab onto the active one: the active tab is
+        // displaced to the drag's old cell (it is the same tab, so its
+        // terminal -- and the selection inside it -- stay put).
+        assert_eq!(swap_follow(2, 0, 0), 2);
+        // A reorder that does not involve the active tab leaves it alone.
+        assert_eq!(swap_follow(1, 2, 0), 0);
     }
 }
