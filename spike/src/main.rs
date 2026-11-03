@@ -3012,6 +3012,29 @@ impl ApplicationHandler for App {
             .as_mut()
             .map(|e| e.on_event(&window, &event))
             .unwrap_or(false);
+        // An event egui claimed was claimed *for* a visual change -- hover,
+        // press, drag feedback all only exist in the next frame. Every
+        // motion over the panel is claimed, so without this the panel's
+        // state would advance invisibly and only become visible when an
+        // unrelated frame (the cursor-blink timer at best) happened to
+        // repaint it -- the one-interaction-behind feel. winit coalesces
+        // queued redraws, so a burst of events costs one frame.
+        // ... and motion/click must ask for a frame even when egui has not
+        // *yet* claimed the event: `consumed` is decided from egui's state
+        // before it sees this event, so the very move that carries the
+        // pointer onto a widget is unclaimed -- the frame that would render
+        // the resulting hover is exactly the one that would go unscheduled.
+        // Terminal input paths request their own frames already; this only
+        // adds motion-paced redraws, which winit coalesces to one per frame.
+        if egui_consumed
+            || matches!(
+                event,
+                winit::event::WindowEvent::CursorMoved { .. }
+                    | winit::event::WindowEvent::MouseInput { .. }
+            )
+        {
+            window.request_redraw();
+        }
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
