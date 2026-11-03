@@ -707,6 +707,8 @@ pub trait Handler {
 
     /// Report text area size in characters.
     fn text_area_size_chars(&mut self) {}
+    /// CSI 16 t - report the cell size in pixels.
+    fn cell_size_pixels(&mut self) {}
 
     /// Set hyperlink.
     fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
@@ -1759,6 +1761,7 @@ where
             ('T', []) => handler.scroll_down(next_param_or(1) as usize),
             ('t', []) => match next_param_or(1) as usize {
                 14 => handler.text_area_size_pixels(),
+                16 => handler.cell_size_pixels(),
                 18 => handler.text_area_size_chars(),
                 22 => handler.push_title(),
                 23 => handler.pop_title(),

@@ -45,6 +45,11 @@ pub struct SpikeListener {
     /// timed out after a second, and broot (via termimad) refused to
     /// start with "the keyboard enhancement status could not be read".
     pub pty_writes: Arc<Mutex<Vec<(usize, String)>>>,
+    /// Tabs that just executed a full reset (`ESC c`), whose graphics store
+    /// must die with the rest of the screen.
+    pub resets: Arc<Mutex<Vec<usize>>>,
+    /// Tabs whose application just asked (CSI 16 t) for the cell size.
+    pub cell_sizes: Arc<Mutex<Vec<usize>>>,
     /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line).
     /// Order per tab is the stream's own; the app folds them into command
     /// blocks (see `App::drain_sems`).
@@ -69,6 +74,14 @@ impl EventListener for SpikeListener {
             Event::Title(t) => {
                 *self.title.lock().unwrap() = t;
                 *self.last_activity.lock().unwrap() = std::time::Instant::now();
+                self.notify_window();
+            },
+            Event::CellSizeRequest => {
+                self.cell_sizes.lock().unwrap().push(self.tab_id);
+                self.notify_window();
+            },
+            Event::GraphicsReset => {
+                self.resets.lock().unwrap().push(self.tab_id);
                 self.notify_window();
             },
             Event::PtyWrite(text) => {
@@ -166,6 +179,8 @@ impl Tab {
             sems: Arc::clone(&shared.sems),
             apcs: Arc::clone(&shared.apcs),
             pty_writes: Arc::clone(&shared.pty_writes),
+            resets: Arc::clone(&shared.resets),
+            cell_sizes: Arc::clone(&shared.cell_sizes),
         };
 
         let term = Arc::new(FairMutex::new(Term::new(
@@ -181,6 +196,10 @@ impl Tab {
         )));
 
         tty::setup_env();
+        // Honest identity for anything that branches on it (alacritty's
+        // env setup above is process-global by design; we inherit it).
+        unsafe { std::env::set_var("TERM_PROGRAM", "mypixels") };
+        unsafe { std::env::set_var("TERM_PROGRAM_VERSION", crate::build_stamp()) };
         // alacritty_terminal advertises TERM=alacritty. We are not alacritty,
         // and more practically: shells' keybinding setups key off $TERM by
         // glob (the classic zsh `case $TERM in *xterm*)` idiom), and VTE -

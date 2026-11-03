@@ -368,6 +368,16 @@ impl TabKitty {
         self.images.get(&id)
     }
 
+    /// Full reset (`ESC c`): every image and placement dies, per the
+    /// protocol's own rules - a reset that leaves a picture burned in is
+    /// not a reset. (`clear`/ED is NOT a reset and does not call this,
+    /// matching kitty.)
+    pub fn clear_all(&mut self) {
+        self.images.clear();
+        self.placements.clear();
+        self.pending = None;
+    }
+
     /// Ids currently held, for GPU cache pruning on tab close.
     pub fn image_ids(&self) -> Vec<u32> {
         self.images.keys().copied().collect()
@@ -501,6 +511,19 @@ mod tests {
         k.on_apc(&bare, 1, 0); // bare continuation with no pending
         assert_eq!(k.images.len(), 0);
         assert_eq!(k.placements().len(), 0);
+    }
+
+    #[test]
+    fn clear_all_is_a_clean_slate() {
+        let mut k = TabKitty::default();
+        k.on_apc(&apc("a=T,i=3,f=100", &b64(&tiny_png())), 1, 0);
+        k.on_apc(&apc("a=t,i=9,f=100,m=1", &b64(&tiny_png())), 2, 0); // open transfer
+        k.clear_all();
+        assert!(k.placements().is_empty());
+        assert!(k.image(3).is_none());
+        // A pending transfer is gone too: a later m=0 must not resurrect it.
+        k.on_apc(&apc("m=0", &b64(&tiny_png())), 3, 0);
+        assert!(k.image(9).is_none());
     }
 
     #[test]

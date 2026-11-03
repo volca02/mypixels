@@ -80,6 +80,16 @@ pub enum Event {
         line: usize,
         col: usize,
     },
+
+    /// CSI 16 t: the application asks the window for the cell size in
+    /// pixels. Only the app knows that - it is broot (and sixel detection)
+    /// asking how to scale an image, answered from the live font metrics.
+    CellSizeRequest,
+
+    /// RIS (`ESC c`) executed: a full reset. The Kitty graphics store must
+    /// die with everything else on the screen - a `reset` that leaves a
+    /// picture burned in is not a reset.
+    GraphicsReset,
 }
 
 impl Debug for Event {
@@ -98,6 +108,8 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Semantic { .. } => write!(f, "Semantic"),
             Event::Apc { payload, .. } => write!(f, "Apc({} bytes)", payload.len()),
+            Event::GraphicsReset => write!(f, "GraphicsReset"),
+            Event::CellSizeRequest => write!(f, "CellSizeRequest"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
         }

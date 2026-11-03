@@ -426,6 +426,8 @@ struct App {
     /// Complete APC strings awaiting graphics interpretation.
     apcs_ring: Arc<std::sync::Mutex<Vec<(usize, Vec<u8>, usize, usize)>>>,
     pty_writes_ring: Arc<std::sync::Mutex<Vec<(usize, String)>>>,
+    resets_ring: Arc<std::sync::Mutex<Vec<usize>>>,
+    cell_sizes_ring: Arc<std::sync::Mutex<Vec<usize>>>,
     /// Per-tab Kitty graphics state, keyed by stable tab id; created on
     /// first use, removed when the tab dies.
     kitty: std::collections::HashMap<usize, kitty::TabKitty>,
@@ -606,11 +608,15 @@ impl App {
             sems: Arc::new(Mutex::new(Vec::new())),
             apcs: Arc::new(Mutex::new(Vec::new())),
             pty_writes: Arc::new(Mutex::new(Vec::new())),
+            resets: Arc::new(Mutex::new(Vec::new())),
+            cell_sizes: Arc::new(Mutex::new(Vec::new())),
         };
         let bells = Arc::clone(&shared.bells);
         let sems = Arc::clone(&shared.sems);
         let apcs = Arc::clone(&shared.apcs);
         let pty_writes = Arc::clone(&shared.pty_writes);
+        let resets = Arc::clone(&shared.resets);
+        let cell_sizes = Arc::clone(&shared.cell_sizes);
         let exited = Arc::clone(&shared.exited);
         let last_activity = Arc::clone(&shared.last_activity);
         let bell = Arc::clone(&shared.bell);
@@ -716,6 +722,8 @@ impl App {
             sems_ring: sems,
             apcs_ring: apcs,
             pty_writes_ring: pty_writes,
+            resets_ring: resets,
+            cell_sizes_ring: cell_sizes,
             kitty: Default::default(),
             sem_blocks: Default::default(),
             session_rx,
@@ -998,6 +1006,8 @@ impl App {
             sems: Arc::clone(&self.sems_ring),
             apcs: Arc::clone(&self.apcs_ring),
             pty_writes: Arc::clone(&self.pty_writes_ring),
+            resets: Arc::clone(&self.resets_ring),
+            cell_sizes: Arc::clone(&self.cell_sizes_ring),
         }
     }
 
@@ -3063,6 +3073,48 @@ impl App {
         }
     }
 
+    /// A tab executed RIS: drop its whole graphics store and the GPU
+    /// textures that came from it, everywhere they were painted.
+    fn drain_resets(&mut self) {
+        let ids: Vec<usize> = std::mem::take(&mut *self.resets_ring.lock().unwrap());
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            if let Some(k) = self.kitty.get_mut(&id) {
+                k.clear_all();
+            }
+            self.forget_gpu_images(id);
+        }
+        for w in self.wins.iter_mut() {
+            if let Some(win) = w.window.as_ref() {
+                win.request_redraw();
+            }
+        }
+    }
+
+    /// CSI 16 t answered from live font metrics: `CSI 6 ; h ; w t`. This is
+    /// how broot's kitty renderer (and sixel detectors) learn to scale
+    /// pixels to cells - without it they refuse to draw anything.
+    fn drain_cell_sizes(&mut self) {
+        let ids: Vec<usize> = std::mem::take(&mut *self.cell_sizes_ring.lock().unwrap());
+        if ids.is_empty() {
+            return;
+        }
+        let reply = format!(
+            "\x1b[6;{};{}t",
+            self.cell_h.round() as u32,
+            self.cell_w.round() as u32
+        );
+        for w in self.wins.iter_mut() {
+            for t in w.tabs.iter_mut() {
+                if ids.contains(&t.id) {
+                    t.write(reply.as_bytes());
+                }
+            }
+        }
+    }
+
     fn drain_clipboard(&mut self) {
         let events: Vec<_> = self.clipboard.as_ref().map(|c| c.events().collect()).unwrap_or_default();
         for event in events {
@@ -4475,6 +4527,8 @@ impl ApplicationHandler for App {
         self.drain_sems();
         self.drain_apcs();
         self.drain_ptwrites();
+        self.drain_resets();
+        self.drain_cell_sizes();
         self.drain_test_keys(event_loop);
     }
 
@@ -4547,6 +4601,8 @@ impl ApplicationHandler for App {
                 self.drain_sems();
                 self.drain_apcs();
                 self.drain_ptwrites();
+                self.drain_resets();
+                self.drain_cell_sizes();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
                 if let Some(action) = self.pending_action.take() {

@@ -1894,6 +1894,8 @@ impl<T: EventListener> Handler for Term<T> {
     /// Reset all important fields in the term struct.
     #[inline]
     fn reset_state(&mut self) {
+        // mypixels patch: RIS also clears the graphics store (app-side).
+        self.event_proxy.send_event(Event::GraphicsReset);
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
@@ -2326,6 +2328,11 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     #[inline]
+    fn cell_size_pixels(&mut self) {
+        // mypixels patch: the pixel geometry lives in the app, answer there.
+        self.event_proxy.send_event(Event::CellSizeRequest);
+    }
+
     fn text_area_size_chars(&mut self) {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
