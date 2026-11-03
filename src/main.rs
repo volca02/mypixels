@@ -2881,8 +2881,10 @@ impl App {
         } else {
             blocks.iter().map(|b| b.prompt_line).filter(|l| *l > cur_top).min()
         };
+        log::debug!("jump back={back} blocks={} hist={hist} cur={cur} target={target:?}", blocks.len());
         if let Some(t) = target {
             let want = hist.saturating_sub(t);
+            log::debug!("jump -> offset {want} (delta {})", want as i32 - cur as i32);
             tab.scroll(alacritty_terminal::grid::Scroll::Delta(
                 want as i32 - cur as i32,
             ));

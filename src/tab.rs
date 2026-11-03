@@ -61,6 +61,7 @@ impl EventListener for SpikeListener {
                 self.notify_window();
             },
             Event::Semantic { code, exit, line, .. } => {
+                log::debug!("sem mark tab {} code {} exit {:?} line {}", self.tab_id, code, exit, line);
                 self.sems.lock().unwrap().push((self.tab_id, code, exit, line));
             },
             Event::Bell => {

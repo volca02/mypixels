@@ -27,10 +27,12 @@ Current priorities:
    plus a red pulse on that tab's cell. `scripts/shell_integration.{bash,
    zsh,fish}` ring the bell on failed commands - "notify me when the build
    breaks" with no daemon, working across ssh. Full OSC 133 semantics
-   (prompt jump, copy-last-output) need a pty byte-tap: the library parses
-   OSC internally and offers no hook; replicating its reader loop is the
-   open step. Bell escalation and shell cwd (/proc) already cover the two
-   most-wanted 133 use cases.
+   OSC 133: shipped (M0-M2 of docs/graphics_osc133_implementation.md).
+   vte+alacritty_terminal vendored with an osc_raw observer hook; A/B/C/D
+   marks captured at dispatch with absolute lines; Ctrl+Alt+Up/Down jump
+   between commands; scripts emit the marks in bash/zsh/fish alongside
+   the failure bell. Kitty graphics (M3-M6) and sixel/iTerm2 (M7) remain
+   on the doc's plan.
 6. **Search (P2).** A reusable inline text input, incremental search, next/previous
    matches, visible match state, and cancellation back to the terminal.
 7. **Multi-window: shipped.** One process hosts many windows: `Ctrl+Shift+n`,
