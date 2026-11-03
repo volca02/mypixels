@@ -95,7 +95,28 @@ def main():
                 return 1
         print('PASS: remote tab ran in the client cwd')
 
-        # 4. --standalone hosts nothing: no registration, still a terminal.
+        # 4. `mypixels -n` asks the LIVE session for a window: same process,
+        # second window, tab running the command in the caller's directory.
+        hd = home('window2', 'keys')
+        before = (ha / 'app.log').stat().st_size
+        d = sp.run([str(BIN), '-n', 'sh', '-c', 'touch window-marker; exec sh'],
+                   env=env_for(hd, 'keys'), cwd=str(hd),
+                   capture_output=True, timeout=10)
+        if d.returncode != 0:
+            print(f'FAIL: -n client exited {d.returncode}: {d.stderr.decode()[:200]}')
+            return 1
+        if not wait_for(ha / 'app.log', 'opened a remote window'):
+            print('FAIL: session A never opened the requested window')
+            return 1
+        deadline = time.time() + 10
+        while time.time() < deadline and not (hd / 'window-marker').exists():
+            time.sleep(0.2)
+        if not (hd / 'window-marker').exists():
+            print('FAIL: the new window ran its tab somewhere else than asked')
+            return 1
+        print('PASS: -n opened a second window inside the session')
+
+        # 5. --standalone hosts nothing: no registration, still a terminal.
         hc = home('solo', 'keys')
         log_c = (hc / 'app.log').open('w')
         c = sp.Popen([str(BIN), '-s', 'sh'], env=env_for(hc, 'keys'),

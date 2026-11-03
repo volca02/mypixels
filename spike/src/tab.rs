@@ -22,7 +22,7 @@ use winit::window::Window;
 /// records title changes, and reports child exit.
 #[derive(Clone)]
 pub struct SpikeListener {
-    pub window: Arc<Mutex<Option<Arc<Window>>>>,
+    pub window: Arc<Mutex<Vec<Arc<Window>>>>,
     pub tab_id: usize,
     pub title: Arc<Mutex<String>>,
     /// tab ids whose child process exited (drained by the app)
@@ -35,7 +35,7 @@ pub struct SpikeListener {
 
 impl SpikeListener {
     fn notify_window(&self) {
-        if let Some(w) = self.window.lock().unwrap().as_ref() {
+        for w in self.window.lock().unwrap().iter() {
             w.request_redraw();
         }
     }

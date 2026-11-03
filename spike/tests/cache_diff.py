@@ -35,6 +35,10 @@ default_height: 600
 default_maximize: false
 term_opacity: 0
 hide_single_tab: false
+# The default background tint (a deliberate post-oracle change) would make
+# every pixel differ from the oracle's black for reasons this test is not
+# about. Pin it black: parity here means TERMINAL content parity.
+bg_tint_color: "#000000"
 """
 
 

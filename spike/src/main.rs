@@ -283,14 +283,69 @@ struct SwThumb {
     last: std::time::Instant,
 }
 
-struct App {
-    config: Config,
+/// Everything that lives "in a window": the surface and its GPU, this
+/// window's egui state, the tab strip as this window displays it, and the
+/// per-window input/selection/switcher state. Windows in one process share
+/// the config, the fonts, the clipboard and the session bus -- and moving a
+/// tab between windows is a Vec::remove plus a Vec::push, which is exactly
+/// why the windows live in one process at all: a terminal is its pty, and a
+/// pty cannot cross a process boundary.
+struct Win {
+    window: Option<Arc<Window>>,
+    gpu: Option<Gpu>,
+    /// egui side: config panel, switcher overlay, rename box -- one context
+    /// per window on purpose: shared egui contexts leak hover state between
+    /// windows, and two independent contexts cost only a font atlas.
+    egui: Option<egui_ui::Egui>,
     tabs: Vec<Tab>,
     active: usize,
-    next_id: usize,
     dims: Dims,
+    /// This window's grid. The App-level rows/cols are the template a new
+    /// window is sized from; these are what is actually on screen.
     cols: usize,
     rows: usize,
+    tab_hits: Vec<(f32, f32)>,
+    add_hit: (f32, f32),
+    pointer: (f32, f32),
+    mouse_button: Option<MouseButton>,
+    mouse_last: Option<(u16, u16)>,
+    drag: Option<(Point, Side)>,
+    click: Option<(u8, u32, (f32, f32), std::time::Instant)>,
+    wheel_pixels: f32,
+    hover_tab: usize,
+    hover_add: bool,
+    tablist_hidden: bool,
+    /// The egui rename box is open: keys belong to it, not the terminal.
+    renaming: bool,
+    /// Alt-held visual switcher (only ever the focused window's; the Alt
+    /// key itself is a global modifier).
+    overview: Option<OverviewState>,
+    sw_thumbs: Vec<Option<SwThumb>>,
+    thumb_rr: usize,
+    /// last BEL seen anywhere (visual bell; see bell_flash)
+    autoscroll_next: Option<Instant>,
+    tab_drag: Option<usize>,
+    /// The tab drag crossed into another cell, so the press has become a
+    /// reorder and the release must not also count as a click.
+    tab_drag_moved: bool,
+    /// egui events synthesized from FIFO key specs, queued for the next
+    /// RawInput.
+    fifo_egui_events: Vec<egui::Event>,
+    /// Per-window error/status bubble (see show_error).
+    notice: Option<(String, Instant)>,
+    /// Winit's focus report. The switcher and the attention request consult
+    /// it, so a background window's blink never steals a foreground gesture.
+    focused: bool,
+}
+
+struct App {
+    config: Config,
+    /// The windows of this session, in creation order. `cur` is the one the
+    /// event being handled belongs to (set by the router at the top of
+    /// `window_event`); "current window" is what every helper below means.
+    wins: Vec<Win>,
+    cur: usize,
+    next_id: usize,
     cell_w: f32,
     cell_h: f32,
     tab_char_w: f32,
@@ -310,43 +365,19 @@ struct App {
     /// 15px, Terminus 12 on 17px) and one guessed factor fit neither.
     term_metrics: fonts::LineMetrics,
     tab_metrics: fonts::LineMetrics,
-    /// Strip hit boxes from the last drawn frame, in window pixels: (x0, x1)
-    /// per tab, plus the [+] button. Recorded while drawing, read by the mouse
-    /// handlers, so hit-testing can never disagree with what is on screen.
-    tab_hits: Vec<(f32, f32)>,
-    add_hit: (f32, f32),
-    /// Last pointer position, so a button press can hit-test without waiting for
-    /// the next `CursorMoved`.
-    pointer: (f32, f32),
-    /// Button held while the terminal receives mouse reports; motion events
-    /// must carry the held button's code.
-    mouse_button: Option<MouseButton>,
-    /// Last viewport cell a report covered: dedupes motion, and stands in for
-    /// the release coordinates when the pointer leaves the terminal area.
-    mouse_last: Option<(u16, u16)>,
-    /// Cell a left-drag last covered; the selection only moves when a new cell
-    /// is entered, which keeps dragging from repainting every pixel step.
-    drag: Option<(Point, Side)>,
-    /// Click counting for word/line selection: (button, count, position, when).
-    /// winit 0.30 reports press counts for keys but not for mouse buttons.
-    click: Option<(u8, u32, (f32, f32), std::time::Instant)>,
+    /// New-window grid template (and the very first window's size): App keeps
+    /// a cols/rows pair even though every window owns its real grid.
+    cols: usize,
+    rows: usize,
     clipboard: Option<clipboard::Clipboard>,
     theme_watcher: Option<theme::Watcher>,
-    notice: Option<(String, Instant)>,
-    wheel_pixels: f32,
-    /// Tab under the pointer, or usize::MAX for none.
-    hover_tab: usize,
-    hover_add: bool,
-    tablist_hidden: bool,
     fg: [f32; 3],
     bg: [f32; 3],
     exited: Arc<Mutex<Vec<usize>>>,
-    window_slot: Arc<Mutex<Option<Arc<Window>>>>,
-    window: Option<Arc<Window>>,
-    gpu: Option<Gpu>,
-    /// egui side: the configuration window, composited on top of the
-    /// hand-drawn frame by `Gpu::render_frame`.
-    egui: Option<egui_ui::Egui>,
+    /// Every live window, for the wake closures that outlive any single one
+    /// (pty listeners, clock, clipboard, theme watcher): a redraw request
+    /// goes to all of them; drawing the wrong one is cheap and correct.
+    window_slot: Arc<Mutex<Vec<Arc<Window>>>>,
     font_system: FontSystem,
     mono_attrs: Attrs<'static>,
     tab_attrs: Attrs<'static>,
@@ -360,17 +391,6 @@ struct App {
     term_weight: u16,
     term_slant: fonts::DbStyle,
     term_pt: f32,
-    /// The egui rename box is open: keys belong to it, not the terminal
-    /// (see `egui_ui::rename_box` for the editing itself).
-    renaming: bool,
-    /// Alt-held visual switcher. Releasing Alt keeps its selected tab.
-    overview: Option<OverviewState>,
-    /// The egui switcher's thumbnails: per tab, the readback texture, the size
-    /// it was read at, the content signature it matches, and when it was last
-    /// read. Cleared when the switcher closes, so the textures are dropped.
-    sw_thumbs: Vec<Option<SwThumb>>,
-    /// Rotating cursor for the readback order (mirrors `gpu.prev_rr`).
-    thumb_rr: usize,
     /// Alt-held tab switcher timing, shared with a background clock thread.
     /// `switcher_alt_at` is when Alt went down (None when released); the clock
     /// opens the switcher after the configured delay (`tab_overview_delay_ms`)
@@ -388,29 +408,11 @@ struct App {
     last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
     /// last BEL seen anywhere (visual bell; see bell_flash)
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
-    /// next tick of selection-drag autoscroll (see the block in `draw`)
-    autoscroll_next: Option<Instant>,
-    /// A left button is held on a tab-strip entry and is dragging it: the
-    /// index is the tab's current position (live swaps keep it equal to
-    /// `hover_tab`). Releasing anywhere ends the drag; the tabs stay where
-    /// they were dropped, like dragging a browser tab past its neighbour.
-    tab_drag: Option<usize>,
     /// Daemon: tab/rise requests forwarded by other mypixels processes.
     session_rx: std::sync::mpsc::Receiver<session::Request>,
     /// Keeps the session-bus thread -- and with it the bus name -- alive for
     /// as long as the app runs.
     _session: Option<session::Server>,
-    /// This window's slot once the bus thread has claimed one (0 = not yet /
-    /// never). Tabs pass it to their shells as $MYPIXELS_WINDOW.
-    session_index: Arc<std::sync::atomic::AtomicU32>,
-    /// The tab drag crossed into another cell, so the press has become a
-    /// reorder and the release must not also count as a click.
-    tab_drag_moved: bool,
-    /// egui events synthesized from FIFO key specs, queued for the next
-    /// RawInput. Events pushed straight into `ctx.input_mut` are wiped by
-    /// `start_pass` before the UI reads them; only `RawInput.events` ride
-    /// through to the widgets.
-    fifo_egui_events: Vec<egui::Event>,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -513,7 +515,7 @@ impl App {
 
         let (program, args) = term_command();
 
-        let window_slot = Arc::new(Mutex::new(None));
+        let window_slot = Arc::new(Mutex::new(Vec::new()));
         let key_rx = spawn_key_reader(Arc::clone(&window_slot));
         // Daemon mode: claim this display's session name unless asked for a
         // private instance. Another `mypixels` run will find us here and open
@@ -524,23 +526,19 @@ impl App {
             .take_while(|a| a.starts_with('-'))
             .any(|a| a == "--standalone" || a == "-s");
         let (session_tx, session_rx) = std::sync::mpsc::channel();
-        let (_session, session_index) = if standalone {
-            (None, Arc::new(std::sync::atomic::AtomicU32::new(0)))
+        let _session = if standalone {
+            None
         } else {
             session::bus_name()
                 .and_then(|name| {
                     let slot = Arc::clone(&window_slot);
                     session::start(&name, session_tx, move || {
                         if let Ok(slot) = slot.lock() {
-                            if let Some(w) = slot.as_ref() {
+                            for w in slot.iter() {
                                 w.request_redraw();
                             }
                         }
                     })
-                })
-                .map(|(srv, idx)| (Some(srv), idx))
-                .unwrap_or_else(|| {
-                    (None, Arc::new(std::sync::atomic::AtomicU32::new(0)))
                 })
         };
         let shared = SpikeListener {
@@ -587,7 +585,7 @@ impl App {
                     };
                     if blink.load(Ordering::SeqCst) != visible {
                         blink.store(visible, Ordering::SeqCst);
-                        if let Some(w) = ws.lock().unwrap().as_ref() {
+                        for w in ws.lock().unwrap().iter() {
                             w.request_redraw();
                         }
                     }
@@ -597,13 +595,13 @@ impl App {
                             if enabled && now.duration_since(at).as_millis() >= delay_ms as u128
                                 && !show_req.swap(true, Ordering::SeqCst)
                             {
-                                if let Some(w) = ws.lock().unwrap().as_ref() { w.request_redraw(); }
+                                for w in ws.lock().unwrap().iter() { w.request_redraw(); }
                             }
                         }
                     } else if now.duration_since(last_refresh).as_millis() >= refresh_ms as u128 {
                         // Keep every preview live while the switcher is open.
                         last_refresh = now;
-                        if let Some(w) = ws.lock().unwrap().as_ref() {
+                        for w in ws.lock().unwrap().iter() {
                             w.request_redraw();
                         }
                     }
@@ -615,15 +613,12 @@ impl App {
         // adjusts it once the surface exists.
         let cols = ((config.default_width as f32 / cell_w) as usize).clamp(20, 512);
         let rows = (((config.default_height as f32 - tab_h) / cell_h) as usize).clamp(10, 400);
-        let dims = Dims { cols, rows };
-        let tablist_hidden = config.tablist_hide;
 
         App {
+            wins: Vec::new(),
+            cur: 0,
             config,
-            tabs: Vec::new(),
-            active: 0,
             next_id: 0,
-            dims,
             cols,
             rows,
             cell_w,
@@ -634,27 +629,12 @@ impl App {
             scale: 1.0,
             term_metrics,
             tab_metrics,
-            tab_hits: Vec::new(),
-            add_hit: (0.0, 0.0),
-            pointer: (0.0, 0.0),
-            mouse_button: None,
-            mouse_last: None,
-            drag: None,
-            click: None,
             clipboard: None,
             theme_watcher: None,
-            notice: None,
-            wheel_pixels: 0.0,
-            hover_tab: usize::MAX,
-            hover_add: false,
-            tablist_hidden,
             fg,
             bg,
             exited,
             window_slot,
-            window: None,
-            gpu: None,
-            egui: None,
             font_system,
             mono_attrs,
             tab_attrs,
@@ -663,23 +643,14 @@ impl App {
             term_weight,
             term_slant,
             term_pt,
-            renaming: false,
-            overview: None,
-            sw_thumbs: Vec::new(),
-            thumb_rr: 0,
             switcher_alt_at,
             switcher_show_req,
             switcher_open,
             cursor_blink,
             last_activity,
             bell,
-            tab_drag: None,
             session_rx,
             _session,
-            session_index,
-            tab_drag_moved: false,
-            autoscroll_next: None,
-            fifo_egui_events: Vec::new(),
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -707,7 +678,7 @@ impl App {
         // The font popup previews from the app's own database, so the list
         // is exactly what the terminal can actually load.
         let font_choices = fonts::font_choices(self.font_system.db());
-        self.egui = Some(egui_ui::Egui::init(
+        self.wins[self.cur].egui = Some(egui_ui::Egui::init(
             event_loop,
             &gpu.device,
             &gpu.queue,
@@ -715,7 +686,7 @@ impl App {
             self.scale,
             font_choices,
         ));
-        self.gpu = Some(gpu);
+        self.wins[self.cur].gpu = Some(gpu);
     }
 
     fn add_tab(&mut self) {
@@ -733,8 +704,8 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let window_size = WindowSize {
-            num_lines: self.rows as u16,
-            num_cols: self.cols as u16,
+            num_lines: self.wins[self.cur].rows as u16,
+            num_cols: self.wins[self.cur].cols as u16,
             cell_width: self.cell_w as u16,
             cell_height: self.cell_h as u16,
         };
@@ -744,25 +715,35 @@ impl App {
         };
         let tab = Tab::new(
             id,
-            &self.dims,
+            &self.wins[self.cur].dims,
             window_size,
             program,
             args,
             &self.listener(),
             self.config.scrollback_lines,
             cwd,
-            self.session_index.load(std::sync::atomic::Ordering::SeqCst),
+            // The shell learns WHICH window of the session it lives in, so a
+            // `mypixels` typed in it joins that window, not window 1. 1-based
+            // because 0 in the environment means "standalone, stay out".
+            self.cur as u32 + 1,
         );
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+        self.wins[self.cur].tabs.push(tab);
+        self.wins[self.cur].active = self.wins[self.cur].tabs.len() - 1;
     }
 
     /// Handle what other mypixels processes asked of this session.
-    fn drain_session_requests(&mut self) {
+    fn drain_session_requests(&mut self, event_loop: &ActiveEventLoop) {
         let mut opened = false;
         while let Ok(req) = self.session_rx.try_recv() {
             match req {
-                session::Request::OpenTab { cwd, argv } => {
+                session::Request::OpenTab { window, cwd, argv } => {
+                    // The number is the requesting shell's window; if it
+                    // still exists the tab goes exactly there. A stale or
+                    // absent number means "wherever the user is looking",
+                    // which is already `cur`.
+                    if window >= 1 && (window as usize) <= self.wins.len() {
+                        self.cur = window as usize - 1;
+                    }
                     // Trust but verify the directory: the caller may have
                     // raced its own rmdir; a vanished cwd means "who cares",
                     // not "fail".
@@ -785,16 +766,34 @@ impl App {
                     self.add_tab_with(cwd, cmd);
                     opened = true;
                 }
+                session::Request::NewWindow { cwd, argv } => {
+                    let cmd = if argv.is_empty() {
+                        None
+                    } else {
+                        Some((argv[0].clone(), argv[1..].to_vec()))
+                    };
+                    if let Some((program, _)) = cmd.as_ref() {
+                        if !command_exists(program) {
+                            log::warn!("session: refusing unknown command {program:?}");
+                            continue;
+                        }
+                    }
+                    let cwd = cwd.map(std::path::PathBuf::from).filter(|p| p.is_dir());
+                    log::info!("session: opened a remote window ({} windows now)", self.wins.len() + 1);
+                    self.make_window(event_loop, cmd, cwd);
+                    self.cur = self.wins.len() - 1;
+                    opened = true;
+                }
                 session::Request::Raise => opened = true,
             }
         }
         if opened {
-            if let Some(w) = &self.window {
+            if let Some(w) = &self.wins[self.cur].window {
                 // The compositor owns focus; an attention request is how a
                 // polite app says "over here" without stealing the keyboard.
                 w.request_user_attention(Some(winit::window::UserAttentionType::Critical));
             }
-            log::info!("session: opened a remote tab (tabs={})", self.tabs.len());
+            log::info!("session: opened a remote tab (tabs={})", self.wins[self.cur].tabs.len());
         }
     }
 
@@ -810,31 +809,31 @@ impl App {
     }
 
     fn close_tab_at(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
-        if idx >= self.tabs.len() {
+        if idx >= self.wins[self.cur].tabs.len() {
             return;
         }
         // Stable ids: find the id of the tab being removed
-        self.tabs.remove(idx);
-        if self.tabs.is_empty() {
+        self.wins[self.cur].tabs.remove(idx);
+        if self.wins[self.cur].tabs.is_empty() {
             event_loop.exit();
             return;
         }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if self.active > idx {
-            self.active -= 1;
+        if self.wins[self.cur].active >= self.wins[self.cur].tabs.len() {
+            self.wins[self.cur].active = self.wins[self.cur].tabs.len() - 1;
+        } else if self.wins[self.cur].active > idx {
+            self.wins[self.cur].active -= 1;
         }
     }
 
     /// Whether the tab strip is currently shown (manual hide flag and
     /// `hide_single_tab` both apply).
     fn show_tab_strip(&self) -> bool {
-        !self.tablist_hidden && !(self.config.hide_single_tab && self.tabs.len() <= 1)
+        !self.wins[self.cur].tablist_hidden && !(self.config.hide_single_tab && self.wins[self.cur].tabs.len() <= 1)
     }
 
     /// Resize terminal grid of all tabs to fit the current surface size.
     fn sync_term_size(&mut self) {
-        let (w, h) = match self.gpu.as_ref() {
+        let (w, h) = match self.wins[self.cur].gpu.as_ref() {
             Some(g) => (g.config.width, g.config.height),
             None => return,
         };
@@ -856,20 +855,20 @@ impl App {
                 nrows = r.parse().unwrap_or(nrows);
             }
         }
-        if (ncols, nrows) != (self.cols, self.rows) {
-            eprintln!("term resize: {}x{} -> {}x{}", self.cols, self.rows, ncols, nrows);
-            self.cols = ncols;
-            self.rows = nrows;
-            self.dims.cols = ncols;
-            self.dims.rows = nrows;
+        if (ncols, nrows) != (self.wins[self.cur].cols, self.wins[self.cur].rows) {
+            eprintln!("term resize: {}x{} -> {}x{}", self.wins[self.cur].cols, self.wins[self.cur].rows, ncols, nrows);
+            self.wins[self.cur].cols = ncols;
+            self.wins[self.cur].rows = nrows;
+            self.wins[self.cur].dims.cols = ncols;
+            self.wins[self.cur].dims.rows = nrows;
             let window_size = WindowSize {
                 num_lines: nrows as u16,
                 num_cols: ncols as u16,
                 cell_width: self.cell_w as u16,
                 cell_height: self.cell_h as u16,
             };
-            for tab in &self.tabs {
-                tab.term.lock().resize(self.dims);
+            for tab in &self.wins[self.cur].tabs {
+                tab.term.lock().resize(self.wins[self.cur].dims);
                 let _ = tab.sender.send(Msg::Resize(window_size));
             }
         }
@@ -883,7 +882,7 @@ impl App {
     fn apply_config(&mut self, font_changed: bool) {
         self.fg = self.config.foreground_color.to_f32();
         self.bg = crate::config::terminal_bg(&self.config).to_f32();
-        if let Some(gpu) = &mut self.gpu {
+        if let Some(gpu) = &mut self.wins[self.cur].gpu {
             gpu.slot_sig.fill(0);
             gpu.prev_sigs.fill(0);
         }
@@ -899,7 +898,7 @@ impl App {
                 self.config = config;
                 self.apply_config(font_changed);
                 if let Some(watcher) = &self.theme_watcher { watcher.set_paths(self.config.theme_files.clone()); }
-                if let Some(window) = &self.window { window.request_redraw(); }
+                if let Some(window) = &self.wins[self.cur].window { window.request_redraw(); }
                 log::info!("configuration and colors reloaded");
             }
             Err(e) => self.show_error(format!("Theme/config reload: {e}")),
@@ -950,7 +949,7 @@ impl App {
         self.cell_w = cell_w;
         self.cell_h = cell_h;
 
-        if let Some(gpu) = &mut self.gpu {
+        if let Some(gpu) = &mut self.wins[self.cur].gpu {
             gpu.pool = (0..MAX_RUNS)
                 .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh)))
                 .collect();
@@ -1026,7 +1025,7 @@ impl App {
         // Whole pixels again, for the same reason as the cell grid.
         self.tab_h = (tab_lh + TAB_VPAD * 2.0).round().max(1.0);
 
-        if let Some(gpu) = &mut self.gpu {
+        if let Some(gpu) = &mut self.wins[self.cur].gpu {
             gpu.tab_pool = (0..16)
                 .map(|_| {
                     Buffer::new(
@@ -1092,8 +1091,8 @@ impl App {
         let fg = resolve(&Color::Named(NamedColor::Foreground));
         let bg = resolve(&Color::Named(NamedColor::Background));
         let cursor_color = resolve(&Color::Named(NamedColor::Cursor));
-        let rows = self.rows;
-        let cols = self.cols;
+        let rows = self.wins[self.cur].rows;
+        let cols = self.wins[self.cur].cols;
 
         let mut runs: Vec<Run> = Vec::new();
         let mut cur: Option<Run> = None;
@@ -1167,7 +1166,7 @@ impl App {
         } else {
             match content.cursor.shape {
                 alacritty_terminal::vte::ansi::CursorShape::Hidden => None,
-                _ if content.cursor.point.line.0 + (content.display_offset as i32) < self.rows as i32 => Some((
+                _ if content.cursor.point.line.0 + (content.display_offset as i32) < self.wins[self.cur].rows as i32 => Some((
                     content.cursor.point.column.0 as u32,
                     (content.cursor.point.line.0 + content.display_offset as i32) as u32,
                 )),
@@ -1182,16 +1181,16 @@ impl App {
     /// Builds a frame per tab (before the mutable gpu borrow), then hands
     /// off to the gpu pass.
     fn draw(&mut self, window: &Window) {
-        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.notice = None; }
+        if self.wins[self.cur].notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.wins[self.cur].notice = None; }
         // Selection-drag autoscroll: hold the dragged edge above or below
         // the grid and the history travels under it at 20 lines/second,
         // the selection tracking the edge cell. Frame-driven -- each tick
         // asks for the next frame while the pointer stays outside.
         {
-            let (px, py) = self.pointer;
+            let (px, py) = self.wins[self.cur].pointer;
             let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
-            let bottom = strip_h + self.rows as f32 * self.cell_h;
-            let dir = if self.drag.is_some() && !self.tabs.is_empty() {
+            let bottom = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
+            let dir = if self.wins[self.cur].drag.is_some() && !self.wins[self.cur].tabs.is_empty() {
                 if py < strip_h {
                     Some(-1i32)
                 } else if py > bottom {
@@ -1203,16 +1202,16 @@ impl App {
                 None
             };
             if let Some(d) = dir {
-                if self.autoscroll_next.map_or(true, |t| Instant::now() >= t) {
-                    self.autoscroll_next = Some(Instant::now() + std::time::Duration::from_millis(50));
-                    let tab = &self.tabs[self.active];
+                if self.wins[self.cur].autoscroll_next.map_or(true, |t| Instant::now() >= t) {
+                    self.wins[self.cur].autoscroll_next = Some(Instant::now() + std::time::Duration::from_millis(50));
+                    let tab = &self.wins[self.cur].tabs[self.wins[self.cur].active];
                     tab.scroll(alacritty_terminal::grid::Scroll::Delta(d));
                     // Same buffer-line transform as `cell_at`, applied to
                     // the edge row of the post-scroll view.
-                    let col = ((px / self.cell_w).floor() as usize).min(self.cols.saturating_sub(1));
+                    let col = ((px / self.cell_w).floor() as usize).min(self.wins[self.cur].cols.saturating_sub(1));
                     let within = px / self.cell_w - (px / self.cell_w).floor();
                     let side = if within < 0.5 { Side::Left } else { Side::Right };
-                    let vis_row = if d < 0 { 0 } else { self.rows as i32 - 1 };
+                    let vis_row = if d < 0 { 0 } else { self.wins[self.cur].rows as i32 - 1 };
                     let off = tab.term.lock().grid().display_offset() as i32;
                     tab.update_selection(
                         Point { line: Line(vis_row - off), column: Column(col) },
@@ -1221,17 +1220,17 @@ impl App {
                     window.request_redraw();
                 }
             } else {
-                self.autoscroll_next = None;
+                self.wins[self.cur].autoscroll_next = None;
             }
         }
         let t_start = Instant::now();
-        let Some(tab) = self.tabs.get(self.active) else {
+        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
             return;
         };
         // The active tab is "focused" iff the window has input focus
         // (covers tab switching, which produces no Focused event).
         {
-            let active = &self.tabs[self.active];
+            let active = &self.wins[self.cur].tabs[self.wins[self.cur].active];
             active.term.lock().is_focused = window.has_focus();
         }
         let blink = self.cursor_blink.load(Ordering::SeqCst);
@@ -1250,8 +1249,8 @@ impl App {
             self.bg = bell_mix(self.bg, bell_k);
             window.request_redraw();
         }
-        let ov_frames: Vec<FrameData> = if self.overview.is_some() {
-            self.tabs.iter().map(|t| self.build_frame(t, true)).collect()
+        let ov_frames: Vec<FrameData> = if self.wins[self.cur].overview.is_some() {
+            self.wins[self.cur].tabs.iter().map(|t| self.build_frame(t, true)).collect()
         } else {
             Vec::new()
         };
@@ -1259,7 +1258,7 @@ impl App {
         self.bg = saved_bg;
         let t_built = t_start.elapsed();
         let show_strip = self.show_tab_strip();
-        let (w, h) = match &self.gpu {
+        let (w, h) = match &self.wins[self.cur].gpu {
             Some(g) => (g.config.width, g.config.height),
             None => return,
         };
@@ -1283,11 +1282,11 @@ impl App {
         // hand-drawn overlay was deleted once the egui cut was confirmed:
         // two renderers of the same UI meant two of every bug.
         let sw_open = matches!(
-                self.overview.map(|o| o.mode),
+                self.wins[self.cur].overview.map(|o| o.mode),
             Some(OverviewMode::Switcher));
-        let sw_selected = self.active;
+        let sw_selected = self.wins[self.cur].active;
         let sw_cards: Vec<egui_ui::SwitcherCard> = if sw_open {
-            self.tabs
+            self.wins[self.cur].tabs
                 .iter()
                 .enumerate()
                 .map(|(i, t)| {
@@ -1297,14 +1296,14 @@ impl App {
                     // wraps it to two lines, ellipsizing only what a third
                     // line would need -- the original's overview labels.
                     let cwd_line = t.current_dir().filter(|c| c != &title);
-                    let thumb = self
-                        .sw_thumbs
+                    let thumb = self.wins[self.cur].
+                        sw_thumbs
                         .get(i)
                         .and_then(|t| t.as_ref())
                         .map(|t| (t.handle.clone(), t.size));
                     egui_ui::SwitcherCard {
                         title,
-                        active: i == self.active,
+                        active: i == self.wins[self.cur].active,
                         marker: t.entangled,
                         cwd: cwd_line,
                         thumb,
@@ -1322,11 +1321,11 @@ impl App {
         );
         let sw_dim = (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8;
         {
-            let mut egui = self.egui.take();
+            let mut egui = self.wins[self.cur].egui.take();
             if let Some(egui) = egui.as_mut() {
                 let mut raw = egui.state.take_egui_input(window);
                 raw.events
-                    .extend(std::mem::take(&mut self.fifo_egui_events));
+                    .extend(std::mem::take(&mut self.wins[self.cur].fifo_egui_events));
                 let ctx = egui.ctx.clone();
                 let full = ctx.run_ui(raw, |ui| {
                     let ev = egui_ui::config_window(
@@ -1362,11 +1361,12 @@ impl App {
                 // and while egui holds focus every keystroke reads as
                 // consumed and never reaches the terminal.
                 if let Some(res) = egui.ui_state.rename_out.take() {
-                    self.renaming = false;
+                    self.wins[self.cur].renaming = false;
                     egui.ui_state.rename_open = false;
                     if let Some(name) = res {
                         log::info!("rename_tab -> {:?}", name);
-                        if let Some(t) = self.tabs.get_mut(self.active) {
+                        let cur_active = self.wins[self.cur].active;
+                        if let Some(t) = self.wins[self.cur].tabs.get_mut(cur_active) {
                             t.name = if name.is_empty() { None } else { Some(name) };
                         }
                     }
@@ -1377,10 +1377,10 @@ impl App {
                 egui_ui::release_focus_if_closed(&ctx, egui.config_open, popup_open, &mut egui.open_prev);
                 full_output = Some(full);
             }
-            self.egui = egui;
+            self.wins[self.cur].egui = egui;
         }
-        let (revert, changed, save) = self
-            .egui
+        let (revert, changed, save) = self.wins[self.cur].
+            egui
             .as_ref()
             .map(|e| (e.revert_requested, e.config_changed, e.save_requested))
             .unwrap_or_default();
@@ -1405,28 +1405,28 @@ impl App {
                 // sees the result on the terminal, not in the dialog.
                 Ok(()) => {
                     log::info!("configuration saved");
-                    if let Some(e) = self.egui.as_mut() {
+                    if let Some(e) = self.wins[self.cur].egui.as_mut() {
                         e.config_open = false;
                     }
                 }
                 Err(err) => self.show_error(err),
             }
         }
-        if let Some(e) = self.egui.as_mut() {
+        if let Some(e) = self.wins[self.cur].egui.as_mut() {
             e.config_changed = false;
             e.save_requested = false;
             e.revert_requested = false;
             // A switcher card was clicked: activate that tab and dismiss.
             if let Some(i) = e.take_switcher_pick() {
-                if i < self.tabs.len() {
-                    self.active = i;
+                if i < self.wins[self.cur].tabs.len() {
+                    self.wins[self.cur].active = i;
                 }
                 self.close_switcher();
             }
         }
         // Moved out of `self` so the drawing code below can keep borrowing
         // other `self` fields freely. Put back before every exit.
-        let mut gpu = self.gpu.take().expect("gpu present, checked above");
+        let mut gpu = self.wins[self.cur].gpu.take().expect("gpu present, checked above");
         let wf = w as f32;
         let hf = h as f32;
 
@@ -1485,15 +1485,15 @@ impl App {
                 marker: bool,
                 w: f32,
             }
-            let faces: Vec<Face> = self
-                .tabs
+            let faces: Vec<Face> = self.wins[self.cur].
+                tabs
                 .iter()
                 .enumerate()
                 .map(|(i, t)| {
                     let text = tab_label(
                         t,
                         i,
-                        i == self.active,
+                        i == self.wins[self.cur].active,
                         self.config.tab_title_max_length,
                         self.config.tab_title_short_current,
                         &self.config.tab_shorten_str,
@@ -1528,7 +1528,7 @@ impl App {
             if total > wf && !faces.is_empty() {
                 let active_end = clock_w
                     + add_w
-                    + faces.iter().take(self.active + 1).map(|f| f.w + TAB_GAP).sum::<f32>();
+                    + faces.iter().take(self.wins[self.cur].active + 1).map(|f| f.w + TAB_GAP).sum::<f32>();
                 let want = active_end - (wf - add_w - TAB_PAD);
                 scroll = want.max(0.0).min((total - wf).max(0.0));
             }
@@ -1554,7 +1554,7 @@ impl App {
                 // single most visible difference between the two title bars.
                 {
                     let c = self.config.add_button_color.to_f32();
-                    let bbg = if self.hover_add { brighten(bar, 1.4) } else { brighten(bar, 1.1) };
+                    let bbg = if self.wins[self.cur].hover_add { brighten(bar, 1.4) } else { brighten(bar, 1.1) };
                     push_rect(&mut gpu.rects, x, 0.0, add_w, self.tab_h - 1.0, [bbg[0], bbg[1], bbg[2], 1.0]);
                     if slot < tpool.len() {
                         push_tab_label(tpool, slot, fs, attrs, "[+]", x + 1.0, text_y, c, &mut areas, self.tab_char_w, bounds);
@@ -1572,8 +1572,8 @@ impl App {
                     if slot + need > tpool.len() {
                         break;
                     }
-                    let selected = i == self.active;
-                    let t = &self.tabs[i];
+                    let selected = i == self.wins[self.cur].active;
+                    let t = &self.wins[self.cur].tabs[i];
                     let mut fgc = if selected {
                         self.config.tab_color_fg_selected.to_f32()
                     } else {
@@ -1591,7 +1591,7 @@ impl App {
                     // the strip instead of covering it.
                     let body_h = self.tab_h - 1.0;
                     push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [bgc[0], bgc[1], bgc[2], 1.0]);
-                    if self.hover_tab == i && !selected {
+                    if self.wins[self.cur].hover_tab == i && !selected {
                         // Wash of the label's own colour rather than an invented
                         // grey, so hover matches whatever theme is configured.
                         push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [fgc[0], fgc[1], fgc[2], 0.12]);
@@ -1610,8 +1610,8 @@ impl App {
                 }
             }
         }
-        self.tab_hits = tab_hits;
-        self.add_hit = add_hit;
+        self.wins[self.cur].tab_hits = tab_hits;
+        self.wins[self.cur].add_hit = add_hit;
 
         // --- Terminal: cell backgrounds ---
         for run in &frame.runs {
@@ -1632,7 +1632,7 @@ impl App {
         // Selection wash: over the cell backgrounds, under the cursor and the
         // glyphs, and translucent so coloured text stays readable underneath --
         // an opaque wash would hide exactly the text the user selected.
-        for (row, left, right) in self.tabs[self.active].selection_rows() {
+        for (row, left, right) in self.wins[self.cur].tabs[self.wins[self.cur].active].selection_rows() {
             push_rect(
                 &mut gpu.rects,
                 left as f32 * self.cell_w,
@@ -1667,7 +1667,7 @@ impl App {
             let fs = &mut self.font_system;
             let pool = &mut gpu.pool;
             for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
-                if self.notice.is_some() && run.row as usize == self.rows.saturating_sub(1) { continue; }
+                if self.wins[self.cur].notice.is_some() && run.row as usize == self.wins[self.cur].rows.saturating_sub(1) { continue; }
                 let blank = run.text.chars().all(|c| c == ' ');
                 let default_fg =
                     (run.fg[0] - frame.fg[0]).abs() + (run.fg[1] - frame.fg[1]).abs()
@@ -1695,8 +1695,8 @@ impl App {
 
         // --- Notice prompt (overlays the last terminal row; renaming moved
         // into egui and no longer paints over the grid) ---
-        if self.notice.is_some() {
-            let prompt_y = strip_h + self.rows.saturating_sub(1) as f32 * self.cell_h;
+        if self.wins[self.cur].notice.is_some() {
+            let prompt_y = strip_h + self.wins[self.cur].rows.saturating_sub(1) as f32 * self.cell_h;
             push_rect(
                 &mut gpu.rects,
                 0.0,
@@ -1705,7 +1705,7 @@ impl App {
                 self.cell_h,
                 [self.bg[0], self.bg[1], self.bg[2], 1.0],
             );
-            let prompt = format!("  {}", self.notice.as_ref().unwrap().0);
+            let prompt = format!("  {}", self.wins[self.cur].notice.as_ref().unwrap().0);
             {
                 let fs = &mut self.font_system;
                 let b = &mut gpu.prompt_buf;
@@ -1744,8 +1744,8 @@ impl App {
         // keeps them warm.
         let mut jobs: Vec<gpu::PreviewJob> = Vec::new();
         if sw_open {
-            if let Some(ov) = &self.overview {
-            let n = self.tabs.len();
+            if let Some(ov) = &self.wins[self.cur].overview {
+            let n = self.wins[self.cur].tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
             gpu.ensure_previews(n, (w, h));
             let now = Instant::now();
@@ -1805,7 +1805,7 @@ impl App {
                         self.cell_w,
                         self.cell_h,
                         strip_h,
-                        self.rows,
+                        self.wins[self.cur].rows,
                         w,
                         h,
                     ),
@@ -1814,7 +1814,7 @@ impl App {
             }
             }
         }
-        let egui_frame = match (full_output.as_mut(), self.egui.as_mut()) {
+        let egui_frame = match (full_output.as_mut(), self.wins[self.cur].egui.as_mut()) {
             (Some(full), Some(egui)) => {
                 // Take the shapes out: `full` is behind a reference, and the
                 // tessellated jobs supersede them (only the texture deltas
@@ -1842,12 +1842,12 @@ impl App {
         // them to egui. The thumbnail takes the terminal area of the texture
         // at its own aspect, so a card shows the tab without letterboxing.
         if sw_open {
-            let Some(ov) = &self.overview else { return };
-            let ctx = match self.egui.as_ref() {
+            let Some(ov) = &self.wins[self.cur].overview else { return };
+            let ctx = match self.wins[self.cur].egui.as_ref() {
                 Some(e) => e.ctx.clone(),
                 None => return,
             };
-            let n = self.tabs.len();
+            let n = self.wins[self.cur].tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
             let term_h = ((h as f32) - strip_h).max(1.0);
             // The point size (egui space) follows the same config values as
@@ -1866,12 +1866,12 @@ impl App {
             let th = (pth * self.scale).round().max(1.0) as u32;
             let mut order: Vec<usize> = vec![sel];
             for k in 0..n {
-                let i = (self.thumb_rr + k) % n;
+                let i = (self.wins[self.cur].thumb_rr + k) % n;
                 if i != sel {
                     order.push(i);
                 }
             }
-            self.thumb_rr = (self.thumb_rr + 1).rem_euclid(n.max(1));
+            self.wins[self.cur].thumb_rr = (self.wins[self.cur].thumb_rr + 1).rem_euclid(n.max(1));
             let now = Instant::now();
             let mut done = 0;
             for i in order {
@@ -1887,8 +1887,8 @@ impl App {
                 }
                 let interval =
                     std::time::Duration::from_millis(if i == sel { 60 } else { 200 });
-                let stale = self
-                    .sw_thumbs
+                let stale = self.wins[self.cur].
+                    sw_thumbs
                     .get(i)
                     .and_then(|t| t.as_ref())
                     .is_none_or(|t| {
@@ -1906,10 +1906,10 @@ impl App {
                     egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &rgba),
                     egui::TextureOptions::LINEAR,
                 );
-                if self.sw_thumbs.len() < n {
-                    self.sw_thumbs.resize(n, None);
+                if self.wins[self.cur].sw_thumbs.len() < n {
+                    self.wins[self.cur].sw_thumbs.resize(n, None);
                 }
-                self.sw_thumbs[i] = Some(SwThumb {
+                self.wins[self.cur].sw_thumbs[i] = Some(SwThumb {
                     handle,
                     // Point size for the layout (the texture is pixel-dense).
                     size: (ptw.round() as u32, pth.round() as u32),
@@ -1920,7 +1920,7 @@ impl App {
                 done += 1;
             }
         }
-        self.gpu = Some(gpu);
+        self.wins[self.cur].gpu = Some(gpu);
 
         if std::env::var("SPIKE_TRACE").is_ok() {
             let mut h: u64 = 0xcbf29ce484222325;
@@ -1933,8 +1933,8 @@ impl App {
             eprintln!(
                 "frame build {t_built:?} text {t_text:?} total {:?} grid {}x{} runs {} hash {h:x}",
                 t_start.elapsed(),
-                self.cols,
-                self.rows,
+                self.wins[self.cur].cols,
+                self.wins[self.cur].rows,
                 frame.runs.len(),
             );
         }
@@ -1961,8 +1961,8 @@ impl App {
         for line in &specs {
             if line == "spy" {
                 // Test hook: dump tab state
-                let state: Vec<String> = self
-                    .tabs
+                let state: Vec<String> = self.wins[self.cur].
+                    tabs
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
@@ -1970,7 +1970,7 @@ impl App {
                         format!("{i}[:{}](g{}e{}){}", t.id, t.group, if t.entangled { 1 } else { 0 }, title)
                     })
                     .collect();
-                let cursor = match self.tabs.get(self.active) {
+                let cursor = match self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
                     Some(t) => {
                         let c = t.term.lock().renderable_content().cursor;
                         let focus = t.term.lock().is_focused;
@@ -1978,31 +1978,31 @@ impl App {
                     },
                     None => "-".to_string(),
                 };
-                let surf = match self.gpu.as_ref() {
+                let surf = match self.wins[self.cur].gpu.as_ref() {
                     Some(g) => format!("{}x{}", g.config.width, g.config.height),
                     None => "-".to_string(),
                 };
-                let ren = if self.renaming {
+                let ren = if self.wins[self.cur].renaming {
                     format!(
                         "renaming={:?}",
-                        self.egui.as_ref().map(|e| e.ui_state.rename_draft.clone())
+                        self.wins[self.cur].egui.as_ref().map(|e| e.ui_state.rename_draft.clone())
                     )
                 } else {
                     String::new()
                 };
-                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {}", self.active, surf, cursor, state.join(","), ren);
+                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {}", self.wins[self.cur].active, surf, cursor, state.join(","), ren);
                 continue;
             }
             if line == "switcher" {
                 // Test hook: open the Alt-held switcher directly (bypass the
                 // hold delay, which needs real ModifiersChanged events).
-                if self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
-                    && !self.tabs.is_empty()
-                    && !self.renaming
+                if self.wins[self.cur].overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
+                    && !self.wins[self.cur].tabs.is_empty()
+                    && !self.wins[self.cur].renaming
                 {
-                    self.overview = Some(OverviewState {
+                    self.wins[self.cur].overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
-                        selected: self.active,
+                        selected: self.wins[self.cur].active,
                     });
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
@@ -2029,7 +2029,7 @@ impl App {
                 }
             }
         }
-        if let Some(window) = self.window.as_ref() {
+        if let Some(window) = self.wins[self.cur].window.as_ref() {
             window.request_redraw();
         }
     }
@@ -2040,11 +2040,11 @@ impl App {
     /// Feed a FIFO key spec to egui when egui holds the keyboard. Returns
     /// whether egui claimed it (so the caller skips the app's own handler).
     fn test_key_to_egui(&mut self, key: &Key, mods: ModifiersState) -> bool {
-        if self.egui.is_none() {
+        if self.wins[self.cur].egui.is_none() {
             return false;
         }
         let m = egui_mods(mods);
-        let egui = self.egui.as_ref().unwrap();
+        let egui = self.wins[self.cur].egui.as_ref().unwrap();
         if !egui.ctx.egui_wants_keyboard_input() {
             return false; // nothing focused: egui-winit would not consume it
         }
@@ -2052,13 +2052,13 @@ impl App {
             // egui inserts characters from Text events, exactly as a real
             // IME-driven keypress arrives through egui-winit.
             Key::Character(c) => {
-                self.fifo_egui_events
+                self.wins[self.cur].fifo_egui_events
                     .push(egui::Event::Text(c.as_ref().to_owned()));
             },
             Key::Named(winit::keyboard::NamedKey::Space) => {
                 // A real keyboard delivers a Space as text, not as a bare
                 // key code; egui's TextEdit expects the same.
-                self.fifo_egui_events.push(egui::Event::Text(" ".into()));
+                self.wins[self.cur].fifo_egui_events.push(egui::Event::Text(" ".into()));
             },
             other => {
                 if let Some(k) = egui_key_of(other) {
@@ -2069,8 +2069,8 @@ impl App {
                         repeat: false,
                         modifiers: m,
                     };
-                    self.fifo_egui_events.push(ev(true));
-                    self.fifo_egui_events.push(ev(false));
+                    self.wins[self.cur].fifo_egui_events.push(ev(true));
+                    self.wins[self.cur].fifo_egui_events.push(ev(false));
                 }
             },
         }
@@ -2081,7 +2081,7 @@ impl App {
         if self.modifiers.shift_key() {
             return None;
         }
-        let term = self.tabs.get(self.active)?.term.lock();
+        let term = self.wins[self.cur].tabs.get(self.wins[self.cur].active)?.term.lock();
         let mode = *term.mode();
         let any = mode.contains(TermMode::MOUSE_REPORT_CLICK)
             || mode.contains(TermMode::MOUSE_DRAG)
@@ -2098,7 +2098,7 @@ impl App {
         }
         let col = (px / self.cell_w).floor() as u16;
         let row = ((py - strip_h) / self.cell_h).floor() as i32;
-        if col >= self.cols as u16 || row < 0 || row as usize >= self.rows {
+        if col >= self.wins[self.cur].cols as u16 || row < 0 || row as usize >= self.wins[self.cur].rows {
             return None;
         }
         Some((col + 1, row as u16 + 1))
@@ -2130,14 +2130,14 @@ impl App {
     /// Cell under the pointer, in grid coordinates, plus which half of it.
     /// None outside the terminal area: the tab strip is not text.
     fn cell_at(&self, px: f32, py: f32) -> Option<(Point, Side)> {
-        let tab = self.tabs.get(self.active)?;
+        let tab = self.wins[self.cur].tabs.get(self.wins[self.cur].active)?;
         let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
         if py < strip_h {
             return None;
         }
         let col = (px / self.cell_w).floor() as usize;
         let row = ((py - strip_h) / self.cell_h).floor() as i32;
-        if col >= self.cols || row < 0 || row as usize >= self.rows {
+        if col >= self.wins[self.cur].cols || row < 0 || row as usize >= self.wins[self.cur].rows {
             return None;
         }
         let within = px / self.cell_w - (px / self.cell_w).floor();
@@ -2153,7 +2153,7 @@ impl App {
     /// window, capped at three (three means "whole rows").
     fn count_click(&mut self, button: u8, at: (f32, f32)) -> u32 {
         let now = std::time::Instant::now();
-        let count = match self.click {
+        let count = match self.wins[self.cur].click {
             Some((b, c, p, t))
                 if b == button
                     && now.duration_since(t) < std::time::Duration::from_millis(400)
@@ -2164,22 +2164,22 @@ impl App {
             }
             _ => 1,
         };
-        self.click = Some((button, count, at, now));
+        self.wins[self.cur].click = Some((button, count, at, now));
         count.min(3)
     }
 
     /// Publish the selection into the primary buffer, the way VTE does: selecting
     /// text *is* copying it, and middle click is the paste.
     fn publish_primary(&mut self) {
-        if let Some(text) = self.tabs.get(self.active).and_then(|t| t.selected_text()) {
+        if let Some(text) = self.wins[self.cur].tabs.get(self.wins[self.cur].active).and_then(|t| t.selected_text()) {
             self.copy_text(clipboard::Kind::Primary, text);
         }
     }
 
     fn show_error(&mut self, error: String) {
         log::warn!("{error}");
-        self.notice = Some((error, Instant::now()));
-        if let Some(window) = &self.window { window.request_redraw(); }
+        self.wins[self.cur].notice = Some((error, Instant::now()));
+        if let Some(window) = &self.wins[self.cur].window { window.request_redraw(); }
     }
 
     fn copy_text(&mut self, kind: clipboard::Kind, text: String) {
@@ -2188,7 +2188,7 @@ impl App {
     }
 
     fn request_paste(&mut self, kind: clipboard::Kind) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else { return };
         let result = self.clipboard.as_ref().ok_or_else(|| "Clipboard unavailable".to_string()).and_then(|c| c.paste(kind, tab.id));
         if let Err(e) = result { self.show_error(e); }
     }
@@ -2198,7 +2198,7 @@ impl App {
         for event in events {
             match event {
                 clipboard::Event::Paste { target, result: Ok(text) } => {
-                    if let Some(tab) = self.tabs.iter().find(|t| t.id == target) { tab.paste(&text); }
+                    if let Some(tab) = self.wins[self.cur].tabs.iter().find(|t| t.id == target) { tab.paste(&text); }
                 }
                 clipboard::Event::Paste { result: Err(e), .. } | clipboard::Event::Error(e) => self.show_error(e),
             }
@@ -2206,12 +2206,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
-        if self.drag.take().is_some() { self.publish_primary(); }
+        if self.wins[self.cur].drag.take().is_some() { self.publish_primary(); }
         // 0. The egui rename box owns the keyboard: egui consumes the keys
         //    it needs, and anything left over is swallowed here so a half-
         //    typed name can never leak into the shell. Escape is the app's
         //    own cancel, in case egui already had the focus dropped.
-        if self.renaming {
+        if self.wins[self.cur].renaming {
             if matches!(key, Key::Named(winit::keyboard::NamedKey::Escape)) {
                 self.close_rename();
             }
@@ -2221,19 +2221,20 @@ impl App {
         //    and Esc with plain Alt); anything else falls through to the
         //    normal handler, so configured bindings and the terminal keep
         //    working while the switcher is open.
-        if self.overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
+        if self.wins[self.cur].overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
             if self.handle_switcher_key(key) {
                 return;
             }
         }
         // 2. Configured bindings
-        let overview_active = self.overview.is_some();
+        let overview_active = self.wins[self.cur].overview.is_some();
         if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
             self.do_action(&action, event_loop);
             // A delegated action may have moved or closed the active tab;
             // keep the highlighted tile in sync while the switcher is open.
-            if let Some(ov) = self.overview.as_mut() {
-                ov.selected = self.active;
+            let cur_active = self.wins[self.cur].active;
+            if let Some(ov) = self.wins[self.cur].overview.as_mut() {
+                ov.selected = cur_active;
             }
             return;
         }
@@ -2244,14 +2245,15 @@ impl App {
             *self.last_activity.lock().unwrap() = std::time::Instant::now();
             // A selection is something you are about to act on; typing means you
             // moved on, and leaving the wash over new output would be a lie.
-            if let Some(tab) = self.tabs.get_mut(self.active) {
+            let cur_active = self.wins[self.cur].active;
+            if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) {
                 tab.clear_selection();
                 tab.scroll(alacritty_terminal::grid::Scroll::Bottom);
             }
-            if let Some(tab) = self.tabs.get(self.active) {
+            if let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
                 // Entanglement: type into all entangled tabs
-                if self.tabs[self.active].entangled {
-                    for t in &self.tabs {
+                if self.wins[self.cur].tabs[self.wins[self.cur].active].entangled {
+                    for t in &self.wins[self.cur].tabs {
                         if t.entangled {
                             t.write(&bytes);
                         }
@@ -2265,24 +2267,24 @@ impl App {
 
     /// Close the rename box without committing (app-side Escape).
     fn close_rename(&mut self) {
-        self.renaming = false;
-        if let Some(egui) = self.egui.as_mut() {
+        self.wins[self.cur].renaming = false;
+        if let Some(egui) = self.wins[self.cur].egui.as_mut() {
             egui.ui_state.rename_open = false;
             egui_ui::release_focus(&egui.ctx);
         }
-        if let Some(w) = &self.window {
+        if let Some(w) = &self.wins[self.cur].window {
             w.request_redraw();
         }
     }
 
     /// Dismiss the Alt-held switcher (only if that variant is open).
     fn close_switcher(&mut self) {
-        if self.overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
-            self.overview = None;
+        if self.wins[self.cur].overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
+            self.wins[self.cur].overview = None;
             self.switcher_open.store(false, Ordering::SeqCst);
-            self.sw_thumbs.clear();
+            self.wins[self.cur].sw_thumbs.clear();
         }
-        if let Some(w) = &self.window {
+        if let Some(w) = &self.wins[self.cur].window {
             w.request_redraw();
         }
     }
@@ -2304,7 +2306,7 @@ impl App {
         if !alt_only {
             return false;
         }
-        let n = self.tabs.len();
+        let n = self.wins[self.cur].tabs.len();
         if n == 0 {
             self.close_switcher();
             return true;
@@ -2312,35 +2314,35 @@ impl App {
         let cols = grid_cols(n);
         let handled = match key {
             Key::Named(NamedKey::ArrowLeft) => {
-                self.active = (self.active + n - 1) % n;
+                self.wins[self.cur].active = (self.wins[self.cur].active + n - 1) % n;
                 true
             },
             Key::Named(NamedKey::ArrowRight) => {
-                self.active = (self.active + 1) % n;
+                self.wins[self.cur].active = (self.wins[self.cur].active + 1) % n;
                 true
             },
             Key::Named(NamedKey::ArrowUp) => {
-                let r = self.active / cols;
+                let r = self.wins[self.cur].active / cols;
                 if r > 0 {
-                    let dc = self.active % cols;
-                    self.active = ((r - 1) * cols + dc).min(n - 1);
+                    let dc = self.wins[self.cur].active % cols;
+                    self.wins[self.cur].active = ((r - 1) * cols + dc).min(n - 1);
                 }
                 true
             },
             Key::Named(NamedKey::ArrowDown) => {
-                let r = self.active / cols;
-                let t = (r + 1) * cols + (self.active % cols);
+                let r = self.wins[self.cur].active / cols;
+                let t = (r + 1) * cols + (self.wins[self.cur].active % cols);
                 if t < n && t / cols > r {
-                    self.active = t;
+                    self.wins[self.cur].active = t;
                 }
                 true
             },
             Key::Named(NamedKey::Home) => {
-                self.active = 0;
+                self.wins[self.cur].active = 0;
                 true
             },
             Key::Named(NamedKey::End) => {
-                self.active = n - 1;
+                self.wins[self.cur].active = n - 1;
                 true
             },
             Key::Named(NamedKey::Escape) => {
@@ -2353,7 +2355,7 @@ impl App {
                     Some(d) => {
                         let idx = if d == 0 { 9 } else { (d - 1) as usize };
                         if idx < n {
-                            self.active = idx;
+                            self.wins[self.cur].active = idx;
                         }
                         true
                     },
@@ -2364,10 +2366,11 @@ impl App {
         };
         if handled {
             // Keep the highlighted tile in sync with the active tab.
-            if let Some(ov) = self.overview.as_mut() {
-                ov.selected = self.active;
+            let cur_active = self.wins[self.cur].active;
+            if let Some(ov) = self.wins[self.cur].overview.as_mut() {
+                ov.selected = cur_active;
             }
-            if let Some(w) = &self.window {
+            if let Some(w) = &self.wins[self.cur].window {
                 w.request_redraw();
             }
         }
@@ -2375,11 +2378,11 @@ impl App {
     }
 
     fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
-        let n = self.tabs.len();
+        let n = self.wins[self.cur].tabs.len();
         match action {
             "new_tab" => self.add_tab(),
             "copy" => {
-                if let Some(text) = self.tabs.get(self.active).and_then(|t| t.selected_text()) {
+                if let Some(text) = self.wins[self.cur].tabs.get(self.wins[self.cur].active).and_then(|t| t.selected_text()) {
                     self.copy_text(clipboard::Kind::Clipboard, text);
                 }
             },
@@ -2388,77 +2391,84 @@ impl App {
             },
             "paste_primary" => self.request_paste(clipboard::Kind::Primary),
             "scroll_page_up" | "scroll_page_down" | "scroll_bottom" => {
-                if let Some(tab) = self.tabs.get(self.active) {
+                if let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
                     use alacritty_terminal::grid::Scroll;
                     tab.scroll(match action { "scroll_page_up" => Scroll::PageUp, "scroll_page_down" => Scroll::PageDown, _ => Scroll::Bottom });
                 }
             },
-            "close_tab" => self.close_tab_at(self.active, event_loop),
+            "close_tab" => self.close_tab_at(self.wins[self.cur].active, event_loop),
             "prev_tab" | "prev_tab_row" => {
                 if n > 1 {
-                    self.active = (self.active + n - 1) % n;
+                    self.wins[self.cur].active = (self.wins[self.cur].active + n - 1) % n;
                 }
             },
             "next_tab" | "next_tab_row" => {
                 if n > 1 {
-                    self.active = (self.active + 1) % n;
+                    self.wins[self.cur].active = (self.wins[self.cur].active + 1) % n;
                 }
             },
-            "first_tab" => self.active = 0,
-            "last_tab" => self.active = n.saturating_sub(1),
+            "first_tab" => self.wins[self.cur].active = 0,
+            "last_tab" => self.wins[self.cur].active = n.saturating_sub(1),
             "move_prev_tab" => {
-                if n > 1 && self.active > 0 {
-                    self.tabs.swap(self.active, self.active - 1);
-                    self.active -= 1;
+                if n > 1 && self.wins[self.cur].active > 0 {
+                    let a = self.wins[self.cur].active;
+                    self.wins[self.cur].tabs.swap(a, a - 1);
+                    self.wins[self.cur].active -= 1;
                 }
             },
             "move_next_tab" => {
-                if n > 1 && self.active < n - 1 {
-                    self.tabs.swap(self.active, self.active + 1);
-                    self.active += 1;
+                if n > 1 && self.wins[self.cur].active < n - 1 {
+                    let a = self.wins[self.cur].active;
+                    self.wins[self.cur].tabs.swap(a, a + 1);
+                    self.wins[self.cur].active += 1;
                 }
             },
             "move_first_tab" => {
-                if n > 1 && self.active > 0 {
-                    let t = self.tabs.remove(self.active);
-                    self.tabs.insert(0, t);
-                    self.active = 0;
+                if n > 1 && self.wins[self.cur].active > 0 {
+                    let a = self.wins[self.cur].active;
+                    let t = self.wins[self.cur].tabs.remove(a);
+                    self.wins[self.cur].tabs.insert(0, t);
+                    self.wins[self.cur].active = 0;
                 }
             },
             "move_last_tab" => {
-                if n > 1 && self.active < n - 1 {
-                    let t = self.tabs.remove(self.active);
-                    self.tabs.push(t);
-                    self.active = n - 1;
+                if n > 1 && self.wins[self.cur].active < n - 1 {
+                    let a = self.wins[self.cur].active;
+                    let t = self.wins[self.cur].tabs.remove(a);
+                    self.wins[self.cur].tabs.push(t);
+                    self.wins[self.cur].active = n - 1;
                 }
             },
             "toggle_entangle" => {
-                if let Some(t) = self.tabs.get_mut(self.active) {
+                let cur_active = self.wins[self.cur].active;
+                if let Some(t) = self.wins[self.cur].tabs.get_mut(cur_active) {
                     t.entangled = !t.entangled;
                 }
             },
             "next_color" => {
-                if let Some(t) = self.tabs.get_mut(self.active) {
+                let cur_active = self.wins[self.cur].active;
+                if let Some(t) = self.wins[self.cur].tabs.get_mut(cur_active) {
                     t.group = if t.group >= 8 { 0 } else { t.group + 1 };
                 }
             },
             "prev_color" => {
-                if let Some(t) = self.tabs.get_mut(self.active) {
+                let cur_active = self.wins[self.cur].active;
+                if let Some(t) = self.wins[self.cur].tabs.get_mut(cur_active) {
                     t.group = if t.group <= 0 || t.group >= 8 { 7 } else { t.group - 1 };
                 }
             },
             "toggle_hide_tabs" => {
-                self.tablist_hidden = !self.tablist_hidden;
+                self.wins[self.cur].tablist_hidden = !self.wins[self.cur].tablist_hidden;
                 self.sync_term_size();
             },
             "config_reload" => {
                 self.reload_config();
             },
             "show_config" => {
-                if let Some(e) = self.egui.as_mut() {
+                if let Some(e) = self.wins[self.cur].egui.as_mut() {
                     e.config_open = true;
                 }
-                if let Some(w) = &self.window {
+                if let Some(w) = &self.wins[self.cur].window {
                     w.request_redraw();
                 }
             },
@@ -2467,13 +2477,14 @@ impl App {
                 let i = action.chars().last().unwrap().to_digit(10).unwrap() as usize;
                 let target = i;
                 if target < n {
-                    self.active = target;
+                    self.wins[self.cur].active = target;
                 }
             },
             "enlarge_font" => self.zoom_term(true),
             "shrink_font" => self.zoom_term(false),
             "select_all" => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
+                let cur_active = self.wins[self.cur].active;
+                if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) {
                     tab.select_all();
                 }
                 // VTE feeds the primary selection from select-all too.
@@ -2486,8 +2497,9 @@ impl App {
                 // switcher open, the chord therefore *closes* it and hands
                 // over to the rename UI.
                 self.close_switcher();
-                if let Some(egui) = self.egui.as_mut() {
-                    let title = self.tabs.get(self.active).map(|t| t.display_title()).unwrap_or_default();
+                let title =
+                    self.wins[self.cur].tabs.get(self.wins[self.cur].active).map(|t| t.display_title()).unwrap_or_default();
+                if let Some(egui) = self.wins[self.cur].egui.as_mut() {
                     let y = self.tab_h + 6.0;
                     let st = &mut egui.ui_state;
                     st.rename_draft = title;
@@ -2495,7 +2507,7 @@ impl App {
                     st.rename_pos = [12.0, y];
                     st.rename_open = true;
                     st.rename_out = None;
-                    self.renaming = true;
+                    self.wins[self.cur].renaming = true;
                 } else {
                     log::warn!("rename_tab: egui unavailable");
                 }
@@ -2506,7 +2518,7 @@ impl App {
             },
             _ => {},
         }
-        if let Some(w) = &self.window {
+        if let Some(w) = &self.wins[self.cur].window {
             w.request_redraw();
         }
     }
@@ -2727,7 +2739,7 @@ fn term_command() -> (String, Vec<String>) {
 /// Test hook: read key specs from the $SPIKE_KEYS FIFO in a background
 /// thread and forward them over a channel. Returns None when unset.
 fn spawn_key_reader(
-    window_slot: Arc<Mutex<Option<Arc<Window>>>>,
+    window_slot: Arc<Mutex<Vec<Arc<Window>>>>,
 ) -> Option<std::sync::mpsc::Receiver<String>> {
     let path = std::env::var("SPIKE_KEYS").ok()?;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2761,12 +2773,12 @@ fn spawn_key_reader(
                 // Wake the event loop: keys are drained on RedrawRequested, and
                 // an idle terminal produces none on its own.
                 if let Ok(slot) = window_slot.lock() {
-                    if let Some(w) = slot.as_ref() {
+                    for w in slot.iter() {
                         w.request_redraw();
                     }
                 }
                 // Wake the UI thread so the spec is processed promptly.
-                if let Some(window) = window_slot.lock().unwrap().as_ref() {
+                for window in window_slot.lock().unwrap().iter() {
                     window.request_redraw();
                 }
             }
@@ -2776,6 +2788,148 @@ fn spawn_key_reader(
 }
 
 impl App {
+/// One more window of this session: window, GPU, egui, and a first tab
+    /// running `cmd` (default shell) in `cwd`. Called at startup and on the
+    /// session bus' NewWindow -- `mypixels -n` from any shell lands here.
+    fn make_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        cmd: Option<(String, Vec<String>)>,
+        cwd: Option<std::path::PathBuf>,
+    ) {
+        {
+            // The metrics were computed at scale 1.0 and the window is
+            // created in physical pixels, so apply the display's factor
+            // first (a no-op on a 1x screen).
+            if let Some(m) = event_loop.primary_monitor() {
+                self.set_scale(m.scale_factor() as f32);
+            }
+            // The template grid (App.cols/rows), not any window's: a new
+            // window starts from the configured size like the first one did.
+            let size = winit::dpi::PhysicalSize::new(
+                (self.cols as f32 * self.cell_w) as u32,
+                (self.rows as f32 * self.cell_h + self.tab_h) as u32,
+            );
+            let window = Arc::new(
+                event_loop
+                    .create_window(
+                        Window::default_attributes()
+                            .with_inner_size(size)
+                            .with_maximized(self.config.default_maximize)
+                            // Only worth requesting when we will use it: an
+                            // ARGB visual costs the compositor a second blend.
+                            .with_transparent(self.config.term_opacity > 0.0)
+                            .with_title("mypixels")
+                            // Compositor identity: this is the wayland app_id
+                            // (and the X11 WM_CLASS), which the original set
+                            // to "mypixels" through Gtk.Application. Rules
+                            // people wrote for the original -- open on
+                            // workspace, no decorations, opacity exceptions
+                            // -- must keep matching the rewrite.
+                            .with_name("mypixels", "mypixels")
+                            .with_window_icon(app_icon()),
+                    )
+                    .expect("window"),
+            );
+            // The window may have landed on a monitor with a different factor
+            // than the primary (or the backend still reports 1.0 before the
+            // first configure); the first frame must already be right.
+            let sf = window.scale_factor() as f32;
+            if sf != self.scale {
+                self.set_scale(sf);
+                let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                    (self.cols as f32 * self.cell_w).round() as u32,
+                    (self.rows as f32 * self.cell_h + self.tab_h).round() as u32,
+                ));
+            }
+            // Never keep a window larger than its monitor (the configured
+            // size is usually the whole screen; nested/test displays are
+            // smaller).
+            if !self.config.default_maximize {
+                if let Some(monitor) = window.current_monitor() {
+                    let ms = monitor.size();
+                    let ws = window.inner_size();
+                    if ws.width > ms.width || ws.height > ms.height {
+                        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                            ws.width.min(ms.width),
+                            ws.height.min(ms.height),
+                        ));
+                    }
+                }
+            }
+            // The window joins the session list before its GPU: init_gpu and
+            // the egui init it performs fill in the new Win's fields, and
+            // everything in between already speaks wins[cur].
+            let cols = self.cols;
+            let rows = self.rows;
+            self.wins.push(Win {
+                window: Some(Arc::clone(&window)),
+                gpu: None,
+                egui: None,
+                tabs: Vec::new(),
+                active: 0,
+                dims: Dims { cols, rows },
+                cols,
+                rows,
+                tab_hits: Vec::new(),
+                add_hit: (0.0, 0.0),
+                pointer: (0.0, 0.0),
+                mouse_button: None,
+                mouse_last: None,
+                drag: None,
+                click: None,
+                wheel_pixels: 0.0,
+                hover_tab: usize::MAX,
+                hover_add: false,
+                tablist_hidden: self.config.tablist_hide,
+                renaming: false,
+                overview: None,
+                sw_thumbs: Vec::new(),
+                thumb_rr: 0,
+                autoscroll_next: None,
+                tab_drag: None,
+                tab_drag_moved: false,
+                fifo_egui_events: Vec::new(),
+                notice: None,
+                focused: true,
+            });
+            self.cur = 0;
+            self.init_gpu(event_loop, &window);
+            let slot = Arc::clone(&self.window_slot);
+            if self.theme_watcher.is_none() {
+            match theme::Watcher::new(self.config.theme_files.clone(), move || {
+                if let Ok(slot) = slot.lock() {
+                    for w in slot.iter() {
+                        w.request_redraw();
+                    }
+                }
+            }) {
+                Ok(watcher) => self.theme_watcher = Some(watcher),
+                Err(e) => self.show_error(format!("Theme watcher unavailable: {e}")),
+            }
+            }
+            if self.clipboard.is_none() {
+            let slot = Arc::clone(&self.window_slot);
+            match clipboard::Clipboard::new(clipboard::Backend::for_window(&window), move || {
+                if let Ok(slot) = slot.lock() {
+                    for w in slot.iter() {
+                        w.request_redraw();
+                    }
+                }
+            }) {
+                Ok(clipboard) => self.clipboard = Some(clipboard),
+                Err(e) => self.show_error(format!("Clipboard unavailable: {e}")),
+            }
+            }
+            self.window_slot.lock().unwrap().push(Arc::clone(&window));
+            self.sync_term_size();
+            // Every window of a session is born with one tab: the shell the
+            // request asked for, in the directory it asked from.
+            self.add_tab_with(cwd, cmd);
+        }
+        let _ = event_loop;
+    }
+
     /// Visual-bell strength: 1.0 at the BEL, fading to 0 over 180ms.
     fn bell_flash(&self) -> f32 {
         let b = self.bell.lock().unwrap();
@@ -3040,88 +3194,11 @@ fn mouse_report_bytes(mode: TermMode, code: u16, col: u16, row: u16, release: bo
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            // The metrics were computed at scale 1.0 and the window is
-            // created in physical pixels, so apply the display's factor
-            // first (a no-op on a 1x screen).
-            if let Some(m) = event_loop.primary_monitor() {
-                self.set_scale(m.scale_factor() as f32);
-            }
-            let size = winit::dpi::PhysicalSize::new(
-                (self.cols as f32 * self.cell_w) as u32,
-                (self.rows as f32 * self.cell_h + self.tab_h) as u32,
-            );
-            let window = Arc::new(
-                event_loop
-                    .create_window(
-                        Window::default_attributes()
-                            .with_inner_size(size)
-                            .with_maximized(self.config.default_maximize)
-                            // Only worth requesting when we will use it: an
-                            // ARGB visual costs the compositor a second blend.
-                            .with_transparent(self.config.term_opacity > 0.0)
-                            .with_title("mypixels")
-                            // Compositor identity: this is the wayland app_id
-                            // (and the X11 WM_CLASS), which the original set
-                            // to "mypixels" through Gtk.Application. Rules
-                            // people wrote for the original -- open on
-                            // workspace, no decorations, opacity exceptions
-                            // -- must keep matching the rewrite.
-                            .with_name("mypixels", "mypixels")
-                            .with_window_icon(app_icon()),
-                    )
-                    .expect("window"),
-            );
-            // The window may have landed on a monitor with a different factor
-            // than the primary (or the backend still reports 1.0 before the
-            // first configure); the first frame must already be right.
-            let sf = window.scale_factor() as f32;
-            if sf != self.scale {
-                self.set_scale(sf);
-                let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
-                    (self.cols as f32 * self.cell_w).round() as u32,
-                    (self.rows as f32 * self.cell_h + self.tab_h).round() as u32,
-                ));
-            }
-            // Never keep a window larger than its monitor (the configured
-            // size is usually the whole screen; nested/test displays are
-            // smaller).
-            if !self.config.default_maximize {
-                if let Some(monitor) = window.current_monitor() {
-                    let ms = monitor.size();
-                    let ws = window.inner_size();
-                    if ws.width > ms.width || ws.height > ms.height {
-                        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
-                            ws.width.min(ms.width),
-                            ws.height.min(ms.height),
-                        ));
-                    }
-                }
-            }
-            self.init_gpu(event_loop, &window);
-            let weak = Arc::downgrade(&window);
-            match theme::Watcher::new(self.config.theme_files.clone(), move || {
-                if let Some(window) = weak.upgrade() { window.request_redraw(); }
-            }) {
-                Ok(watcher) => self.theme_watcher = Some(watcher),
-                Err(e) => self.show_error(format!("Theme watcher unavailable: {e}")),
-            }
-            let weak = Arc::downgrade(&window);
-            match clipboard::Clipboard::new(clipboard::Backend::for_window(&window), move || {
-                if let Some(w) = weak.upgrade() { w.request_redraw(); }
-            }) {
-                Ok(clipboard) => self.clipboard = Some(clipboard),
-                Err(e) => self.show_error(format!("Clipboard unavailable: {e}")),
-            }
-            *self.window_slot.lock().unwrap() = Some(Arc::clone(&window));
-            self.window = Some(window);
-            self.sync_term_size();
-            if self.tabs.is_empty() {
-                self.add_tab();
-            }
+        if self.wins.is_empty() {
+            self.make_window(event_loop, None, None);
         }
-        let _ = event_loop;
     }
+
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.check_theme_files();
@@ -3129,16 +3206,24 @@ impl ApplicationHandler for App {
         self.drain_test_keys(event_loop);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(window) = self.window.clone() else {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Route first: every helper below means "the window this event is
+        // for" via `cur`. Events for windows we do not know (one just
+        // closed, or a stray) are dropped -- there is nothing correct left
+        // to do with them.
+        match self.wins.iter().position(|w| w.window.as_ref().is_some_and(|win| win.id() == id)) {
+            Some(i) => self.cur = i,
+            None => return,
+        }
+        let Some(window) = self.wins[self.cur].window.clone() else {
             return;
         };
         // egui first: it claims events for its own widgets (the config
         // window) and lets the rest fall through to the app below. State
         // events (resize, focus, modifiers) are never gated: the app needs
         // them no matter what egui is doing.
-        let egui_consumed = self
-            .egui
+        let egui_consumed = self.wins[self.cur].
+            egui
             .as_mut()
             .map(|e| e.on_event(&window, &event))
             .unwrap_or(false);
@@ -3167,24 +3252,32 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                // A window closes; its tabs die with it (they are pty
+                // children and nowhere else to go). The session ends with
+                // the last window, like the original's GApplication.
+                self.wins.remove(self.cur);
+                self.cur = self.cur.min(self.wins.len().saturating_sub(1));
+                if self.wins.is_empty() {
+                    event_loop.exit();
+                }
             },
             WindowEvent::RedrawRequested => {
                 self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_test_keys(event_loop);
-                self.drain_session_requests();
+                self.drain_session_requests(event_loop);
                 // Open the Alt-held switcher if the clock asked and Alt is
                 // still held (guards against the press/release race).
                 if self.switcher_show_req.swap(false, Ordering::SeqCst)
+                    && (self.wins.len() == 1 || self.wins[self.cur].focused)
                     && self.switcher_alt_at.lock().unwrap().is_some()
-                    && !self.tabs.is_empty()
-                    && self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
-                    && !self.renaming
+                    && !self.wins[self.cur].tabs.is_empty()
+                    && self.wins[self.cur].overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
+                    && !self.wins[self.cur].renaming
                 {
-                    self.overview = Some(OverviewState {
+                    self.wins[self.cur].overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
-                        selected: self.active,
+                        selected: self.wins[self.cur].active,
                     });
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
@@ -3199,11 +3292,11 @@ impl ApplicationHandler for App {
                 if !to_close.is_empty() {
                     // map stable ids back to current indices (ids are stable)
                     for id in to_close.iter().rev() {
-                        if let Some(pos) = self.tabs.iter().position(|t| t.id == *id) {
+                        if let Some(pos) = self.wins[self.cur].tabs.iter().position(|t| t.id == *id) {
                             self.close_tab_at(pos, event_loop);
                         }
                     }
-                    if self.tabs.is_empty() {
+                    if self.wins[self.cur].tabs.is_empty() {
                         return;
                     }
                 }
@@ -3220,7 +3313,7 @@ impl ApplicationHandler for App {
                 // The pointer position is app state, not an action: keep it
                 // current even while egui owns the pointer, so the next
                 // unclaimed click hit-tests against the right cell.
-                self.pointer = (px, py);
+                self.wins[self.cur].pointer = (px, py);
                 if egui_consumed {
                     return;
                 }
@@ -3231,14 +3324,14 @@ impl ApplicationHandler for App {
                     let cell = self.mouse_cell(px, py);
                     if let (Some(mode), Some(cell)) = (self.mouse_mode(), cell) {
                         let motion = mode.contains(TermMode::MOUSE_MOTION)
-                            || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_button.is_some());
-                        if motion && self.mouse_last != Some(cell) {
-                            self.mouse_last = Some(cell);
-                            let code = match self.mouse_button {
+                            || (mode.contains(TermMode::MOUSE_DRAG) && self.wins[self.cur].mouse_button.is_some());
+                        if motion && self.wins[self.cur].mouse_last != Some(cell) {
+                            self.wins[self.cur].mouse_last = Some(cell);
+                            let code = match self.wins[self.cur].mouse_button {
                                 Some(b) => self.mouse_button_code(b) | 32,
                                 None => 32,
                             };
-                            self.tabs[self.active].write(&mouse_report_bytes(mode, code, cell.0, cell.1, false));
+                            self.wins[self.cur].tabs[self.wins[self.cur].active].write(&mouse_report_bytes(mode, code, cell.0, cell.1, false));
                         }
                     }
                 }
@@ -3246,40 +3339,41 @@ impl ApplicationHandler for App {
                 let mut hover = usize::MAX;
                 let mut hover_add = false;
                 if in_strip {
-                    for (i, (x0, x1)) in self.tab_hits.iter().enumerate() {
+                    for (i, (x0, x1)) in self.wins[self.cur].tab_hits.iter().enumerate() {
                         if px >= *x0 && px < *x1 {
                             hover = i;
                             break;
                         }
                     }
-                    let (a0, a1) = self.add_hit;
+                    let (a0, a1) = self.wins[self.cur].add_hit;
                     hover_add = px >= a0 && px < a1;
                 }
                 // Drag reorder: the held tab trades places every time the
                 // pointer crosses into another tab's cell. Swapping (rather
                 // than shifting) keeps the neighbour order stable when the
                 // pointer wobbles across a boundary.
-                if let Some(from) = self.tab_drag {
-                    if hover < self.tabs.len() && hover != from {
-                        self.tabs.swap(from, hover);
-                        self.active = swap_follow(from, hover, self.active);
-                        self.tab_drag = Some(hover);
-                        self.tab_drag_moved = true;
+                if let Some(from) = self.wins[self.cur].tab_drag {
+                    if hover < self.wins[self.cur].tabs.len() && hover != from {
+                        self.wins[self.cur].tabs.swap(from, hover);
+                        self.wins[self.cur].active = swap_follow(from, hover, self.wins[self.cur].active);
+                        self.wins[self.cur].tab_drag = Some(hover);
+                        self.wins[self.cur].tab_drag_moved = true;
                         window.request_redraw();
                     }
                 }
-                if hover != self.hover_tab || hover_add != self.hover_add {
-                    self.hover_tab = hover;
-                    self.hover_add = hover_add;
+                if hover != self.wins[self.cur].hover_tab || hover_add != self.wins[self.cur].hover_add {
+                    self.wins[self.cur].hover_tab = hover;
+                    self.wins[self.cur].hover_add = hover_add;
                     window.request_redraw();
                 }
                 // Dragging extends the selection cell by cell: repainting on every
                 // pixel step would spend a frame per mouse sample.
-                if self.drag.is_some() {
+                if self.wins[self.cur].drag.is_some() {
                     if let Some((pt, side)) = self.cell_at(px, py) {
-                        if self.drag != Some((pt, side)) {
-                            self.drag = Some((pt, side));
-                            if let Some(tab) = self.tabs.get_mut(self.active) {
+                        if self.wins[self.cur].drag != Some((pt, side)) {
+                            self.wins[self.cur].drag = Some((pt, side));
+                            let cur_active = self.wins[self.cur].active;
+                            if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) {
                                 tab.update_selection(pt, side);
                             }
                             window.request_redraw();
@@ -3293,18 +3387,18 @@ impl ApplicationHandler for App {
                 }
                 // The app owns this click (terminal, tab strip): whoever held
                 // egui keyboard focus is no longer who the user is typing to.
-                if let Some(e) = self.egui.as_ref() {
+                if let Some(e) = self.wins[self.cur].egui.as_ref() {
                     egui_ui::release_focus(&e.ctx);
                 }
-                let at = self.pointer;
+                let at = self.wins[self.cur].pointer;
                 // While the app owns the mouse (and Shift is not bypassing it)
                 // the click is the app's, not the selection's: no paste, no
                 // word select, no tab-strip click.
                 if matches!(button, MouseButton::Left | MouseButton::Middle | MouseButton::Right) {
                     if let (Some(cell), Some(mode)) = (self.mouse_cell(at.0, at.1), self.mouse_mode()) {
-                        self.mouse_button = Some(button);
-                        self.mouse_last = Some(cell);
-                        self.tabs[self.active].write(&mouse_report_bytes(
+                        self.wins[self.cur].mouse_button = Some(button);
+                        self.wins[self.cur].mouse_last = Some(cell);
+                        self.wins[self.cur].tabs[self.wins[self.cur].active].write(&mouse_report_bytes(
                             mode,
                             self.mouse_button_code(button),
                             cell.0,
@@ -3319,18 +3413,19 @@ impl ApplicationHandler for App {
                     // convention the original gets free from VTE.
                     if self.cell_at(at.0, at.1).is_some() { self.request_paste(clipboard::Kind::Primary); }
                 } else if button == MouseButton::Left {
-                    if self.hover_tab < self.tabs.len() {
+                    if self.wins[self.cur].hover_tab < self.wins[self.cur].tabs.len() {
                         // Pressing a tab arms a drag but does *not* activate
                         // it: switching on press yanks the view -- and its
                         // scrollback position -- out from under a reorder
                         // started from a scrolled-up terminal. The release
                         // decides whether this was a click.
-                        self.drag = None;
-                        self.tab_drag = Some(self.hover_tab);
-                        self.tab_drag_moved = false;
-                    } else if self.hover_add {
-                        self.drag = None;
-                        if let Some(tab) = self.tabs.get_mut(self.active) { tab.clear_selection(); }
+                        self.wins[self.cur].drag = None;
+                        self.wins[self.cur].tab_drag = Some(self.wins[self.cur].hover_tab);
+                        self.wins[self.cur].tab_drag_moved = false;
+                    } else if self.wins[self.cur].hover_add {
+                        self.wins[self.cur].drag = None;
+                        let cur_active = self.wins[self.cur].active;
+                        if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) { tab.clear_selection(); }
                         self.add_tab();
                         window.request_redraw();
                     } else if let Some((pt, side)) = self.cell_at(at.0, at.1) {
@@ -3350,10 +3445,11 @@ impl ApplicationHandler for App {
                             2 => SelectionType::Semantic,
                             _ => SelectionType::Simple,
                         };
-                        if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let cur_active = self.wins[self.cur].active;
+                        if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) {
                             tab.begin_selection(pt, side, ty);
                         }
-                        self.drag = Some((pt, side));
+                        self.wins[self.cur].drag = Some((pt, side));
                         window.request_redraw();
                     }
                 }
@@ -3363,15 +3459,16 @@ impl ApplicationHandler for App {
                 // egui, whose panels would otherwise swallow the release and
                 // leave the drag armed. A release without a reorder was a
                 // click: that is the moment the tab actually activates.
-                if let Some(idx) = self.tab_drag.take() {
-                    if !self.tab_drag_moved && idx < self.tabs.len() && idx != self.active {
-                        if let Some(t) = self.tabs.get_mut(self.active) {
+                if let Some(idx) = self.wins[self.cur].tab_drag.take() {
+                    if !self.wins[self.cur].tab_drag_moved && idx < self.wins[self.cur].tabs.len() && idx != self.wins[self.cur].active {
+                        let cur_active = self.wins[self.cur].active;
+                        if let Some(t) = self.wins[self.cur].tabs.get_mut(cur_active) {
                             t.clear_selection();
                         }
-                        self.active = idx;
+                        self.wins[self.cur].active = idx;
                         window.request_redraw();
                     }
-                    self.tab_drag_moved = false;
+                    self.wins[self.cur].tab_drag_moved = false;
                 }
                 if egui_consumed {
                     return;
@@ -3379,12 +3476,12 @@ impl ApplicationHandler for App {
                 // A reported release goes back to the app; the coordinates fall
                 // back to the last reported cell when the pointer left the
                 // terminal area mid-drag.
-                if self.mouse_button.take().is_some() {
+                if self.wins[self.cur].mouse_button.take().is_some() {
                     if let Some(mode) = self.mouse_mode() {
                         if let Some(cell) =
-                            self.mouse_cell(self.pointer.0, self.pointer.1).or(self.mouse_last)
+                            self.mouse_cell(self.wins[self.cur].pointer.0, self.wins[self.cur].pointer.1).or(self.wins[self.cur].mouse_last)
                         {
-                            self.tabs[self.active].write(&mouse_report_bytes(
+                            self.wins[self.cur].tabs[self.wins[self.cur].active].write(&mouse_report_bytes(
                                 mode,
                                 3 | self.mouse_mods(),
                                 cell.0,
@@ -3393,9 +3490,9 @@ impl ApplicationHandler for App {
                             ));
                         }
                     }
-                    self.mouse_last = None;
+                    self.wins[self.cur].mouse_last = None;
                 }
-                if button == MouseButton::Left && self.drag.take().is_some() {
+                if button == MouseButton::Left && self.wins[self.cur].drag.take().is_some() {
                     self.publish_primary();
                     window.request_redraw();
                 }
@@ -3437,25 +3534,25 @@ impl ApplicationHandler for App {
                 };
                 if dy != 0.0 {
                     if let (Some(cell), Some(mode)) = (
-                        self.mouse_cell(self.pointer.0, self.pointer.1),
+                        self.mouse_cell(self.wins[self.cur].pointer.0, self.wins[self.cur].pointer.1),
                         self.mouse_mode(),
                     ) {
                         let code = (if dy > 0.0 { 64 } else { 65 }) | self.mouse_mods();
-                        self.tabs[self.active].write(&mouse_report_bytes(mode, code, cell.0, cell.1, false));
+                        self.wins[self.cur].tabs[self.wins[self.cur].active].write(&mouse_report_bytes(mode, code, cell.0, cell.1, false));
                         return;
                     }
                 }
-                if self.cell_at(self.pointer.0, self.pointer.1).is_some() {
+                if self.cell_at(self.wins[self.cur].pointer.0, self.wins[self.cur].pointer.1).is_some() {
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
                         MouseScrollDelta::PixelDelta(p) => {
-                            self.wheel_pixels += p.y as f32;
-                            let lines = (self.wheel_pixels / self.cell_h) as i32;
-                            self.wheel_pixels -= lines as f32 * self.cell_h;
+                            self.wins[self.cur].wheel_pixels += p.y as f32;
+                            let lines = (self.wins[self.cur].wheel_pixels / self.cell_h) as i32;
+                            self.wins[self.cur].wheel_pixels -= lines as f32 * self.cell_h;
                             lines
                         }
                     };
-                    if let Some(tab) = self.tabs.get(self.active) { tab.scroll(alacritty_terminal::grid::Scroll::Delta(lines)); }
+                    if let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) { tab.scroll(alacritty_terminal::grid::Scroll::Delta(lines)); }
                     window.request_redraw();
                 }
             },
@@ -3469,7 +3566,7 @@ impl ApplicationHandler for App {
                     // the configuration window is open: Alt is a plain key
                     // in its text fields, and a held "Altica" must not raise
                     // the switcher behind the window.
-                    if !self.egui.as_ref().is_some_and(|e| e.config_open) {
+                    if !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.config_open) {
                         *self.switcher_alt_at.lock().unwrap() = Some(std::time::Instant::now());
                     }
                     self.switcher_show_req.store(false, Ordering::SeqCst);
@@ -3485,12 +3582,13 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             },
             WindowEvent::Focused(focused) => {
+                self.wins[self.cur].focused = focused;
                 if focused {
                     // The user answered an attention request by focusing us;
                     // stop asking.
                     window.request_user_attention(None);
                 }
-                if let Some(tab) = self.tabs.get(self.active) {
+                if let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
                     tab.term.lock().is_focused = focused;
                 }
                 window.request_redraw();
@@ -3500,7 +3598,7 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             },
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = self.gpu.as_mut() {
+                if let Some(gpu) = self.wins[self.cur].gpu.as_mut() {
                     if size.width > 0
                         && size.height > 0
                         && (size.width != gpu.config.width || size.height != gpu.config.height)
@@ -3520,7 +3618,7 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        for tab in self.tabs.iter() {
+        for tab in self.wins[self.cur].tabs.iter() {
             let _ = tab.sender.send(Msg::Shutdown);
         }
     }
@@ -3648,11 +3746,15 @@ to answer -- or with -n -- this process becomes a window of the session."
     // window yourself", never "lose the command". -n skips asking entirely:
     // an explicit second window.
     let standalone = flags.iter().any(|a| a == "--standalone" || a == "-s");
-    if !standalone && !flags.iter().any(|a| a == "--new-window" || a == "-n") {
+    if !standalone {
+        let new_window = flags.iter().any(|a| a == "--new-window" || a == "-n");
         let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
-        if session::remote_open(cwd, positional_terms()) {
+        if session::remote_open(cwd, positional_terms(), new_window) {
             return;
         }
+        // Nothing answered: a window of our own, session or not, is the
+        // fallback -- with -n against a session too old to speak NewWindow,
+        // that means a separate second process, the worst honest outcome.
     }
     // Running our own window from here. The shells this window spawns must
     // describe THIS window: a joiner's inherited $MYPIXELS_WINDOW would
