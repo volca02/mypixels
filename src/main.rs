@@ -807,10 +807,26 @@ impl App {
     /// Remove a window from the session: the wake-slot list first (dead
     /// windows must not be woken, nor kept alive by it), then the window
     /// itself; the last one exiting ends the session.
+    /// Drop a dead tab's textures from EVERY window's cache: a tab that was
+    /// once previewed or shown in another window left copies there, and the
+    /// key (a never-reused id) would never be overwritten.
+    fn forget_gpu_images(&mut self, tab_id: usize) {
+        for w in self.wins.iter_mut() {
+            if let Some(g) = w.gpu.as_mut() {
+                g.forget_images(tab_id as u32);
+            }
+        }
+    }
+
     fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
         // A window dying takes its tabs with it; remember them all, oldest
         // first, so Ctrl+Shift+z can walk them back one by one.
         let deaths: Vec<_> = self.wins[i].tabs.iter().map(tab_death).collect();
+        let dying: Vec<usize> = self.wins[i].tabs.iter().map(|t| t.id).collect();
+        self.kitty.retain(|id, _| !dying.contains(id));
+        for id in dying {
+            self.forget_gpu_images(id);
+        }
         for d in deaths {
             self.remember_closed(d);
         }
@@ -996,6 +1012,7 @@ impl App {
         let dying_id = self.wins[self.cur].tabs[idx].id;
         self.sem_blocks.remove(&dying_id);
         self.kitty.remove(&dying_id);
+        self.forget_gpu_images(dying_id);
         self.remember_closed(tab_death(&self.wins[self.cur].tabs[idx]));
         // Stable ids: find the id of the tab being removed
         self.wins[self.cur].tabs.remove(idx);
@@ -2251,6 +2268,60 @@ impl App {
                 self.wins[self.cur].shot = false;
             }
         }
+        // Kitty images for the active tab: placements anchored to absolute
+        // logical lines, mapped through the tab's scroll position to window
+        // pixels, clipped to the grid area (UV-split so a half-scrolled
+        // image peels off the top realistically). Text paints afterwards,
+        // so glyphs stay on top of whatever an image covers.
+        gpu.images = {
+            let mut draws = Vec::new();
+            let a = self.wins[self.cur].active;
+            if let Some(tab) = self.wins[self.cur].tabs.get(a) {
+                let tab_id = tab.id as u32;
+                if let Some(k) = self.kitty.get(&tab.id) {
+                    let (hist, off) = {
+                        let term = tab.term.lock();
+                        (term.grid().history_size(), term.grid().display_offset())
+                    };
+                    let top_abs = hist.saturating_sub(off);
+                    let vy0 = strip_h;
+                    let vy1 = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
+                    for pl in k.placements_sorted() {
+                        let Some(img) = k.image(pl.image_id) else { continue };
+                        let iw = pl
+                            .cols
+                            .map_or(img.width, |c| (c as f32 * self.cell_w).max(1.0) as u32);
+                        let ih = pl
+                            .rows
+                            .map_or(img.height, |r| (r as f32 * self.cell_h).max(1.0) as u32);
+                        let x0 = pl.col as f32 * self.cell_w + pl.x_off as f32;
+                        let y0 = vy0
+                            + (pl.anchor_line as f32 - top_abs as f32) * self.cell_h
+                            + pl.y_off as f32;
+                        let (cx0, cy0) = (x0.max(0.0), y0.max(vy0));
+                        let (cx1, cy1) = ((x0 + iw as f32).min(w as f32), (y0 + ih as f32).min(vy1));
+                        if cx1 <= cx0 || cy1 <= cy0 {
+                            continue;
+                        }
+                        let key = (tab_id, pl.image_id, img.generation);
+                        if !gpu.has_image(key) {
+                            gpu.upload_image(key, &img.rgba, img.width, img.height);
+                        }
+                        draws.push(gpu::ImageQuad {
+                            key,
+                            dst: [cx0, cy0, cx1 - cx0, cy1 - cy0],
+                            uv: [
+                                (cx0 - x0) / iw as f32,
+                                (cy0 - y0) / ih as f32,
+                                (cx1 - x0) / iw as f32,
+                                (cy1 - y0) / ih as f32,
+                            ],
+                        });
+                    }
+                }
+            }
+            draws
+        };
         let egui_frame = match (full_output.as_mut(), self.wins[self.cur].egui.as_mut()) {
             (Some(full), Some(egui)) => {
                 // Take the shapes out: `full` is behind a reference, and the
@@ -2917,6 +2988,7 @@ impl App {
             if !live {
                 continue;
             }
+            log::debug!("apc drained for tab {tab_id}: {} bytes at {line}:{col}", payload.len());
             self.kitty.entry(tab_id).or_default().on_apc(&payload, line, col);
         }
     }

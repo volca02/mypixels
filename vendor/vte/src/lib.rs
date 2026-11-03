@@ -190,7 +190,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
-            State::SosPmApcString => self.anywhere(performer, byte),
+            State::SosPmApcString => self.advance_apc_string(performer, byte),
             State::Ground => unreachable!(),
         }
     }
@@ -367,7 +367,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
             },
-            0x58 => self.state = State::SosPmApcString,
+            0x58 => {
+                self.apc_raw.clear();
+                self.apc_overflow = false;
+                self.state = State::SosPmApcString;
+            }
             0x59..=0x5A => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -385,7 +389,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E..=0x5F => {
+                self.apc_raw.clear();
+                self.apc_overflow = false;
+                self.state = State::SosPmApcString;
+            }
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -415,6 +423,47 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 
     #[inline(always)]
+    /// APC/SOS/PM string accumulation. mypixels patch: the bytes were
+    /// previously dropped on the floor; the Kitty graphics protocol (and
+    /// anything else that lives in APC) needs them whole. Collected under a
+    /// hard cap and handed to `Perform::apc_raw` on the way out. ESC ends
+    /// the string exactly as it does for OSC - an APC interrupted by ESC
+    /// still dispatches what it held, malformed-by-construction payloads
+    /// being the consumer's problem to reject.
+    #[inline]
+    fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x18 | 0x1A => {
+                self.apc_end(performer);
+                performer.execute(byte);
+                self.state = State::Ground;
+            },
+            0x1B => {
+                self.apc_end(performer);
+                self.reset_params();
+                self.state = State::Escape;
+            },
+            _ => {
+                if !self.apc_overflow {
+                    if self.apc_raw.len() >= APC_LIMIT {
+                        self.apc_overflow = true;
+                    } else {
+                        self.apc_raw.push(byte);
+                    }
+                }
+            },
+        }
+    }
+
+    #[inline]
+    fn apc_end<P: Perform>(&mut self, performer: &mut P) {
+        let bytes = core::mem::take(&mut self.apc_raw);
+        if !bytes.is_empty() && !self.apc_overflow {
+            performer.apc_raw(&bytes);
+        }
+        self.apc_overflow = false;
+    }
+
     fn advance_osc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),

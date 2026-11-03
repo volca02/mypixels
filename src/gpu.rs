@@ -224,6 +224,57 @@ fn fs(i: VSIn) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// One Kitty image to paint this frame: a destination rect in window pixels,
+/// the UV sub-rect it shows (the visible part after viewport clipping), and
+/// the texture cache key (tab, image id, generation). The caller builds
+/// these from its graphics state; nothing below `Gpu` knows the protocol.
+pub struct ImageQuad {
+    pub key: (u32, u32, u32),
+    pub dst: [f32; 4],
+    pub uv: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImgVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+}
+
+const IMG_VS_WGSL: &str = r#"
+struct VSOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+@vertex
+fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VSOut {
+    return VSOut(vec4<f32>(pos, 0.0, 1.0), uv);
+}
+"#;
+
+const IMG_FS_WGSL: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VSIn {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+// Plain bilinear at LOD 0 over the Rgba8Unorm upload - the surface is
+// non-sRGB and display-referred, so texel bytes reach the screen unchanged,
+// exactly like the rect pipeline's colors.
+@fragment
+fn fs(i: VSIn) -> @location(0) vec4<f32> {
+    return textureSampleLevel(tex, samp, i.uv, 0.0);
+}
+"#;
+
+/// An uploaded image texture and its bind group, keyed by (tab, id, gen).
+struct ImgSlot {
+    _tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+}
+
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -281,6 +332,14 @@ pub struct Gpu {
     /// into them: same format, so no second atlas is needed.
     prev_viewport: Option<Viewport>,
     prev_size: (u32, u32),
+    // --- Kitty images ------------------------------------------------------
+    img_pipeline: wgpu::RenderPipeline,
+    img_buffer: wgpu::Buffer,
+    img_cache: std::collections::HashMap<(u32, u32, u32), ImgSlot>,
+    /// Images to paint in the next frame; the caller rebuilds this every
+    /// frame from its graphics state (placements are few and cheap to
+    /// re-derive, and staleness would mean images frozen mid-scroll).
+    pub images: Vec<ImageQuad>,
 }
 
 pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -591,6 +650,72 @@ impl Gpu {
             .collect();
         let prompt_buf = Buffer::new(font_system, Metrics::new(font_px, font_lh));
 
+        // Kitty image pipeline. The preview bind layout and sampler fit it
+        // exactly (one filtered texture + a linear sampler), so there is no
+        // second of either.
+        let img_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("images"),
+            bind_group_layouts: &[Some(&prev_bgl)],
+            immediate_size: 0,
+        });
+        let img_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("images"),
+            layout: Some(&img_layout),
+            vertex: wgpu::VertexState {
+                module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("images.vs"),
+                    source: wgpu::ShaderSource::Wgsl(IMG_VS_WGSL.into()),
+                }),
+                compilation_options: Default::default(),
+                entry_point: Some("vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImgVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                    ],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("images.fs"),
+                    source: wgpu::ShaderSource::Wgsl(IMG_FS_WGSL.into()),
+                }),
+                compilation_options: Default::default(),
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // PNGs carry alpha; images composite over the background
+                    // rects and under the glyphs, so ordinary source-alpha.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let img_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("images"),
+            size: 4096,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Gpu {
             device,
             queue,
@@ -619,6 +744,10 @@ impl Gpu {
             previews: Vec::new(),
             prev_viewport: None,
             prev_size: (0, 0),
+            img_pipeline,
+            img_buffer,
+            img_cache: std::collections::HashMap::new(),
+            images: Vec::new(),
             tab_pool,
             prompt_buf,
         }
@@ -635,6 +764,145 @@ impl Gpu {
             &pipeline,
             rects,
         );
+    }
+
+    /// True when this exact image generation is already on the GPU.
+    pub fn has_image(&self, key: (u32, u32, u32)) -> bool {
+        self.img_cache.contains_key(&key)
+    }
+
+    /// Upload an RGBA image (packed rows, w*h*4 bytes) and cache its
+    /// texture under `key`. Re-uploading the same id with a new generation
+    /// retires the older one: exactly one live texture per (tab, id).
+    pub fn upload_image(&mut self, key: (u32, u32, u32), rgba: &[u8], w: u32, h: u32) {
+        if self.img_cache.contains_key(&key) {
+            return;
+        }
+        let (tab, id, _) = key;
+        self.img_cache.retain(|k, _| !(k.0 == tab && k.1 == id));
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("kitty image"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bpr = 4 * w;
+        let rows = |src: &[u8]| -> Vec<u8> {
+            let padded = bpr.next_multiple_of(256);
+            let mut out = Vec::with_capacity(padded as usize * h as usize);
+            for y in 0..h as usize {
+                out.extend_from_slice(&src[y * bpr as usize..][..bpr as usize]);
+                out.resize(out.len() + padded as usize - bpr as usize, 0);
+            }
+            out
+        };
+        let data: &[u8] = if bpr % 256 == 0 { rgba } else { &rows(rgba) };
+        let bpr = bpr.next_multiple_of(256);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kitty image"),
+            layout: &self.prev_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.prev_sampler),
+                },
+            ],
+        });
+        self.img_cache.insert(key, ImgSlot { _tex: tex, view, bind });
+    }
+
+    /// Drop every texture belonging to a tab (tab close).
+    pub fn forget_images(&mut self, tab: u32) {
+        self.img_cache.retain(|k, _| k.0 != tab);
+    }
+
+    /// Paint this frame's image quads: after the rects (images belong over
+    /// the background) and before the glyphs (text stays readable on top).
+    /// Bind groups are cloned (each is an Arc) so the pass borrow and the
+    /// cache read do not fight over `self`.
+    fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, wf: f32, hf: f32) {
+        if self.images.is_empty() {
+            return;
+        }
+        let clip = |px: f32, py: f32| -> [f32; 2] {
+            [(px / wf) * 2.0 - 1.0, 1.0 - (py / hf) * 2.0]
+        };
+        let mut verts: Vec<ImgVertex> = Vec::with_capacity(self.images.len() * 6);
+        for q in &self.images {
+            let [x, y, w, h] = q.dst;
+            let (u0, v0, u1, v1) = (q.uv[0], q.uv[1], q.uv[2], q.uv[3]);
+            let v = |px: f32, py: f32, u: f32, vv: f32| ImgVertex {
+                pos: clip(px, py),
+                uv: [u, vv],
+            };
+            let (x1, y1) = (x + w, y + h);
+            verts.extend_from_slice(&[
+                v(x, y, u0, v0),
+                v(x1, y, u1, v0),
+                v(x1, y1, u1, v1),
+                v(x, y, u0, v0),
+                v(x1, y1, u1, v1),
+                v(x, y1, u0, v1),
+            ]);
+        }
+        let need = verts.len() * std::mem::size_of::<ImgVertex>();
+        if need > self.img_buffer.size() as usize {
+            self.img_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("images"),
+                size: ((need * 2) as u64).next_multiple_of(4096),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(&self.img_buffer, 0, bytemuck::cast_slice(&verts));
+        let binds: Vec<Option<wgpu::BindGroup>> = self
+            .images
+            .iter()
+            .map(|q| self.img_cache.get(&q.key).map(|s| s.bind.clone()))
+            .collect();
+        pass.set_pipeline(&self.img_pipeline.clone());
+        pass.set_vertex_buffer(0, self.img_buffer.slice(..));
+        for (i, bind) in binds.into_iter().enumerate() {
+            // A quad whose texture vanished (deleted between building the
+            // list and drawing it - one frame's grace at worst) is skipped,
+            // never drawn with a stranger's bind group.
+            if let Some(bind) = bind {
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw((i * 6) as u32..(i * 6 + 6) as u32, 0..1);
+            }
+        }
     }
 
     pub fn set_prev_sig(&mut self, idx: usize, sig: u64) {
@@ -1061,6 +1329,8 @@ impl Gpu {
             // `self`, which the &self pipeline fields are still borrowed from.
             let rects = std::mem::take(&mut self.rects);
             self.draw_rects(&mut pass, &rects);
+            let (iwf, ihf) = (w as f32, h as f32);
+            self.draw_images(&mut pass, iwf, ihf);
             if !areas.is_empty() {
                 self.text_renderer
                     .prepare(

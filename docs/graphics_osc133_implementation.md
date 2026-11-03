@@ -2,7 +2,16 @@
 
 **Target:** [`volca02/mypixels`, branch `rust_rewrite`](https://github.com/volca02/mypixels/tree/rust_rewrite)  
 **Inspected:** 2026-11-03  
-**Status:** implementation design, **not** an implemented patch. Code fragments are interfaces/pseudocode unless marked as a complete snippet.
+**Status:** M0-M2 (OSC 133) and M3-M5 (Kitty graphics) are IMPLEMENTED. The
+implementation deviated in one important way from the M3-M5 design below: the
+Kitty parameter language, transfer assembly, image store and placement rules
+live in the application (`src/kitty.rs`, pure and unit-tested), not inside
+vendored alacritty_terminal. The vendored terminal does only what it uniquely
+can - notice the sequence and report the cursor's absolute position at that
+instant (`osc_raw`/`apc_raw` hooks in `vendor/vte`, `Event::Semantic` /
+`Event::Apc` in `vendor/alacritty_terminal`) and hand over bytes. M6 and the
+sixel/iTerm2 milestones remain design; code fragments there are still
+pseudocode.
 
 ## Objective
 
@@ -43,10 +52,23 @@ Files and behaviors inspected directly on `rust_rewrite`:
 - [ ] M0 Baseline and dependency pinning
 - [ ] M1 OSC 133 parsing and metadata
 - [ ] M2 Shell integration and visible command navigation
-- [ ] M3 Kitty parsing + bounded payload assembly
-- [ ] M4 Kitty image store + scrolling semantics
-- [ ] M5 wgpu image rendering
-- [ ] M6 Full Kitty operations and capability detection
+- [x] M3 Kitty parsing + bounded payload assembly (2026-11-03: `src/kitty.rs`;
+      PNG/f=100 only, `a=t/T/p/d`, all three continuation shapes, caps at
+      32 MB transfer / 8192 px side / 64 images / 1024 placements; raw RGB,
+      zlib and file transfer explicitly rejected, not silently mispainted)
+- [x] M4 Kitty image store + scrolling semantics (placements anchored to the
+      absolute logical line captured at dispatch; scroll with content and
+      clip at the viewport edge by UV-splitting the quad; `a=d` deletes by
+      image, placement, or all; textures and store die with the tab)
+- [x] M5 wgpu image rendering (textured-quad pipeline in `src/gpu.rs`:
+      Rgba8Unorm upload + linear sampler, painted after rects and before
+      glyphs so text stays readable on top; texture cache keyed by
+      (tab, id, generation))
+- [ ] M6 Full Kitty operations and capability detection (deferred deliberately:
+      `a=q` is IGNORED, not answered falsely; `kitty +kitten icat` therefore
+      may not detect us - stream-mode senders work. Also open: scroll-cursor
+      placement modes, alt-screen clear, images in switcher thumbnails,
+      copy-image-to-clipboard from the stored source bytes)
 - [ ] M7 Sixel and iTerm2 adapters
 - [ ] M8 Robustness, performance, and release validation
 
