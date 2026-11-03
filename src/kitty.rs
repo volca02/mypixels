@@ -13,7 +13,8 @@
 //!
 //! Implemented subset of https://sw.kovidgoyal.net/kitty/graphicsprotocol :
 //! `a=t` transmit, `a=T` transmit+display, `a=p` display, `a=d` delete,
-//! `f=100` PNG, image ids, placement ids, chunked transfer (`m=1`),
+//! `f=24`/`f=32` raw RGB/RGBA, `f=100` PNG, image ids, placement ids,
+//! chunked transfer (`m=1`),
 //! columns/rows sizing, x/y offsets, z-index. Raw RGB/RGBA (`f=24/32`),
 //! zlib (`o=z`), cursor-relative delete filters, file/shared-memory
 //! transfer, protocol responses and scroll-cursor semantics are NOT
@@ -70,6 +71,8 @@ struct Pending {
     id: u32,
     display: bool,
     format: u32,
+    px_w: u32,
+    px_h: u32,
     cols: Option<u32>,
     rows: Option<u32>,
     x_off: u32,
@@ -77,7 +80,12 @@ struct Pending {
     z: i32,
     anchor_line: usize,
     anchor_col: usize,
-    buf: Vec<u8>,
+    /// Decoded bytes so far. Base64 is decoded chunk by chunk: senders
+    /// (broot among them) pad each chunk independently, so the texts of
+    /// two chunks must never be pasted together and decoded as one.
+    bytes: Vec<u8>,
+    /// At most 3 base64 chars awaiting their fourth.
+    carry: Vec<u8>,
 }
 
 /// Per-tab graphics state. Owned by the app, keyed by tab id; it moves and
@@ -142,8 +150,24 @@ impl TabKitty {
         };
         let append = |slf: &mut Self, data: &[u8]| -> bool {
             match slf.pending.as_mut() {
-                Some(p) if p.buf.len() + data.len() <= MAX_TRANSFER => {
-                    p.buf.extend_from_slice(data);
+                Some(p) if p.bytes.len() + p.carry.len() + data.len() <= MAX_TRANSFER => {
+                    p.carry.extend_from_slice(data);
+                    let n = p.carry.len() / 4 * 4;
+                    if n > 0 {
+                        let aligned = &p.carry[..n];
+                        match base64::engine::general_purpose::STANDARD_NO_PAD
+                            .decode(aligned)
+                            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(aligned))
+                        {
+                            Ok(b) => p.bytes.extend_from_slice(&b),
+                            Err(_) => {
+                                log::warn!("kitty: transfer corrupted mid-stream, dropped");
+                                slf.pending = None;
+                                return false;
+                            },
+                        }
+                        p.carry.drain(..n);
+                    }
                     true
                 },
                 Some(_) => {
@@ -167,13 +191,14 @@ impl TabKitty {
         let more = num(b'm') == 1;
 
         // Interrogation: answer truthfully about the subset implemented.
-        // `f=100` only (PNG), no `o=` field at all (no compression). A
+        // `f=24,32,100` (raw RGB, raw RGBA, PNG), no `o=` field at all
+        // (no compression). A
         // sender that reads this honestly will send plain base64 PNG in
         // chunks, which is exactly what this terminal can do; senders that
         // demand zlib or raw RGB are told the truth by absence.
         if action == b'q' {
             let id = num(b'i');
-            let msg = format!("\x1b_G:OK,a=i,f=100,i={id};mypixels\x1b\\");
+            let msg = format!("\x1b_G:OK,a=i,f=24,32,100,i={id};mypixels\x1b\\");
             return msg.into_bytes();
         }
         // Other unknown actions: ignored. Answering `q` is above; anything
@@ -218,6 +243,8 @@ impl TabKitty {
                     id,
                     display: action == b'T',
                     format,
+                    px_w: num(b's') as u32,
+                    px_h: num(b'v') as u32,
                     cols: (num(b'c') > 0).then(|| num(b'c') as u32),
                     rows: (num(b'r') > 0).then(|| num(b'r') as u32),
                     x_off: num(b'x') as u32,
@@ -225,14 +252,14 @@ impl TabKitty {
                     z: num(b'z') as u32 as i32,
                     anchor_line: line,
                     anchor_col: col,
-                    buf: Vec::new(),
+                    bytes: Vec::new(),
+                    carry: Vec::new(),
                 };
                 if data.len() > MAX_TRANSFER {
                     return Vec::new();
                 }
-                p.buf.extend_from_slice(data);
                 self.pending = Some(p);
-                if !more {
+                if append(self, data) && !more {
                     self.complete_pending();
                 }
             },
@@ -295,29 +322,40 @@ impl TabKitty {
         if p.id >= self.next_id {
             self.next_id = p.id + 1;
         }
-        let bytes = match decode_b64(&p.buf) {
-            Some(b) => b,
-            None => {
-                log::warn!("kitty: base64 decode failed, frame dropped");
-                return;
-            },
-        };
+        let mut bytes = p.bytes;
+        if !p.carry.is_empty() {
+            match decode_b64(&p.carry) {
+                Some(mut t) => bytes.append(&mut t),
+                None => {
+                    log::warn!("kitty: base64 decode failed, frame dropped");
+                    return;
+                },
+            }
+        }
+        let src = Arc::new(bytes);
         let rgba = match p.format {
-            100 => match decode_png(&bytes) {
+            100 => match decode_png(&src) {
                 Some(img) => img,
                 None => {
                     log::warn!("kitty: png decode failed, frame dropped");
                     return;
                 },
             },
-            // Raw RGB/RGBA needs s/w geometry this version does not
-            // implement; say nothing and drop it, per the caps.
+            // Raw RGB/RGBA (f=24/f=32): no header to learn geometry from,
+            // so `s=`/`v=` are mandatory; broot's whole graphics path is
+            // built on exactly these.
+            f @ (24 | 32) => match raw_rgba(&src, f, p.px_w, p.px_h) {
+                Some(img) => img,
+                None => {
+                    log::warn!("kitty: raw f={f} rejected ({}x{}, {} bytes)", p.px_w, p.px_h, src.len());
+                    return;
+                },
+            },
             other => {
                 log::warn!("kitty: format {other} not supported, frame dropped");
                 return;
             },
         };
-        let src = Arc::new(bytes);
         let generation = self.images.get(&p.id).map(|old| old.generation + 1).unwrap_or(0);
         self.images.insert(p.id, KittyImage { width: rgba.0, height: rgba.1, rgba: rgba.2, source: src, generation });
         while self.images.len() > MAX_IMAGES {
@@ -396,6 +434,27 @@ fn decode_b64(data: &[u8]) -> Option<Vec<u8>> {
 /// PNG -> RGBA8, size-capped BEFORE allocating: width/height are read from
 /// the header and bounds-checked first, so a 100000x100000 claim never
 /// reaches the decoder's memory (checked against u64 products as well).
+/// Raw RGB/RGBA pixels: length must be exactly w*h*bpp, sides within the
+/// cap; RGB grows an opaque alpha.
+fn raw_rgba(bytes: &[u8], format: u32, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let bpp = if format == 24 { 3 } else { 4 };
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return None;
+    }
+    let need = w as usize * h as usize * bpp;
+    if bytes.len() != need {
+        return None;
+    }
+    if format == 32 {
+        return Some((w, h, bytes.to_vec()));
+    }
+    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+    for px in bytes.chunks_exact(3) {
+        rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+    }
+    Some((w, h, rgba))
+}
+
 fn decode_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let reader = std::io::Cursor::new(bytes);
     let mut decoder = png::Decoder::new(reader);
@@ -527,11 +586,35 @@ mod tests {
     }
 
     #[test]
+    fn raw_rgb_and_rgba_are_accepted() {
+        let mut k = TabKitty::default();
+        // f=24: two red pixels, 2x1
+        k.on_apc(&apc("a=T,i=1,f=24,s=2,v=1", &b64(&[255, 0, 0, 255, 0, 0])), 1, 0);
+        let img = k.image(1).expect("rgb24 image");
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(&img.rgba[..4], &[255, 0, 0, 255]);
+        // f=32 chunked, broot's shape: header, m=1 chunks, m=0 finish
+        k.on_apc(&apc("a=t,i=2,f=32,m=1,s=2,v=1", &b64(&[0, 0, 255, 9][..])), 2, 0);
+        k.on_apc(&apc("a=t,i=2,f=32,m=1", &b64(&[0, 0, 255, 9][..])), 2, 0);
+        assert!(k.image(2).is_none()); // not finished yet
+        // broot repeats the full header on continuation chunks (a=t same id):
+        k.on_apc(&apc("a=t,i=2,f=32,m=0", &b64(&[][..])), 2, 0);
+        let img = k.image(2).expect("rgba32 reassembles");
+        assert_eq!(img.rgba, vec![0, 0, 255, 9, 0, 0, 255, 9]);
+        // a lying length is refused, not overrun
+        k.on_apc(&apc("a=T,i=3,f=24,s=4,v=4", &b64(&[0, 0, 0])), 3, 0);
+        assert!(k.image(3).is_none());
+        // raw without geometry is refused (nothing derives it from length alone)
+        k.on_apc(&apc("a=T,i=4,f=32", &b64(&[0u8; 8])), 4, 0);
+        assert!(k.image(4).is_none());
+    }
+
+    #[test]
     fn interrogation_answers_truthfully() {
         let mut k = TabKitty::default();
         let r = k.on_apc(&apc("a=q,i=1", &[]), 1, 0);
         let r = String::from_utf8(r).unwrap();
-        assert!(r.starts_with("\x1b_G:OK,a=i,f=100,i=1;"), "{r:?}");
+        assert!(r.starts_with("\x1b_G:OK,a=i,f=24,32,100,i=1;"), "{r:?}");
         // No `o=` field: no compression is claimed.
         assert!(!r.contains(",o="), "{r:?}");
         // Ordinary frames answer nothing.
