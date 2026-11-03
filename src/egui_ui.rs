@@ -51,6 +51,10 @@ pub struct ConfigEvents {
 /// Ephemeral UI state that must survive across frames.
 #[derive(Default)]
 pub struct UiState {
+    /// Frames the context menu has been on screen. The right-press that
+    /// *opened* the menu is still in the input state of the first frame
+    /// that draws it - dismissal must not see its own opening.
+    pub menu_age: u32,
     /// The open font popup, if any (at most one at a time).
     pub font_popup: Option<FontPopup>,
     /// Theme names for the picker. Fetched lazily and re-fetched after
@@ -130,7 +134,10 @@ pub fn ctx_menu(ui: &egui::Ui, st: &mut UiState) {
             }
             area = ui.response().rect;
         });
+    // One frame of grace: the opening press (and any key in the same batch)
+    // arrives in the input state of the first frame that draws the menu.
     if out.is_none()
+        && st.menu_age >= 2
         && ctx.input(|i| {
             i.key_pressed(egui::Key::Escape)
                 || (i.pointer.any_pressed()
@@ -139,6 +146,7 @@ pub fn ctx_menu(ui: &egui::Ui, st: &mut UiState) {
     {
         out = Some(None);
     }
+    st.menu_age += 1;
     st.menu_out = out;
 }
 

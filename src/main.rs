@@ -3775,6 +3775,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+
                 if egui_consumed {
                     return;
                 }
@@ -3817,6 +3818,7 @@ impl ApplicationHandler for App {
                         st.menu_pos = [mx, my];
                         st.menu_open = true;
                         st.menu_out = None;
+                        st.menu_age = 0;
                     }
                     window.request_redraw();
                 } else if button == MouseButton::Middle {
