@@ -144,6 +144,16 @@ impl Tab {
         )));
 
         tty::setup_env();
+        // alacritty_terminal advertises TERM=alacritty. We are not alacritty,
+        // and more practically: shells' keybinding setups key off $TERM by
+        // glob (the classic zsh `case $TERM in *xterm*)` idiom), and VTE -
+        // the terminal the original mypixels was built on - always said
+        // xterm-256color. Say the same thing, or everything downstream
+        // (ctrl-arrow word-jump first) silently un-binds itself. MYPIXELS_TERM
+        // overrides for the rare terminfo purist.
+        let term_name = std::env::var("MYPIXELS_TERM")
+            .unwrap_or_else(|_| "xterm-256color".to_string());
+        unsafe { std::env::set_var("TERM", term_name) };
         let pty = tty::new(&pty_options(program, args, cwd, window), window_size, tab_id as u64)
             .expect("failed to open pty");
 
