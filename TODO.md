@@ -64,13 +64,14 @@ data-device protocol.
       asserts the reported SGR sequences, the wheel report, and the Shift
       bypass) -- it needs a machine with xdotool and xsel, which the
       headless build box lacks.
-- [ ] **Modifier chords reach the terminal only sometimes** (reported on Wayland/niri:
-  Alt+Backspace and Ctrl+W produce nothing, plain typing fine). The FIFO key-spec
-  path bypasses winit's keyboard layer entirely, so unit tests and FIFO smokes are
-  blind to this class of bug - it lives between the backend's key event and
-  `key_from_key_event`. Reproduce with real injected keys (xte under forced-X11),
-  then diff what Wayland hands over that X11 does not: the alt/ctrl modifier flags,
-  and the logical key each backend settles on.
+- [x] **Modifier chords reach the terminal only sometimes** - fixed in `keys: the
+  full xterm modifier table`: named keys (arrows/Home/End/Del/pgup/F-keys) had been
+  sent *without* their modifier parameter, Ctrl/Alt+Space dodged the ctrl branch via
+  NamedKey::Space, Alt+Backspace lost its ESC prefix, and egui consumed Tab with no
+  surface open. Ctrl+W had always encoded 0x17 correctly; if word-kill still fails
+  on niri after this build, the remaining suspect is Wayland-side modifiers only.
+  Test rig: Xvfb + xte + /tmp-style xlib focus helper (no WM => no keyboard focus;
+  every older keyboard e2e was silently typing into the void).
 - [ ] **IME.** GTK/VTE give it free; the rewrite has none.
 - [x] **Selection autoscroll.** Dragging the selection edge into a band at
       either grid edge scrolls that way, faster the deeper the pointer is
