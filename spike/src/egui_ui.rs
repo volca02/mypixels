@@ -49,9 +49,89 @@ pub struct ConfigEvents {
 }
 
 /// Ephemeral UI state that must survive across frames.
+#[derive(Default)]
 pub struct UiState {
     /// The open font popup, if any (at most one at a time).
     pub font_popup: Option<FontPopup>,
+    /// The tab-rename box, egui's version of the original's GTK entry. The
+    /// app mirrors this to decide whether to swallow keys.
+    pub rename_open: bool,
+    pub rename_draft: String,
+    /// Screen position (logical points) chosen by the app when it opens the
+    /// box -- just under the tab strip, where row 0 used to host the prompt.
+    pub rename_pos: [f32; 2],
+    /// True for the frame the box opens: focus the entry and pre-select the
+    /// draft, so the first typed key replaces it exactly like selected text
+    /// in the GTK original (Enter with nothing typed keeps it).
+    pub rename_seed: bool,
+    /// Set by `rename_box` when the user commits (Some(Some(_))) or cancels
+    /// (Some(None)); the app applies and clears it after the frame.
+    pub rename_out: Option<Option<String>>,
+}
+
+/// The rename box: a small frameless window with one text field. Enter
+/// commits, anything that drops the focus (Escape, a click elsewhere)
+/// cancels. Returns whatever `UiState::rename_out` received this frame.
+pub fn rename_box(ui: &egui::Ui, st: &mut UiState) {
+    if !st.rename_open {
+        st.rename_out = None;
+        return;
+    }
+    let ctx = ui.ctx();
+    let pos = egui::pos2(st.rename_pos[0], st.rename_pos[1]);
+    let seed = st.rename_seed;
+    let mut out: Option<Option<String>> = None;
+    egui::Window::new("rename_tab")
+        .id(egui::Id::new("rename_tab_box"))
+        .title_bar(false)
+        .movable(false)
+        .resizable(false)
+        .fixed_pos(pos)
+        .constrain(false)
+        .show(&ctx, |ui| {
+            // Deliberately no lock_focus: losing the focus *is* the cancel
+            // gesture (Escape, or a click anywhere else in the window).
+            let te = egui::TextEdit::singleline(&mut st.rename_draft).desired_width(280.0);
+            let resp = ui.add(te);
+            if seed {
+                resp.request_focus();
+                st.rename_seed = false;
+                // egui 0.37 dropped select_all_on, so pre-select through the
+                // edit's stored cursor state: the whole draft reads as
+                // selected text, and the first typed key replaces it.
+                let id = resp.id;
+                let len = st.rename_draft.chars().count();
+                let mut state =
+                    egui::text_edit::TextEditState::load(&ctx, id).unwrap_or_default();
+                state.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
+                    egui::epaint::text::cursor::CCursor::new(0),
+                    egui::epaint::text::cursor::CCursor::new(len),
+                )));
+                state.store(&ctx, id);
+            }
+            if resp.lost_focus() {
+                // egui drops the edit's focus on Enter and on Escape alike;
+                // only Enter commits. A click on another widget lands here.
+                out = Some(if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    Some(st.rename_draft.clone())
+                } else {
+                    None
+                });
+            } else if ctx.input(|i| {
+                // A press on empty background (the terminal, mostly) does
+                // not steal egui focus, so treat it as cancel by hand. The
+                // app also surrenders egui focus on its own mouse presses;
+                // whichever fires first settles it.
+                i.pointer.any_pressed()
+                    && i
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|p| !resp.rect.expand(8.0).contains(p))
+            }) {
+                out = Some(None);
+            }
+        });
+    st.rename_out = out;
 }
 
 /// The font selector popup, opened from one of the two font rows. It works
@@ -195,7 +275,7 @@ impl Egui {
         // textures, so the first real open is ordinary UI work.
         {
             let mut warm_cfg = crate::config::Config::default();
-            let mut warm_st = UiState { font_popup: None };
+            let mut warm_st = UiState::default();
             let mut open = true;
             let mut full = ctx.run_ui(
                 egui::RawInput {
@@ -220,7 +300,7 @@ impl Egui {
             config_changed: false,
             save_requested: false,
             revert_requested: false,
-            ui_state: UiState { font_popup: None },
+            ui_state: UiState::default(),
             switcher_pick: None,
             font_choices,
             open_prev: (false, false),
@@ -374,9 +454,6 @@ fn measure_card(ui: &egui::Ui, index: usize, card: &SwitcherCard) -> (f32, f32) 
 pub fn release_focus(ctx: &egui::Context) {
     if let Some(id) = ctx.memory(|m| m.focused()) {
         ctx.memory_mut(|m| m.surrender_focus(id));
-        eprintln!("DBG release: was focused {:?}, now focused {:?}", id, ctx.memory(|m| m.focused()));
-    } else {
-        eprintln!("DBG release: no focused id");
     }
 }
 
@@ -1288,7 +1365,7 @@ mod regression {
 
     /// One layout pass of the config panel at a given screen size.
     fn pass(ctx: &Context, w: f32, h: f32, open: bool) -> egui::FullOutput {
-        let mut st = UiState { font_popup: None };
+        let mut st = UiState::default();
         let mut cfg = crate::config::Config::default();
         let mut open_local = open;
         let mut full = ctx.run_ui(
@@ -1362,7 +1439,7 @@ mod regression {
             ),
         }));
 
-        let mut st = UiState { font_popup: None };
+        let mut st = UiState::default();
         let mut cfg = crate::config::Config::default();
         // Seed from a family in the middle of the list: the popup puts the
         // current family first, so the next row down is the first family
@@ -1655,7 +1732,7 @@ mod input_regression {
         let mut db = glyphon::fontdb::Database::new();
         db.load_system_fonts();
         let choices = crate::fonts::font_choices(&db);
-        let mut st = UiState { font_popup: None };
+        let mut st = UiState::default();
         let mut cfg = crate::config::Config::default();
         let seed_spec = choices[choices.len() / 2].name.clone();
         cfg.term_font = format!("{seed_spec} 13");
@@ -1720,7 +1797,7 @@ mod input_regression {
         let mut db = glyphon::fontdb::Database::new();
         db.load_system_fonts();
         let choices = crate::fonts::font_choices(&db);
-        let mut st = UiState { font_popup: None };
+        let mut st = UiState::default();
         let mut cfg = crate::config::Config::default();
         let mid = choices[choices.len() / 2].name.clone();
         // A hand-written decimal in the config must seed a whole point size.
@@ -1774,6 +1851,86 @@ mod input_regression {
     }
 
     #[test]
+    /// The egui rename box: seeded draft arrives selected (first key
+    /// replaces it), Enter commits, and any other focus loss -- Escape or a
+    /// click away -- cancels. The hand-drawn prompt had this logic in the
+    /// app's key handler; egui owns it now.
+    #[test]
+    fn rename_box_selects_seeds_commits_and_cancels() {
+        let ctx = Context::default();
+        let mut st = UiState::default();
+        let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
+            let mut full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(900.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| rename_box(ui, st),
+            );
+            full.textures_delta.clear();
+        };
+        let key = |k: egui::Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let click_far = egui::Event::PointerButton {
+            pos: egui::pos2(800.0, 500.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        st.rename_open = true;
+        st.rename_seed = true;
+        st.rename_draft = "worktree".to_string();
+        step(&mut st, vec![]);
+        // Focused, and the whole draft reads as selected text.
+        let focused = ctx.memory(|m| m.focused()).expect("rename entry took focus");
+        let sel = egui::text_edit::TextEditState::load(&ctx, focused)
+            .and_then(|s| s.cursor.char_range())
+            .expect("cursor state");
+        assert_ne!(sel.primary, sel.secondary, "seeded draft is not selected");
+        // The seed is a one-frame gesture.
+        assert!(!st.rename_seed);
+
+        // Typing over a selection replaces it -- the GTK behaviour the
+        // hand-drawn draft used to emulate.
+        step(
+            &mut st,
+            vec![egui::Event::Text("w".into())],
+        );
+        assert_eq!(st.rename_draft, "w", "typing did not replace the selection");
+
+        // Enter commits exactly what is on screen.
+        step(&mut st, vec![key(egui::Key::Enter)]);
+        assert_eq!(
+            st.rename_out.as_ref().map(Option::as_deref),
+            Some(Some("w")),
+            "Enter did not commit"
+        );
+
+        // A click elsewhere cancels: nothing is renamed.
+        let mut st2 = UiState::default();
+        st2.rename_open = true;
+        st2.rename_seed = true;
+        st2.rename_draft = "keep".to_string();
+        step(&mut st2, vec![]);
+        assert!(ctx.memory(|m| m.focused()).is_some());
+        step(&mut st2, vec![click_far]);
+        assert_eq!(
+            st2.rename_out.as_ref().map(Option::as_deref),
+            Some(None),
+            "clicking away did not cancel"
+        );
+    }
+
     fn keyboard_focus_released_when_ui_steps_aside() {
         let mut db = glyphon::fontdb::Database::new();
         db.load_system_fonts();
@@ -1799,7 +1956,7 @@ mod input_regression {
         // A: panel closed (Save / x) while the filter had focus. Closing the
         // panel also clears the popup, exactly as config_window does, so the
         // app's edge helper sees (true,true) -> (false,false).
-        let mut st = UiState { font_popup: None };
+        let mut st = UiState::default();
         let mut cfg = crate::config::Config::default();
         let mut sim = fresh_sim(&mut st, &mut cfg, true, &choices);
         focus_filter(&mut sim);
@@ -1815,7 +1972,7 @@ mod input_regression {
         assert!(sim.ctx.memory(|m| m.focused()).is_none(), "egui still holds a widget focus after the panel closed");
 
         // B: popup closed (OK/Cancel) while the filter had focus, panel open.
-        let mut st = UiState { font_popup: None };
+        let mut st = UiState::default();
         let mut cfg = crate::config::Config::default();
         let mut sim = fresh_sim(&mut st, &mut cfg, true, &choices);
         focus_filter(&mut sim);
@@ -1829,7 +1986,7 @@ mod input_regression {
         // C: filter focused, user clicks the terminal. Such a click is NOT
         // egui-consumed, and the app releases focus for every click it
         // claims itself; simulate that call.
-        let mut st = UiState { font_popup: None };
+        let mut st = UiState::default();
         let mut cfg = crate::config::Config::default();
         let mut sim = fresh_sim(&mut st, &mut cfg, true, &choices);
         focus_filter(&mut sim);

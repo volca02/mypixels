@@ -359,13 +359,9 @@ struct App {
     term_weight: u16,
     term_slant: fonts::DbStyle,
     term_pt: f32,
-    /// Inline rename mode: when true, keys edit `rename_draft` instead of the
-    /// terminal; Enter commits, Esc cancels.
+    /// The egui rename box is open: keys belong to it, not the terminal
+    /// (see `egui_ui::rename_box` for the editing itself).
     renaming: bool,
-    rename_draft: String,
-    /// The seeded draft still stands in for a selection: the first
-    /// keystroke replaces it instead of appending (GTK select-all).
-    rename_fresh: bool,
     /// Alt-held visual switcher. Releasing Alt keeps its selected tab.
     overview: Option<OverviewState>,
     /// The egui switcher's thumbnails: per tab, the readback texture, the size
@@ -391,6 +387,11 @@ struct App {
     last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
     /// last BEL seen anywhere (visual bell; see bell_flash)
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// egui events synthesized from FIFO key specs, queued for the next
+    /// RawInput. Events pushed straight into `ctx.input_mut` are wiped by
+    /// `start_pass` before the UI reads them; only `RawInput.events` ride
+    /// through to the widgets.
+    fifo_egui_events: Vec<egui::Event>,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -621,8 +622,6 @@ impl App {
             term_slant,
             term_pt,
             renaming: false,
-            rename_draft: String::new(),
-            rename_fresh: false,
             overview: None,
             sw_thumbs: Vec::new(),
             thumb_rr: 0,
@@ -632,6 +631,7 @@ impl App {
             cursor_blink,
             last_activity,
             bell,
+            fifo_egui_events: Vec::new(),
             modifiers: ModifiersState::empty(),
             program,
             args,
@@ -1183,7 +1183,9 @@ impl App {
         {
             let mut egui = self.egui.take();
             if let Some(egui) = egui.as_mut() {
-                let raw = egui.state.take_egui_input(window);
+                let mut raw = egui.state.take_egui_input(window);
+                raw.events
+                    .extend(std::mem::take(&mut self.fifo_egui_events));
                 let ctx = egui.ctx.clone();
                 let full = ctx.run_ui(raw, |ui| {
                     let ev = egui_ui::config_window(
@@ -1207,6 +1209,7 @@ impl App {
                             &mut egui.switcher_pick,
                         );
                     }
+                    egui_ui::rename_box(ui, &mut egui.ui_state);
                 });
                 // While the pointer is down on a slider, egui keeps asking
                 // for frames; forward that to winit's redraw path.
@@ -1217,7 +1220,19 @@ impl App {
                 // keyboard focus; a vanished TextEdit does not do it alone,
                 // and while egui holds focus every keystroke reads as
                 // consumed and never reaches the terminal.
-                let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open);
+                if let Some(res) = egui.ui_state.rename_out.take() {
+                    self.renaming = false;
+                    egui.ui_state.rename_open = false;
+                    if let Some(name) = res {
+                        log::info!("rename_tab -> {:?}", name);
+                        if let Some(t) = self.tabs.get_mut(self.active) {
+                            t.name = if name.is_empty() { None } else { Some(name) };
+                        }
+                    }
+                    window.request_redraw();
+                }
+                let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open)
+                    || egui.ui_state.rename_open;
                 egui_ui::release_focus_if_closed(&ctx, egui.config_open, popup_open, &mut egui.open_prev);
                 full_output = Some(full);
             }
@@ -1488,9 +1503,8 @@ impl App {
                 { let c = self.config.selection_color.to_f32(); [c[0], c[1], c[2], 0.35] },
             );
         }
-        // Cursor (hidden on row 0 while renaming; the prompt owns that line)
         if let Some((cx, cy)) = frame.cursor {
-            if !(self.renaming && cy == 0) {
+            {
                 push_rect(
                     &mut gpu.rects,
                     cx as f32 * self.cell_w,
@@ -1512,10 +1526,6 @@ impl App {
             let fs = &mut self.font_system;
             let pool = &mut gpu.pool;
             for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
-                // Row 0 is replaced by the rename prompt.
-                if self.renaming && run.row == 0 {
-                    continue;
-                }
                 if self.notice.is_some() && run.row as usize == self.rows.saturating_sub(1) { continue; }
                 let blank = run.text.chars().all(|c| c == ' ');
                 let default_fg =
@@ -1542,9 +1552,10 @@ impl App {
             }
         }
 
-        // --- Inline rename prompt (overlays terminal row 0) ---
-        if self.renaming || self.notice.is_some() {
-            let prompt_y = if self.renaming { strip_h } else { strip_h + self.rows.saturating_sub(1) as f32 * self.cell_h };
+        // --- Notice prompt (overlays the last terminal row; renaming moved
+        // into egui and no longer paints over the grid) ---
+        if self.notice.is_some() {
+            let prompt_y = strip_h + self.rows.saturating_sub(1) as f32 * self.cell_h;
             push_rect(
                 &mut gpu.rects,
                 0.0,
@@ -1553,8 +1564,7 @@ impl App {
                 self.cell_h,
                 [self.bg[0], self.bg[1], self.bg[2], 1.0],
             );
-            let prompt = if self.renaming { format!("Rename: [{}]", self.rename_draft) }
-                else { format!("  {}", self.notice.as_ref().unwrap().0) };
+            let prompt = format!("  {}", self.notice.as_ref().unwrap().0);
             {
                 let fs = &mut self.font_system;
                 let b = &mut gpu.prompt_buf;
@@ -1832,7 +1842,10 @@ impl App {
                     None => "-".to_string(),
                 };
                 let ren = if self.renaming {
-                    format!("renaming={:?}", self.rename_draft)
+                    format!(
+                        "renaming={:?}",
+                        self.egui.as_ref().map(|e| e.ui_state.rename_draft.clone())
+                    )
                 } else {
                     String::new()
                 };
@@ -1844,6 +1857,7 @@ impl App {
                 // hold delay, which needs real ModifiersChanged events).
                 if self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
                     && !self.tabs.is_empty()
+                    && !self.renaming
                 {
                     self.overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
@@ -1863,7 +1877,15 @@ impl App {
             }
             if let Some((mods, key)) = parse_key_spec(line) {
                 self.modifiers = mods;
-                self.handle_key(&key, event_loop);
+                // Mirror the real path's egui-first routing: while an egui
+                // widget owns the keyboard (rename box, font popup, config
+                // fields), the spec goes to egui and never reaches the
+                // terminal. winit's KeyEvent cannot be constructed from
+                // outside winit (pub(crate) extras), so translate to egui
+                // events directly -- the same things egui-winit would send.
+                if !self.test_key_to_egui(&key, mods) {
+                    self.handle_key(&key, event_loop);
+                }
             }
         }
         if let Some(window) = self.window.as_ref() {
@@ -1874,6 +1896,46 @@ impl App {
     /// The active terminal's mouse-reporting mode, or None when the terminal
     /// does not want the mouse. Shift is the bypass: while it is held the
     /// mouse always selects instead of reporting (the VTE/Alacritty rule).
+    /// Feed a FIFO key spec to egui when egui holds the keyboard. Returns
+    /// whether egui claimed it (so the caller skips the app's own handler).
+    fn test_key_to_egui(&mut self, key: &Key, mods: ModifiersState) -> bool {
+        if self.egui.is_none() {
+            return false;
+        }
+        let m = egui_mods(mods);
+        let egui = self.egui.as_ref().unwrap();
+        if !egui.ctx.egui_wants_keyboard_input() {
+            return false; // nothing focused: egui-winit would not consume it
+        }
+        match key {
+            // egui inserts characters from Text events, exactly as a real
+            // IME-driven keypress arrives through egui-winit.
+            Key::Character(c) => {
+                self.fifo_egui_events
+                    .push(egui::Event::Text(c.as_ref().to_owned()));
+            },
+            Key::Named(winit::keyboard::NamedKey::Space) => {
+                // A real keyboard delivers a Space as text, not as a bare
+                // key code; egui's TextEdit expects the same.
+                self.fifo_egui_events.push(egui::Event::Text(" ".into()));
+            },
+            other => {
+                if let Some(k) = egui_key_of(other) {
+                    let ev = |pressed| egui::Event::Key {
+                        key: k,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: m,
+                    };
+                    self.fifo_egui_events.push(ev(true));
+                    self.fifo_egui_events.push(ev(false));
+                }
+            },
+        }
+        true
+    }
+
     fn mouse_mode(&self) -> Option<TermMode> {
         if self.modifiers.shift_key() {
             return None;
@@ -2004,10 +2066,14 @@ impl App {
 
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
         if self.drag.take().is_some() { self.publish_primary(); }
-        // 0. Rename mode eats keys (Enter commits, Esc cancels, Backspace and
-        //    characters edit the draft). Nothing reaches the terminal.
+        // 0. The egui rename box owns the keyboard: egui consumes the keys
+        //    it needs, and anything left over is swallowed here so a half-
+        //    typed name can never leak into the shell. Escape is the app's
+        //    own cancel, in case egui already had the focus dropped.
         if self.renaming {
-            self.handle_rename_key(key);
+            if matches!(key, Key::Named(winit::keyboard::NamedKey::Escape)) {
+                self.close_rename();
+            }
             return;
         }
         // 1. The switcher claims only its own keys (arrows, Home/End, digits
@@ -2056,41 +2122,12 @@ impl App {
         }
     }
 
-    fn handle_rename_key(&mut self, key: &Key) {
-        use winit::keyboard::NamedKey;
-        match key {
-            Key::Named(NamedKey::Enter) => {
-                let name = self.rename_draft.clone();
-                self.renaming = false;
-                log::info!("rename_tab -> {:?}", name);
-                if let Some(t) = self.tabs.get_mut(self.active) {
-                    t.name = if name.is_empty() { None } else { Some(name) };
-                }
-            },
-            Key::Named(NamedKey::Escape) => {
-                self.renaming = false;
-            },
-            Key::Named(NamedKey::Backspace) => {
-                if self.rename_fresh {
-                    self.rename_draft.clear(); // delete the "selection"
-                } else {
-                    self.rename_draft.pop();
-                }
-                self.rename_fresh = false;
-            },
-            Key::Character(c) => {
-                if self.rename_fresh {
-                    // The seeded title acted as selected text: typing over
-                    // a selection replaces it. Appending turned `shell` into
-                    // `shellworktree` -- the original's GTK entry select-all
-                    // never did that.
-                    self.rename_draft = c.to_string();
-                } else {
-                    self.rename_draft.push_str(c);
-                }
-                self.rename_fresh = false;
-            },
-            _ => {},
+    /// Close the rename box without committing (app-side Escape).
+    fn close_rename(&mut self) {
+        self.renaming = false;
+        if let Some(egui) = self.egui.as_mut() {
+            egui.ui_state.rename_open = false;
+            egui_ui::release_focus(&egui.ctx);
         }
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -2295,12 +2332,25 @@ impl App {
             "enlarge_font" => self.zoom_term(true),
             "shrink_font" => self.zoom_term(false),
             "rename_tab" => {
-                // Pre-fill the draft with the current displayed title; it
-                // stands in for selected text (Enter keeps it, the first
-                // typed key replaces it) like the original's GTK entry.
-                self.rename_draft = self.tabs[self.active].display_title();
-                self.rename_fresh = true;
-                self.renaming = true;
+                // The rename box is an egui text entry, so it and the Alt-
+                // held switcher cannot share the screen: they share Mod1,
+                // and only one of them may hold the keyboard. With the
+                // switcher open, the chord therefore *closes* it and hands
+                // over to the rename UI.
+                self.close_switcher();
+                if let Some(egui) = self.egui.as_mut() {
+                    let title = self.tabs.get(self.active).map(|t| t.display_title()).unwrap_or_default();
+                    let y = self.tab_h + 6.0;
+                    let st = &mut egui.ui_state;
+                    st.rename_draft = title;
+                    st.rename_seed = true;
+                    st.rename_pos = [12.0, y];
+                    st.rename_open = true;
+                    st.rename_out = None;
+                    self.renaming = true;
+                } else {
+                    log::warn!("rename_tab: egui unavailable");
+                }
             },
             // Not yet ported
             "show_search" | "show_search_all" | "search_prev" | "search_next" => {
@@ -2596,6 +2646,43 @@ fn app_icon() -> Option<winit::window::Icon> {
     .map(|a| (**a).clone())
 }
 
+fn egui_mods(m: ModifiersState) -> egui::Modifiers {
+    let mut out = egui::Modifiers::NONE;
+    if m.shift_key() {
+        out |= egui::Modifiers::SHIFT;
+    }
+    if m.control_key() {
+        out |= egui::Modifiers::CTRL;
+    }
+    if m.alt_key() {
+        out |= egui::Modifiers::ALT;
+    }
+    if m.super_key() {
+        out |= egui::Modifiers::COMMAND;
+    }
+    out
+}
+
+/// The named keys worth handing to egui from the FIFO hook; characters go
+/// through `Event::Text` instead, so they never appear here.
+fn egui_key_of(key: &Key) -> Option<egui::Key> {
+    use winit::keyboard::NamedKey;
+    Some(match key {
+        Key::Named(NamedKey::Enter) => egui::Key::Enter,
+        Key::Named(NamedKey::Escape) => egui::Key::Escape,
+        Key::Named(NamedKey::Backspace) => egui::Key::Backspace,
+        Key::Named(NamedKey::Delete) => egui::Key::Delete,
+        Key::Named(NamedKey::Tab) => egui::Key::Tab,
+        Key::Named(NamedKey::Home) => egui::Key::Home,
+        Key::Named(NamedKey::End) => egui::Key::End,
+        Key::Named(NamedKey::ArrowLeft) => egui::Key::ArrowLeft,
+        Key::Named(NamedKey::ArrowRight) => egui::Key::ArrowRight,
+        Key::Named(NamedKey::ArrowUp) => egui::Key::ArrowUp,
+        Key::Named(NamedKey::ArrowDown) => egui::Key::ArrowDown,
+        _ => return None,
+    })
+}
+
 fn parse_key_spec(spec: &str) -> Option<(ModifiersState, Key)> {
     let mut mods = ModifiersState::empty();
     let mut keypart = "";
@@ -2873,6 +2960,7 @@ impl ApplicationHandler for App {
                     && self.switcher_alt_at.lock().unwrap().is_some()
                     && !self.tabs.is_empty()
                     && self.overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
+                    && !self.renaming
                 {
                     self.overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
