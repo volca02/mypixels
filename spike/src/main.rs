@@ -1177,41 +1177,64 @@ impl App {
         FrameData { runs, cursor, fg, bg, cursor_color }
     }
 
+    /// Which way (and how fast) a selection drag at pointer height `py`
+    /// should scroll. `top`/`bottom` bound the text grid. Inside a band at
+    /// an edge, the pull is answered: the deeper toward (and past) the edge
+    /// the pointer is pushed, the more lines travel per tick -- grazing the
+    /// band drifts a line, pinning the pointer at the window's border
+    /// scrolls almost a screen. The pointer cannot leave the window, so
+    /// how far INTO the edge you drove it is the only honest measure of
+    /// how hard the drag is; depth is the speed. Positive direction = up
+    /// into history, the wheel's own sign.
+    fn autoscroll_tick(py: f32, top: f32, bottom: f32, cell: f32) -> Option<(i32, i32)> {
+        if bottom <= top || cell <= 0.0 {
+            return None;
+        }
+        // A band taller than the grid would scroll on a pointer parked in
+        // the middle of a tiny window.
+        let band = (cell * 2.2).min((bottom - top) / 3.0);
+        let cap = 32;
+        if py < top + band {
+            let depth = (top + band - py).max(0.0);
+            Some((1, ((depth / cell).ceil() as i32).clamp(1, cap)))
+        } else if py > bottom - band {
+            let depth = (py - (bottom - band)).max(0.0);
+            Some((-1, ((depth / cell).ceil() as i32).clamp(1, cap)))
+        } else {
+            None
+        }
+    }
+
     /// Render the terminal and, while Alt is held, the egui tab switcher.
     /// Builds a frame per tab (before the mutable gpu borrow), then hands
     /// off to the gpu pass.
     fn draw(&mut self, window: &Window) {
         if self.wins[self.cur].notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.wins[self.cur].notice = None; }
-        // Selection-drag autoscroll: hold the dragged edge above or below
-        // the grid and the history travels under it at 20 lines/second,
-        // the selection tracking the edge cell. Frame-driven -- each tick
-        // asks for the next frame while the pointer stays outside.
+        // Selection-drag autoscroll: dragging the selection edge into the
+        // band at either grid edge scrolls that way, and dragging PAST the
+        // edge scrolls faster -- one extra line per tick for every cell
+        // height of over-drag. The signs match the wheel: Delta(+) travels
+        // up into history, Delta(-) back down.
         {
             let (px, py) = self.wins[self.cur].pointer;
             let strip_h = if self.show_tab_strip() { self.tab_h } else { 0.0 };
             let bottom = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
             let dir = if self.wins[self.cur].drag.is_some() && !self.wins[self.cur].tabs.is_empty() {
-                if py < strip_h {
-                    Some(-1i32)
-                } else if py > bottom {
-                    Some(1i32)
-                } else {
-                    None
-                }
+                Self::autoscroll_tick(py, strip_h, bottom, self.cell_h)
             } else {
                 None
             };
-            if let Some(d) = dir {
+            if let Some((d, lines)) = dir {
                 if self.wins[self.cur].autoscroll_next.map_or(true, |t| Instant::now() >= t) {
                     self.wins[self.cur].autoscroll_next = Some(Instant::now() + std::time::Duration::from_millis(50));
                     let tab = &self.wins[self.cur].tabs[self.wins[self.cur].active];
-                    tab.scroll(alacritty_terminal::grid::Scroll::Delta(d));
+                    tab.scroll(alacritty_terminal::grid::Scroll::Delta(d * lines));
                     // Same buffer-line transform as `cell_at`, applied to
                     // the edge row of the post-scroll view.
                     let col = ((px / self.cell_w).floor() as usize).min(self.wins[self.cur].cols.saturating_sub(1));
                     let within = px / self.cell_w - (px / self.cell_w).floor();
                     let side = if within < 0.5 { Side::Left } else { Side::Right };
-                    let vis_row = if d < 0 { 0 } else { self.wins[self.cur].rows as i32 - 1 };
+                    let vis_row = if d > 0 { 0 } else { self.wins[self.cur].rows as i32 - 1 };
                     let off = tab.term.lock().grid().display_offset() as i32;
                     tab.update_selection(
                         Point { line: Line(vis_row - off), column: Column(col) },
@@ -3899,6 +3922,44 @@ mod mouse_report_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn autoscroll_direction_follows_the_wheel_sign() {
+        // Drag near the top edge: up into history, Delta(+). Near the
+        // bottom: toward the prompt, Delta(-). Middle: dead.
+        let (dir, lines) = App::autoscroll_tick(10.0, 0.0, 400.0, 16.0).unwrap();
+        assert_eq!((dir.signum(), lines >= 1), (1, true));
+        let (dir, _) = App::autoscroll_tick(395.0, 0.0, 400.0, 16.0).unwrap();
+        assert_eq!(dir.signum(), -1);
+        assert!(App::autoscroll_tick(200.0, 0.0, 400.0, 16.0).is_none());
+    }
+
+    #[test]
+    fn autoscroll_speeds_up_with_over_drag() {
+        // Edge band: one line per tick. Each cell height pulled past the
+        // edge: one more. A furious pull still moves a screen, not a book.
+        let cap = 32;
+        // band = 2.2 cells deep: grazing its far edge drifts one line...
+        assert_eq!(App::autoscroll_tick(58.0, 24.0, 400.0, 16.0), Some((1, 1)));
+        // ...mid-band travels two...
+        assert_eq!(App::autoscroll_tick(32.0, 24.0, 400.0, 16.0), Some((2, 2)).map(|(a, b)| (1, b)));
+        // ...and the grid edge itself (a full band of depth) three.
+        assert_eq!(App::autoscroll_tick(24.0, 24.0, 400.0, 16.0), Some((1, 3)));
+        // Past it (the strip zone, or the window's own border) keeps ramping.
+        assert_eq!(App::autoscroll_tick(4.0, 24.0, 400.0, 16.0), Some((1, 4)));
+        assert_eq!(App::autoscroll_tick(420.0, 0.0, 400.0, 16.0), Some((-1, 4)));
+        assert_eq!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).map(|(d, _)| d), Some(1));
+        assert_eq!(App::autoscroll_tick(1.0, 0.0, 400.0, 16.0), Some((1, 3))); // near the border: three
+        assert!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).unwrap().1 <= cap);
+    }
+
+    #[test]
+    fn tiny_windows_do_not_autoscroll_on_a_parked_pointer() {
+        // Two-cell grid: the bands would overlap; the middle must hold.
+        assert!(App::autoscroll_tick(16.0, 0.0, 32.0, 16.0).is_none());
+    }
+
     use super::swap_follow;
 
     #[test]
