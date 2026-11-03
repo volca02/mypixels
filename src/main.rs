@@ -1495,7 +1495,7 @@ impl App {
             (acc[1] * 255.0) as u8,
             (acc[2] * 255.0) as u8,
         );
-        let sw_dim = (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8;
+        let sw_dim = egui_ui::dim_fill(&self.config, (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8);
         {
             let mut egui = self.wins[self.cur].egui.take();
             if let Some(egui) = egui.as_mut() {

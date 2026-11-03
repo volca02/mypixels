@@ -677,6 +677,20 @@ pub fn ui_theme(cfg: &crate::config::Config) -> egui::Visuals {
     v
 }
 
+/// The switcher backdrop: the theme's background pressed towards dark,
+/// not flat black. Over a light theme a black dim reads as smoke; over a
+/// dark one the difference is subtle - either way the overlay now belongs
+/// to the palette the user chose.
+pub fn dim_fill(cfg: &crate::config::Config, alpha: u8) -> egui::Color32 {
+    let bg = cfg.background_color.to_f32();
+    egui::Color32::from_rgba_unmultiplied(
+        (bg[0] * 0.30 * 255.0) as u8,
+        (bg[1] * 0.30 * 255.0) as u8,
+        (bg[2] * 0.30 * 255.0) as u8,
+        alpha,
+    )
+}
+
 /// Mix two egui colours in plain sRGB bytes (card fills etc. derived from
 /// the live visuals; perceptual subtleties are lost on 8-bit UI fills).
 fn mix_c(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
@@ -689,7 +703,7 @@ pub fn switcher_screen(
     ui: &mut egui::Ui,
     open: bool,
     selected: usize,
-    dim_alpha: u8,
+    dim_fill: egui::Color32,
     accent: egui::Color32,
     cards: &[SwitcherCard],
     pick: &mut Option<usize>,
@@ -698,7 +712,7 @@ pub fn switcher_screen(
         return;
     }
     egui::CentralPanel::no_frame()
-        .frame(egui::Frame::NONE.fill(egui::Color32::from_black_alpha(dim_alpha)))
+        .frame(egui::Frame::NONE.fill(dim_fill))
         .show(ui, |ui| {
             // Claim the whole backdrop (see docs) *without allocating it*:
             // allocating the full rect would advance the layout cursor past
@@ -1873,7 +1887,7 @@ mod regression {
                             ui,
                             true,
                             1,
-                            76,
+                            egui::Color32::from_black_alpha(76),
                             egui::Color32::WHITE,
                             &cards,
                             &mut pick,
