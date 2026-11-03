@@ -791,7 +791,7 @@ pub fn config_window(
             // The header is pinned (outside the scroll area) so the close
             // button stays reachable however far down the user has scrolled.
             ui.horizontal(|ui| {
-                ui.heading("Configuration");
+                ui.label(egui::RichText::new("Settings").strong().size(18.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("×").clicked() {
                         *open = false;
@@ -800,37 +800,22 @@ pub fn config_window(
             });
             ui.separator();
 
-            // Each section is a grid whose label column is sized by the
-            // widest label (see `row`), so the controls line up in a single
-            // column across all sections.
+            // Sections follow how often they are actually touched: fonts and
+            // colours first (the everyday edits), transparency and window
+            // next, then the two tab subsystems, and the near-never-changed
+            // terminal bits last. Both fonts share one section -- splitting
+            // them across "Terminal" and "Tabs" was the confusing bit. Each
+            // section is a grid whose label column is sized by the widest
+            // label (see `row`), so controls line up across the whole panel.
             egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Terminal");
-            egui::Grid::new("terminal").show(ui, |ui| {
-                font_row(
-                    ui,
-                    "Font",
-                    &mut cfg.term_font,
-                    FontWhich::Term,
-                    st,
-                    choices,
-                    &mut ev,
-                );
-                row(ui, "See-through", |ui| {
-                    if ui.add(egui::Slider::new(&mut cfg.term_opacity, 0.0..=1.0)).changed() {
-                        ev.apply = true;
-                    }
-                });
-                row(ui, "Scrollback lines", |ui| {
-                    if ui.add(egui::DragValue::new(&mut cfg.scrollback_lines).range(0..=1_000_000)).changed() {
-                        ev.apply = true;
-                    }
-                });
-
+            section(ui, "FONTS");
+            egui::Grid::new("fonts").show(ui, |ui| {
+                font_row(ui, "Terminal font", &mut cfg.term_font, FontWhich::Term, st, choices, &mut ev);
+                font_row(ui, "Tab font", &mut cfg.tablist_font, FontWhich::Tablist, st, choices, &mut ev);
             });
-            // Every color chooser lives in this one section, grouped by
-            // where it paints; the other sections stay colour-free.
-            ui.heading("Colors");
-            ui.strong("Terminal");
+
+            section(ui, "COLORS");
+            subsection(ui, "Terminal");
             egui::Grid::new("colors-terminal").show(ui, |ui| {
                 color_row(ui, "Background", &mut cfg.background_color, &mut ev);
                 color_row(ui, "Foreground", &mut cfg.foreground_color, &mut ev);
@@ -838,21 +823,22 @@ pub fn config_window(
                 color_row(ui, "Cursor", &mut cfg.cursor_color, &mut ev);
                 color_row(ui, "Accent", &mut cfg.accent_color, &mut ev);
                 color_row(ui, "Background tint", &mut cfg.bg_tint_color, &mut ev);
-                row(ui, "Palette", |ui| {
-                    // Two rows of eight: one row of sixteen is wider than
-                    // the narrowest panel.
-                    for chunk in cfg.col.chunks_mut(8) {
-                        ui.horizontal(|ui| {
-                            for c in chunk.iter_mut() {
-                                if color_cell(ui, c) {
-                                    ev.apply = true;
-                                }
-                            }
-                        });
-                    }
-                });
             });
-            ui.strong("Tab strip");
+            subsection(ui, "16-colour palette");
+            ui.indent("palette", |ui| {
+                // Four rows of four: eight to a row already exceeds the
+                // default panel width once the indent is paid for.
+                for chunk in cfg.col.chunks_mut(4) {
+                    ui.horizontal(|ui| {
+                        for c in chunk.iter_mut() {
+                            if color_cell(ui, c) {
+                                ev.apply = true;
+                            }
+                        }
+                    });
+                }
+            });
+            subsection(ui, "Tab strip");
             egui::Grid::new("colors-tabs").show(ui, |ui| {
                 color_row(ui, "Strip", &mut cfg.tablist_background, &mut ev);
                 color_row(ui, "Tab", &mut cfg.tab_color_bg, &mut ev);
@@ -861,17 +847,29 @@ pub fn config_window(
                 color_row(ui, "Tab text (active)", &mut cfg.tab_color_fg_selected, &mut ev);
                 color_row(ui, "Add button", &mut cfg.add_button_color, &mut ev);
             });
-            ui.heading("Tabs");
+
+            section(ui, "TRANSPARENCY & WINDOW");
+            egui::Grid::new("window").show(ui, |ui| {
+                row(ui, "Transparency", |ui| {
+                    if ui.add(egui::Slider::new(&mut cfg.term_opacity, 0.0..=1.0)).changed() {
+                        ev.apply = true;
+                    }
+                });
+                row(ui, "Default width", |ui| {
+                    if ui.add(egui::DragValue::new(&mut cfg.default_width)).changed() {
+                        ev.apply = true;
+                    }
+                });
+                row(ui, "Default height", |ui| {
+                    if ui.add(egui::DragValue::new(&mut cfg.default_height)).changed() {
+                        ev.apply = true;
+                    }
+                });
+                checkbox_row(ui, "Start maximized", &mut cfg.default_maximize, &mut ev);
+            });
+
+            section(ui, "TABS");
             egui::Grid::new("tabs").show(ui, |ui| {
-                font_row(
-                    ui,
-                    "Font",
-                    &mut cfg.tablist_font,
-                    FontWhich::Tablist,
-                    st,
-                    choices,
-                    &mut ev,
-                );
                 row(ui, "Title length", |ui| {
                     if ui.add(egui::DragValue::new(&mut cfg.tab_title_max_length)).changed() {
                         ev.apply = true;
@@ -888,9 +886,9 @@ pub fn config_window(
                 checkbox_row(ui, "Hide single tab", &mut cfg.hide_single_tab, &mut ev);
                 checkbox_row(ui, "Focus new tabs", &mut cfg.focus_new_tabs, &mut ev);
                 checkbox_row(ui, "Shorten from start", &mut cfg.tab_title_shorten_start, &mut ev);
-
             });
-            ui.heading("Tab switcher");
+
+            section(ui, "TAB SWITCHER");
             egui::Grid::new("tab_switcher").show(ui, |ui| {
                 checkbox_row(ui, "Open on Alt hold", &mut cfg.tab_overview_on_alt, &mut ev);
                 row(ui, "Backdrop dim", |ui| {
@@ -913,33 +911,28 @@ pub fn config_window(
                         ev.apply = true;
                     }
                 });
-
             });
-            ui.heading("Window");
-            egui::Grid::new("window").show(ui, |ui| {
-                row(ui, "Default width", |ui| {
-                    if ui.add(egui::DragValue::new(&mut cfg.default_width)).changed() {
-                        ev.apply = true;
-                    }
-                });
-                row(ui, "Default height", |ui| {
-                    if ui.add(egui::DragValue::new(&mut cfg.default_height)).changed() {
-                        ev.apply = true;
-                    }
-                });
-                checkbox_row(ui, "Start maximized", &mut cfg.default_maximize, &mut ev);
 
+            section(ui, "TERMINAL");
+            egui::Grid::new("terminal").show(ui, |ui| {
+                row(ui, "Scrollback lines", |ui| {
+                    if ui.add(egui::DragValue::new(&mut cfg.scrollback_lines).range(0..=1_000_000)).changed() {
+                        ev.apply = true;
+                    }
+                });
             });
             }); // ScrollArea contents
 
             // Pinned at the panel bottom, outside the scroll area.
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Revert").clicked() {
-                    ev.revert = true;
-                }
+                // Right-to-left layout: whichever is added first lands at the
+                // far right, so Save -- the primary action -- takes it.
                 if ui.button("Save").clicked() {
                     ev.save = true;
+                }
+                if ui.button("Revert").clicked() {
+                    ev.revert = true;
                 }
             });
         });
@@ -949,6 +942,23 @@ pub fn config_window(
         st.font_popup = None;
     }
     ev
+}
+
+/// Section caption: quiet uppercase text doing the work a fat heading used
+/// to do. A settings panel has dozens of headings; when everything shouts,
+/// nothing does.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(14.0);
+    let weak = ui.style().visuals.weak_text_color();
+    ui.label(egui::RichText::new(title).strong().small().color(weak));
+    ui.add_space(2.0);
+}
+
+/// Grouping inside a section (the colour subgroups), one notch quieter.
+fn subsection(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(title).weak().small());
+    ui.add_space(2.0);
 }
 
 /// One aligned row inside a section [`egui::Grid`]: the label cell, the
