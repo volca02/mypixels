@@ -683,6 +683,86 @@ pub fn ui_theme(
     v
 }
 
+/// Convert a config RGB to egui colour (clamped: user YAML can be bold).
+fn rgb_c32(rgb: crate::config::Rgb) -> egui::Color32 {
+    let c = rgb.to_f32();
+    egui::Color32::from_rgb(
+        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+    )
+}
+
+/// The app's one Cancel/OK row, shared by every confirm-or-discard surface
+/// (settings panel, font popup, future dialogs) so "the endings" look and
+/// mean the same thing everywhere: equal halves, side by side, Cancel in
+/// the palette's red and OK in its green - instant meaning, still wearing
+/// the user's theme. `width` is the *host's* design width, deliberately
+/// not measured from available_width: a panel that auto-sizes from content
+/// plus content that measures the panel is a width feedback loop (the
+/// layout regression test guards exactly this).
+pub fn ok_cancel_row(
+    ui: &mut egui::Ui,
+    cfg: &crate::config::Config,
+    width: f32,
+    ok_label: &str,
+    cancel_label: &str,
+) -> (bool, bool) {
+    ok_cancel_row_tinted(
+        ui,
+        rgb_c32(cfg.col[1]),
+        rgb_c32(cfg.col[2]),
+        width,
+        ok_label,
+        cancel_label,
+    )
+}
+
+/// The same row for callers that hold only the two colours (a row editing
+/// one config field cannot also hand over the whole config - the borrow
+/// checker wins this one, and the palette arrives as data instead).
+pub fn ok_cancel_row_tinted(
+    ui: &mut egui::Ui,
+    red: egui::Color32,
+    green: egui::Color32,
+    width: f32,
+    ok_label: &str,
+    cancel_label: &str,
+) -> (bool, bool) {
+    let mut ok = false;
+    let mut cancel = false;
+    ui.horizontal(|ui| {
+        let gap = ui.style().spacing.item_spacing.x;
+        let half = (width - gap) / 2.0;
+        let row_h = 34.0;
+        let vis = ui.style().visuals.clone();
+        if ui
+            .add_sized(
+                [half, row_h],
+                egui::Button::new(egui::RichText::new(cancel_label).strong())
+                    .fill(mix_c(vis.panel_fill, red, 0.30))
+                    .stroke(egui::Stroke::new(1.0, mix_c(vis.panel_fill, red, 0.65))),
+            )
+            .clicked()
+        {
+            cancel = true;
+        }
+        ui.add_space(gap);
+        if ui
+            .add_sized(
+                [half, row_h],
+                egui::Button::new(egui::RichText::new(ok_label).strong())
+                    .fill(mix_c(vis.panel_fill, green, 0.34))
+                    .stroke(egui::Stroke::new(1.0, mix_c(vis.panel_fill, green, 0.7))),
+            )
+            .clicked()
+        {
+            ok = true;
+        }
+    });
+    (ok, cancel)
+}
+
 /// The switcher backdrop: the theme's background pressed towards dark,
 /// not flat black. Over a light theme a black dim reads as smoke; over a
 /// dark one the difference is subtle - either way the overlay now belongs
@@ -1057,8 +1137,26 @@ pub fn config_window(
             egui::ScrollArea::vertical().show(ui, |ui| {
             section(ui, "FONTS");
             egui::Grid::new("fonts").show(ui, |ui| {
-                font_row(ui, "Terminal font", &mut cfg.term_font, FontWhich::Term, st, choices, &mut ev);
-                font_row(ui, "Tab font", &mut cfg.tablist_font, FontWhich::Tablist, st, choices, &mut ev);
+                font_row(
+                    ui,
+                    "Terminal font",
+                    &mut cfg.term_font,
+                    FontWhich::Term,
+                    st,
+                    choices,
+                    (rgb_c32(cfg.col[1]), rgb_c32(cfg.col[2])),
+                    &mut ev,
+                );
+                font_row(
+                    ui,
+                    "Tab font",
+                    &mut cfg.tablist_font,
+                    FontWhich::Tablist,
+                    st,
+                    choices,
+                    (rgb_c32(cfg.col[1]), rgb_c32(cfg.col[2])),
+                    &mut ev,
+                );
             });
 
             section(ui, "COLORS");
@@ -1214,59 +1312,18 @@ pub fn config_window(
             // Save right (the primary keeps the thumb's corner), and Save
             // is set in strong text so the pair reads as [secondary |
             // PRIMARY] rather than an apology.
-            // Standard nomenclature and standard colours, taken from the
-            // user's own palette: Cancel wears the palette's red, OK its
-            // green - so "discard" and "keep" read instantly and still
-            // belong to the theme (a Nord OK is blue-green, a dracula OK
-            // is dracula-green). Both close the panel: OK persists, Cancel
-            // discards; either way the errand is done.
+            // The panel's two endings. OK persists and closes; Cancel
+            // discards and closes - the shared row component, in the panel's
+            // own design width.
             ui.separator();
             ui.add_space(2.0);
-            let to_c32 = |rgb: crate::config::Rgb| {
-                let c = rgb.to_f32();
-                egui::Color32::from_rgb(
-                    (c[0].clamp(0.0, 1.0) * 255.0) as u8,
-                    (c[1].clamp(0.0, 1.0) * 255.0) as u8,
-                    (c[2].clamp(0.0, 1.0) * 255.0) as u8,
-                )
-            };
-            let red = to_c32(cfg.col[1]);
-            let green = to_c32(cfg.col[2]);
-            let mut ok = None;
-            let mut cancel = None;
-            ui.horizontal(|ui| {
-                // The panel auto-sizes from its content, and this footer
-                // *is* content: measuring the buttons against available_width
-                // while the panel is still measuring itself is a width
-                // feedback loop (available_width is infinite mid-measure, and
-                // the panel lands wherever egui's clamp felt like). The footer
-                // therefore speaks in the panel's own design width and takes
-                // exactly what it asked for.
-                let gap = ui.style().spacing.item_spacing.x;
-                let half = (380.0 - gap) / 2.0;
-                let row_h = 34.0;
-                let vis = ui.style().visuals.clone();
-                cancel = Some(ui.add_sized(
-                    [half, row_h],
-                    egui::Button::new(egui::RichText::new("Cancel").strong())
-                        .fill(mix_c(vis.panel_fill, red, 0.30))
-                        .stroke(egui::Stroke::new(1.0, mix_c(vis.panel_fill, red, 0.65))),
-                ));
-                ui.add_space(gap);
-                ok = Some(ui.add_sized(
-                    [half, row_h],
-                    egui::Button::new(egui::RichText::new("OK").strong())
-                        .fill(mix_c(vis.panel_fill, green, 0.34))
-                        .stroke(egui::Stroke::new(1.0, mix_c(vis.panel_fill, green, 0.7))),
-                ));
-            });
-            let (ok, cancel) = (ok.unwrap(), cancel.unwrap());
-            if ok.clicked() {
+            let (ok, cancel) = ok_cancel_row(ui, cfg, 380.0, "OK", "Cancel");
+            if ok {
                 ev.save = true;
                 st.theme_fetched = false;
                 *open = false;
             }
-            if cancel.clicked() {
+            if cancel {
                 ev.revert = true;
                 st.theme_fetched = false;
                 *open = false;
@@ -1325,6 +1382,7 @@ fn font_row(
     which: FontWhich,
     st: &mut UiState,
     choices: &[crate::fonts::FontChoice],
+    tint: (egui::Color32, egui::Color32),
     ev: &mut ConfigEvents,
 ) {
     row(ui, label, |ui| {
@@ -1559,23 +1617,20 @@ fn font_row(
                                 {
                                     popup.size_pt = (popup.size_pt + 1.0).min(96.0);
                                 }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("OK").clicked() || dbl {
-                                            commit = compose_value(
-                                                choices,
-                                                &popup.family,
-                                                popup.style,
-                                                popup.size_pt,
-                                            );
-                                            close = true;
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            close = true;
-                                        }
-                                    },
-                                );
+                                ui.add_space(2.0);
+                                let (ok, canc) = ok_cancel_row_tinted(ui, tint.0, tint.1, 250.0, "OK", "Cancel");
+                                if ok || dbl {
+                                    commit = compose_value(
+                                        choices,
+                                        &popup.family,
+                                        popup.style,
+                                        popup.size_pt,
+                                    );
+                                    close = true;
+                                }
+                                if canc {
+                                    close = true;
+                                }
                             });
                         },
                     );
