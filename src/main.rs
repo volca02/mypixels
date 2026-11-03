@@ -2995,7 +2995,17 @@ impl App {
                 continue;
             }
             log::debug!("apc drained for tab {tab_id}: {} bytes at {line}:{col}", payload.len());
-            self.kitty.entry(tab_id).or_default().on_apc(&payload, line, col);
+            let reply = self.kitty.entry(tab_id).or_default().on_apc(&payload, line, col);
+            if !reply.is_empty() {
+                if let Some(tab) = self
+                    .wins
+                    .iter()
+                    .flat_map(|w| w.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                {
+                    tab.write(&reply);
+                }
+            }
         }
     }
 
@@ -4577,14 +4587,22 @@ impl ApplicationHandler for App {
                         to_close = exited.drain(..).collect();
                     }
                 }
+                // A window can die with these closes (the last tab closes
+                // its window, the last window empties `wins`), and the
+                // event loop still has queued work after `exit()`: every
+                // `wins[self.cur]` below is guarded, or shutdown ends in a
+                // panic on the second exited event instead of a clean exit.
                 if !to_close.is_empty() {
                     // map stable ids back to current indices (ids are stable)
                     for id in to_close.iter().rev() {
+                        if self.wins.is_empty() {
+                            return;
+                        }
                         if let Some(pos) = self.wins[self.cur].tabs.iter().position(|t| t.id == *id) {
                             self.close_tab_at(pos, event_loop);
                         }
                     }
-                    if self.wins[self.cur].tabs.is_empty() {
+                    if self.wins.is_empty() || self.wins[self.cur].tabs.is_empty() {
                         return;
                     }
                 }

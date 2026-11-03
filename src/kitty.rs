@@ -105,12 +105,13 @@ impl Default for TabKitty {
 impl TabKitty {
     /// One complete APC string (the bytes between `ESC _` and ST, so it
     /// starts with the `G` namespace letter for Kitty), anchored at
-    /// `line`/`col` as captured at dispatch.
-    pub fn on_apc(&mut self, payload: &[u8], line: usize, col: usize) {
+    /// `line`/`col` as captured at dispatch. Returns bytes to write back to
+    /// the pty - today only the `a=q` interrogation answer.
+    pub fn on_apc(&mut self, payload: &[u8], line: usize, col: usize) -> Vec<u8> {
         if payload.first() != Some(&b'G') {
             // Some other APC dialect (tmux passes several through); not
             // ours to interpret, and nothing here may misread it.
-            return;
+            return Vec::new();
         }
         // Wire shape is `G;<params>;<data>`. The ';' after the namespace
         // letter is part of the framing - strip it before splitting, or
@@ -159,11 +160,24 @@ impl TabKitty {
         // parameterized frame can end the transfer.
         if params.is_empty() {
             append(self, data);
-            return;
+            return Vec::new();
         }
 
         let action = get(b'a').and_then(|v| v.first()).copied().unwrap_or(b't');
         let more = num(b'm') == 1;
+
+        // Interrogation: answer truthfully about the subset implemented.
+        // `f=100` only (PNG), no `o=` field at all (no compression). A
+        // sender that reads this honestly will send plain base64 PNG in
+        // chunks, which is exactly what this terminal can do; senders that
+        // demand zlib or raw RGB are told the truth by absence.
+        if action == b'q' {
+            let id = num(b'i');
+            let msg = format!("\x1b_G:OK,a=i,f=100,i={id};mypixels\x1b\\");
+            return msg.into_bytes();
+        }
+        // Other unknown actions: ignored. Answering `q` is above; anything
+        // else would just be noise on the wire.
 
         // Continuation, shape two: a frame carrying neither `a` nor `i`
         // while a transfer lives can only belong to it.
@@ -171,7 +185,7 @@ impl TabKitty {
             if append(self, data) && !more {
                 self.complete_pending();
             }
-            return;
+            return Vec::new();
         }
 
         match action {
@@ -196,7 +210,7 @@ impl TabKitty {
                     if append(self, data) && !more {
                         self.complete_pending();
                     }
-                    return;
+                    return Vec::new();
                 }
                 // A genuinely new header frame while one is open abandons
                 // the old: the spec's resync rule.
@@ -214,7 +228,7 @@ impl TabKitty {
                     buf: Vec::new(),
                 };
                 if data.len() > MAX_TRANSFER {
-                    return;
+                    return Vec::new();
                 }
                 p.buf.extend_from_slice(data);
                 self.pending = Some(p);
@@ -225,7 +239,7 @@ impl TabKitty {
             b'p' => {
                 let id = num(b'i') as u32;
                 if !self.images.contains_key(&id) {
-                    return;
+                    return Vec::new();
                 }
                 let placement_id = {
                     let p = num(b'p') as u32;
@@ -261,11 +275,9 @@ impl TabKitty {
                     self.images.remove(&id);
                 }
             },
-            // 'q' (query) and everything unknown: ignored. Answering `q`
-            // wrongly would advertise a subset we do not fully implement;
-            // answering it truly belongs with capability work (doc M6).
             _ => {},
         }
+        Vec::new()
     }
 
     fn push_placement(&mut self, pl: Placement) {
@@ -489,6 +501,18 @@ mod tests {
         k.on_apc(&bare, 1, 0); // bare continuation with no pending
         assert_eq!(k.images.len(), 0);
         assert_eq!(k.placements().len(), 0);
+    }
+
+    #[test]
+    fn interrogation_answers_truthfully() {
+        let mut k = TabKitty::default();
+        let r = k.on_apc(&apc("a=q,i=1", &[]), 1, 0);
+        let r = String::from_utf8(r).unwrap();
+        assert!(r.starts_with("\x1b_G:OK,a=i,f=100,i=1;"), "{r:?}");
+        // No `o=` field: no compression is claimed.
+        assert!(!r.contains(",o="), "{r:?}");
+        // Ordinary frames answer nothing.
+        assert!(k.on_apc(&apc("a=t,i=5,f=100", &b64(&tiny_png())), 1, 0).is_empty());
     }
 
     #[test]
