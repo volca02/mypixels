@@ -394,6 +394,9 @@ struct App {
     /// `hover_tab`). Releasing anywhere ends the drag; the tabs stay where
     /// they were dropped, like dragging a browser tab past its neighbour.
     tab_drag: Option<usize>,
+    /// The tab drag crossed into another cell, so the press has become a
+    /// reorder and the release must not also count as a click.
+    tab_drag_moved: bool,
     /// egui events synthesized from FIFO key specs, queued for the next
     /// RawInput. Events pushed straight into `ctx.input_mut` are wiped by
     /// `start_pass` before the UI reads them; only `RawInput.events` ride
@@ -639,6 +642,7 @@ impl App {
             last_activity,
             bell,
             tab_drag: None,
+            tab_drag_moved: false,
             autoscroll_next: None,
             fifo_egui_events: Vec::new(),
             modifiers: ModifiersState::empty(),
@@ -3112,6 +3116,7 @@ impl ApplicationHandler for App {
                         self.tabs.swap(from, hover);
                         self.active = swap_follow(from, hover, self.active);
                         self.tab_drag = Some(hover);
+                        self.tab_drag_moved = true;
                         window.request_redraw();
                     }
                 }
@@ -3167,16 +3172,14 @@ impl ApplicationHandler for App {
                     if self.cell_at(at.0, at.1).is_some() { self.request_paste(clipboard::Kind::Primary); }
                 } else if button == MouseButton::Left {
                     if self.hover_tab < self.tabs.len() {
+                        // Pressing a tab arms a drag but does *not* activate
+                        // it: switching on press yanks the view -- and its
+                        // scrollback position -- out from under a reorder
+                        // started from a scrolled-up terminal. The release
+                        // decides whether this was a click.
                         self.drag = None;
-                        self.tabs[self.active].clear_selection();
-                        window.request_redraw();
-                        if self.hover_tab != self.active {
-                            self.active = self.hover_tab;
-                            window.request_redraw();
-                        }
-                        // And it may become a drag: crossing into a neighbour
-                        // reorders from here (browser behaviour).
                         self.tab_drag = Some(self.hover_tab);
+                        self.tab_drag_moved = false;
                     } else if self.hover_add {
                         self.drag = None;
                         if let Some(tab) = self.tabs.get_mut(self.active) { tab.clear_selection(); }
@@ -3210,8 +3213,18 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
                 // A tab drag ends wherever the button comes up -- even over
                 // egui, whose panels would otherwise swallow the release and
-                // leave the drag armed.
-                self.tab_drag = None;
+                // leave the drag armed. A release without a reorder was a
+                // click: that is the moment the tab actually activates.
+                if let Some(idx) = self.tab_drag.take() {
+                    if !self.tab_drag_moved && idx < self.tabs.len() && idx != self.active {
+                        if let Some(t) = self.tabs.get_mut(self.active) {
+                            t.clear_selection();
+                        }
+                        self.active = idx;
+                        window.request_redraw();
+                    }
+                    self.tab_drag_moved = false;
+                }
                 if egui_consumed {
                     return;
                 }
