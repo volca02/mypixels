@@ -53,6 +53,11 @@ pub struct ConfigEvents {
 pub struct UiState {
     /// The open font popup, if any (at most one at a time).
     pub font_popup: Option<FontPopup>,
+    /// Theme names for the picker. Fetched lazily and re-fetched after
+    /// save/revert -- dropping a new file into a themes dir is exactly when
+    /// the user expects the list to have noticed.
+    pub theme_choice: Vec<String>,
+    pub theme_fetched: bool,
     /// The tab-rename box, egui's version of the original's GTK entry. The
     /// app mirrors this to decide whether to swallow keys.
     pub rename_open: bool,
@@ -837,6 +842,44 @@ pub fn config_window(
             });
 
             section(ui, "COLORS");
+            // Theme before the individual colors: one pick retunes every box
+            // below at once, and the boxes stay editable afterwards -- a
+            // theme is a starting point, not a straitjacket. The choice
+            // persists as `theme:` so the file still says where colors came
+            // from.
+            if !st.theme_fetched {
+                st.theme_choice = crate::theme::available();
+                st.theme_fetched = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Preset");
+                let written =
+                    if cfg.theme.is_empty() { "default".to_string() } else { cfg.theme.clone() };
+                let mut names = st.theme_choice.clone();
+                // A hand-written theme: custom.yml stays selectable and
+                // visible even though no directory listed it.
+                if !names.iter().any(|n| *n == written) {
+                    names.push(written.clone());
+                }
+                let mut chosen = written.clone();
+                egui::ComboBox::from_id_salt("theme_preset")
+                    .width(150.0)
+                    .selected_text(&written)
+                    .show_ui(ui, |ui| {
+                        for n in &names {
+                            ui.selectable_value(&mut chosen, n.clone(), n);
+                        }
+                    });
+                if chosen != written {
+                    cfg.theme = chosen.clone();
+                    // Live colors now; a broken theme logs and leaves the
+                    // screen alone rather than half-applying.
+                    if let Err(e) = crate::theme::apply_name(cfg, &chosen) {
+                        log::warn!("theme {chosen}: {e}");
+                    }
+                    ev.apply = true;
+                }
+            });
             subsection(ui, "Terminal");
             egui::Grid::new("colors-terminal").show(ui, |ui| {
                 color_row(ui, "Background", &mut cfg.background_color, &mut ev);
@@ -952,9 +995,11 @@ pub fn config_window(
                 // far right, so Save -- the primary action -- takes it.
                 if ui.button("Save").clicked() {
                     ev.save = true;
+                    st.theme_fetched = false;
                 }
                 if ui.button("Revert").clicked() {
                     ev.revert = true;
+                    st.theme_fetched = false;
                 }
             });
         });

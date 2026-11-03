@@ -18,6 +18,8 @@ pub const NAMES: &[&str] = &[
     "dracula",
     "catppuccin-mocha",
     "catppuccin-latte",
+    "gruvbox-dark",
+    "nord",
     "wal",
 ];
 
@@ -54,14 +56,132 @@ pub fn parse_palette(value: &Value) -> Result<[Rgb; 16], String> {
     } else {
         return Err("Theme palette must be a list or colon-separated colors".into());
     };
-    if colors.len() < 16 {
-        return Err("Theme palette needs 16 ANSI colors".into());
+    let given = colors
+        .iter()
+        .enumerate()
+        .map(|(i, c)| color(c, &format!("palette[{i}]")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if given.is_empty() {
+        return Err("Theme palette is empty".into());
     }
-    let mut palette = [Rgb(0, 0, 0); 16];
-    for (i, slot) in palette.iter_mut().enumerate() {
-        *slot = color(&colors[i], &format!("palette[{i}]"))?;
+    Ok(derive_palette(&given))
+}
+
+/// The xterm defaults, by slot: the "question" each ANSI palette slot asks
+/// (dark red, bright cyan, ...) that a foreign color list gets matched against.
+const ANCHORS: [Rgb; 16] = [
+    Rgb(0, 0, 0),
+    Rgb(128, 0, 0),
+    Rgb(0, 128, 0),
+    Rgb(128, 128, 0),
+    Rgb(0, 0, 128),
+    Rgb(128, 0, 128),
+    Rgb(0, 128, 128),
+    Rgb(192, 192, 192),
+    Rgb(128, 128, 128),
+    Rgb(255, 0, 0),
+    Rgb(0, 255, 0),
+    Rgb(255, 255, 0),
+    Rgb(0, 0, 255),
+    Rgb(255, 0, 255),
+    Rgb(0, 255, 255),
+    Rgb(255, 255, 255),
+];
+
+/// Complete a theme's color list into the 16 ANSI slots, so a theme file can
+/// ship the colors it actually cares about instead of enumerating fourteen it
+/// barely uses.
+///
+///  * 16 or more: taken verbatim, in order -- the canonical case.
+///  * exactly 8 (the classic scheme): the darks stand, brights are derived by
+///    lifting lightness in CIE Lab and keeping hue and chroma -- which is what
+///    "the bright variant" perceptually means, and what hand-authored themes
+///    do anyway.
+///  * any other length: every slot takes the nearest given color, distance
+///    measured in Lab so it is gamut *and* brightness, not raw channel delta.
+pub fn derive_palette(given: &[Rgb]) -> [Rgb; 16] {
+    if given.len() >= 16 {
+        return given[..16].try_into().unwrap();
     }
-    Ok(palette)
+    if given.len() == 8 {
+        let mut out = [Rgb(0, 0, 0); 16];
+        out[..8].copy_from_slice(given);
+        for i in 0..8 {
+            out[8 + i] = brighten(given[i]);
+        }
+        return out;
+    }
+    let mut out = [Rgb(0, 0, 0); 16];
+    for (slot, anchor) in out.iter_mut().zip(ANCHORS) {
+        *slot = given
+            .iter()
+            .min_by(|a, b| lab_dist(**a, anchor).total_cmp(&lab_dist(**b, anchor)))
+            .copied()
+            .unwrap();
+    }
+    out
+}
+
+/// A bright variant of a normal ANSI color: +26 lightness, capped below pure
+/// white so `bright white` stays distinguishable from a white background.
+/// Colors that are already bright stand.
+fn brighten(c: Rgb) -> Rgb {
+    let mut l = lab(c);
+    if l[0] >= 85.0 {
+        return c;
+    }
+    l[0] = (l[0] + 26.0).min(90.0);
+    from_lab(l)
+}
+
+// sRGB <-> CIE Lab (D65). Cheap, and far closer to "looks like" than any
+// RGB-space distance: hue and lightness are separate coordinates here, so a
+// dark red and its bright sibling end up adjacent, as they should.
+fn lab(c: Rgb) -> [f32; 3] {
+    let lin = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    let (r, g, b) = (lin(c.0), lin(c.1), lin(c.2));
+    let enc = |t: f32| {
+        if t > 0.008_856 {
+            t.cbrt()
+        } else {
+            7.787 * t + 16.0 / 116.0
+        }
+    };
+    let fx = enc((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.950_470);
+    let fy = enc(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    let fz = enc((0.019_300 * r + 0.119_2 * g + 0.950_5 * b) / 1.088_830);
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn from_lab(l: [f32; 3]) -> Rgb {
+    let fy = (l[0] + 16.0) / 116.0;
+    let fx = fy + l[1] / 500.0;
+    let fz = fy - l[2] / 200.0;
+    let dec = |t: f32| {
+        let t3 = t * t * t;
+        if t3 > 0.008_856 { t3 } else { (t - 16.0 / 116.0) / 7.787 }
+    };
+    let x = dec(fx) * 0.950_470;
+    let y = if l[0] > 8.0 { fy * fy * fy } else { l[0] / 903.3 };
+    let z = dec(fz) * 1.088_830;
+    let gam = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        let v = if v <= 0.003_130_8 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        (v * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    Rgb(
+        gam(3.2406 * x - 1.5372 * y - 0.4986 * z),
+        gam(-0.9689 * x + 1.8758 * y + 0.0415 * z),
+        gam(0.055_70 * x - 0.2040 * y + 1.0570 * z),
+    )
+}
+
+fn lab_dist(a: Rgb, b: Rgb) -> f32 {
+    let (p, q) = (lab(a), lab(b));
+    (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)
 }
 
 pub struct Theme {
@@ -186,6 +306,8 @@ fn builtin(name: &str) -> Option<&'static str> {
         "dracula" => Some(include_str!("../themes/dracula.yml")),
         "catppuccin-mocha" | "mocha" => Some(include_str!("../themes/catppuccin-mocha.yml")),
         "catppuccin-latte" | "latte" => Some(include_str!("../themes/catppuccin-latte.yml")),
+        "gruvbox-dark" | "gruvbox" => Some(include_str!("../themes/gruvbox-dark.yml")),
+        "nord" => Some(include_str!("../themes/nord.yml")),
         _ => None,
     }
 }
@@ -211,6 +333,95 @@ pub fn load_file(path: &Path) -> Result<Theme, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read theme {}: {e}", path.display()))?;
     Theme::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Every directory a named theme may live in, in precedence order: the user's
+/// XDG config dir, their data dir, then the system-installed ones
+/// ($XDG_DATA_DIRS, default /usr/local/share:/usr/share). Packagers drop theme
+/// files into <datadir>/mypixels/themes/ and they appear in the picker.
+pub fn theme_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(d) = dirs::config_dir() {
+        dirs.push(d.join("mypixels/themes"));
+    }
+    if let Some(d) = dirs::data_dir() {
+        dirs.push(d.join("mypixels/themes"));
+    }
+    let xdg = std::env::var_os("XDG_DATA_DIRS");
+    match xdg.as_deref() {
+        Some(list) => {
+            for d in std::env::split_paths(list) {
+                if !d.as_os_str().is_empty() {
+                    dirs.push(d.join("mypixels/themes"));
+                }
+            }
+        }
+        None => {
+            dirs.push(PathBuf::from("/usr/local/share/mypixels/themes"));
+            dirs.push(PathBuf::from("/usr/share/mypixels/themes"));
+        }
+    }
+    dirs
+}
+
+fn theme_file(name: &str) -> Option<PathBuf> {
+    theme_dirs()
+        .into_iter()
+        .flat_map(|d| [d.join(format!("{name}.yml")), d.join(format!("{name}.yaml"))])
+        .find(|p| p.is_file())
+}
+
+/// The theme names to offer a picker: the built-ins first, then anything found
+/// in the theme directories that is not a built-in under another spelling.
+pub fn available() -> Vec<String> {
+    let mut names: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
+    let mut found: Vec<String> = theme_dirs()
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
+        .filter_map(|e| {
+            let p = e.path();
+            let stem = p.file_stem()?.to_str()?.to_string();
+            matches!(p.extension().and_then(|x| x.to_str()), Some("yml") | Some("yaml")).then_some(stem)
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    let builtins = names.clone();
+    names.extend(found.into_iter().filter(|n| !builtins.iter().any(|b| b == n)));
+    names
+}
+
+/// Apply a named theme to a live config -- the settings UI's picker route,
+/// which must not round-trip through a file reload. Records what it watched in
+/// theme_files, exactly as `configure` does at load.
+pub fn apply_name(cfg: &mut Config, name: &str) -> Result<(), String> {
+    let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "" | "default" => {
+            cfg.theme_files.clear();
+            Ok(())
+        }
+        "wal" => {
+            let path = expand_path("~/.cache/wal/colors.yml", Path::new("."));
+            let theme = load_file(&path)?;
+            cfg.theme_files = vec![path];
+            theme.apply(cfg);
+            Ok(())
+        }
+        _ => {
+            if let Some(text) = builtin(&normalized) {
+                cfg.theme_files.clear();
+                Theme::parse(text)?.apply(cfg);
+                return Ok(());
+            }
+            let path =
+                theme_file(&normalized).ok_or_else(|| format!("Unknown theme {name:?}"))?;
+            let theme = load_file(&path)?;
+            cfg.theme_files = vec![path];
+            theme.apply(cfg);
+            Ok(())
+        }
+    }
 }
 
 /// Preset -> explicit config overrides -> pywal. The implicit pywal file keeps
@@ -240,16 +451,13 @@ pub fn configure(cfg: &mut Config, value: &Value, base: &Path) -> Result<(), Str
                 Theme::parse(text)?.apply(cfg);
             } else {
                 let direct = expand_path(name, base);
-                let paths = if name.contains('/') || Path::new(name).extension().is_some() {
+                let paths: Vec<PathBuf> = if name.contains('/') || Path::new(name).extension().is_some() {
                     vec![direct]
                 } else {
-                    let dir = dirs::config_dir()
-                        .unwrap_or_else(|| base.join(".config"))
-                        .join("mypixels/themes");
-                    vec![
-                        dir.join(format!("{name}.yml")),
-                        dir.join(format!("{name}.yaml")),
-                    ]
+                    theme_dirs()
+                        .into_iter()
+                        .flat_map(|d| [d.join(format!("{normalized}.yml")), d.join(format!("{normalized}.yaml"))])
+                        .collect()
                 };
                 let path = paths.iter().find(|p| p.is_file()).ok_or_else(|| {
                     format!(
@@ -387,7 +595,40 @@ mod tests {
         assert!(
             Theme::parse("foreground_color: '#fff'\nbackground_color: nope\npalette: []").is_err()
         );
-        assert!(parse_palette(&serde_yaml::from_str("['#fff', '#000']").unwrap()).is_err());
+        assert!(parse_palette(&serde_yaml::from_str("[]").unwrap()).is_err());
+    }
+
+    #[test]
+    fn short_color_lists_complete_themselves() {
+        // A full list is taken verbatim -- no derivation, no surprises.
+        let full: Vec<Rgb> = (0..20).map(|i| Rgb(i as u8, 0, 0)).collect();
+        assert_eq!(&derive_palette(&full)[..3], &[Rgb(0, 0, 0), Rgb(1, 0, 0), Rgb(2, 0, 0)]);
+        // Eight classic colors: darks stand, brights are the same colors
+        // lighter -- same family, more lightness.
+        let base: Vec<Rgb> = [
+            "#282828", "#cc241d", "#98971a", "#d79921", "#458588", "#b16286", "#689d6a",
+            "#a89984",
+        ]
+        .iter()
+        .map(|s| Rgb::parse(s).unwrap())
+        .collect();
+        let p = derive_palette(&base);
+        assert_eq!(&p[..8], &base[..]);
+        for i in 0..8 {
+            assert!(
+                lab(p[8 + i])[0] > lab(base[i])[0] + 15.0,
+                "slot {i}: bright must read clearly lighter"
+            );
+        }
+        // An arbitrary short list matches by nearest gamut/brightness: the
+        // reds land on the red slots, black on black, white on the whites.
+        let trio = [Rgb(0, 0, 0), Rgb(220, 30, 30), Rgb(250, 250, 250)];
+        let q = derive_palette(&trio);
+        assert_eq!(q[0], Rgb(0, 0, 0));
+        assert_eq!(q[1], Rgb(220, 30, 30));
+        assert_eq!(q[9], Rgb(220, 30, 30));
+        assert_eq!(q[15], Rgb(250, 250, 250));
+        assert_eq!(q[7], Rgb(250, 250, 250));
     }
 
     #[test]

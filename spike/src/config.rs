@@ -79,6 +79,9 @@ pub struct Config {
     pub selection_color: Rgb,
     pub cursor_color: Rgb,
     pub accent_color: Rgb,
+    /// The selected theme (preset name, `wal`, or a YAML path); empty means
+    /// none. Kept as written so the picker and the file agree after a save.
+    pub theme: String,
     /// External color sources monitored by the theme worker, never by draw().
     pub theme_files: Vec<std::path::PathBuf>,
     /// 16-color palette (None = alacritty defaults). Terminal runtime OSC 4
@@ -179,6 +182,7 @@ impl Default for Config {
             selection_color: parse_hex("#3584e4"),
             cursor_color: Rgb(140, 140, 153),
             accent_color: Rgb(92, 191, 191),
+            theme: String::new(),
             theme_files: Vec::new(),
             palette: None,
             term_font: "Terminus 8".to_string(),
@@ -228,10 +232,36 @@ impl Config {
     }
 
     /// The file the configuration is read from (and written to on save):
-    /// $SPIKE_CONFIG, else ~/.mypixels.
+    /// $SPIKE_CONFIG, else $XDG_CONFIG_HOME/mypixels/config.yml
+    /// (~/.config/mypixels/config.yml by default). A legacy ~/.mypixels that
+    /// predates the move keeps working while the XDG file does not exist --
+    /// nobody's configuration gets orphaned by the relocation, and saving
+    /// writes back to the very file that was loaded.
     pub fn config_path() -> Option<std::path::PathBuf> {
-        std::env::var_os("SPIKE_CONFIG").map(std::path::PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|p| p.join(".mypixels")))
+        Self::config_path_in(
+            std::env::var_os("SPIKE_CONFIG").map(std::path::PathBuf::from).as_deref(),
+            dirs::config_dir().as_deref(),
+            dirs::home_dir().as_deref(),
+        )
+    }
+
+    fn config_path_in(
+        spike: Option<&std::path::Path>,
+        xdg: Option<&std::path::Path>,
+        home: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        if let Some(p) = spike {
+            return Some(p.to_path_buf());
+        }
+        let modern = xdg?.join("mypixels").join("config.yml");
+        if modern.is_file() {
+            return Some(modern);
+        }
+        let legacy = home?.join(".mypixels");
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+        Some(modern)
     }
 
     pub fn try_load() -> Result<Config, String> {
@@ -267,6 +297,10 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        // First save into a fresh XDG location has to create it.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let text = std::fs::read_to_string(path).unwrap_or_default();
         let out = replace_top_level_values(&text, &Self::ui_keys(self));
         std::fs::write(path, out).map_err(|e| format!("Cannot write {}: {e}", path.display()))
@@ -312,6 +346,9 @@ impl Config {
         ];
         for (i, c) in self.col.iter().enumerate() {
             keys.push((format!("col_{i}"), rgb(c)));
+        }
+        if !self.theme.is_empty() {
+            keys.push(("theme".into(), str_(&self.theme)));
         }
         keys
     }
@@ -427,6 +464,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                             Ok(palette) => cfg.palette = Some(palette),
                             Err(e) => log::warn!("{e}"),
                         }
+                    }
+                },
+                "theme" => {
+                    if let Some(s) = val.as_str() {
+                        cfg.theme = s.to_string();
                     }
                 },
                 "term_font" => {
@@ -790,7 +832,52 @@ mod tests {
         assert_eq!(p[2], Rgb(174, 238, 0));
         assert_eq!(p[15], Rgb(255, 255, 255));
         assert_eq!(parse_palette(""), None);
-        assert_eq!(parse_palette("#000:#111"), None); // too few
+        // Too few is no longer an error -- short lists are completed, not
+        // rejected: slots take the nearest given color in Lab space.
+        let two = parse_palette("#000:#f00").expect("derived from two");
+        assert_eq!(two[0], Rgb(0, 0, 0));
+        assert_eq!(two[9], Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn config_path_prefers_xdg_then_legacy() {
+        let root = std::env::temp_dir().join(format!("mypixels-path-{}", std::process::id()));
+        let xdg = root.join("config");
+        let home = root.join("home");
+        std::fs::create_dir_all(xdg.join("mypixels")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let modern = xdg.join("mypixels").join("config.yml");
+        // Neither file exists yet: the modern path wins -- that is where a
+        // first save belongs, legacy or not.
+        assert_eq!(Config::config_path_in(None, Some(&xdg), Some(&home)).unwrap(), modern);
+        // Only the legacy file exists: it is respected, not silently skipped.
+        std::fs::write(home.join(".mypixels"), "").unwrap();
+        assert_eq!(Config::config_path_in(None, Some(&xdg), Some(&home)).unwrap(),
+            home.join(".mypixels"));
+        // Once the XDG file exists it wins: the move happens on save, not on
+        // read, and never duplicates state.
+        std::fs::write(&modern, "").unwrap();
+        assert_eq!(Config::config_path_in(None, Some(&xdg), Some(&home)).unwrap(), modern);
+        // The test override still outranks everything.
+        assert_eq!(
+            Config::config_path_in(Some(&root.join("env")), Some(&xdg), Some(&home)).unwrap(),
+            root.join("env")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn theme_name_round_trips_through_save() {
+        let cfg = Config::from_text("theme: 'gruvbox-dark'\n", std::path::Path::new(".")).unwrap();
+        assert_eq!(cfg.theme, "gruvbox-dark");
+        let keys = cfg.ui_keys();
+        assert!(keys.iter().any(|(k, v)| k == "theme" && v == "'gruvbox-dark'"));
+        // Colors the theme set are saved alongside it: the file stays
+        // readable by tools that do not know themes at all.
+        assert!(keys.iter().any(|(k, _)| k == "background_color"));
+        // No theme: no empty `theme: ''` noise appended to the file.
+        let cfg = Config::default();
+        assert!(!cfg.ui_keys().iter().any(|(k, _)| k == "theme"));
     }
 
     #[test]
