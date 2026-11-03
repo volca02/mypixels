@@ -17,5 +17,15 @@ fn main() {
         .unwrap_or_default();
     let stamp = format!("{} built {}", if out.is_empty() { "unknown".to_string() } else { out }, now);
     println!("cargo:rustc-env=MYPIXELS_BUILD={stamp}");
+    // Re-run on ANY source change, or the stamp freezes at the last build
+    // that touched build.rs and every later binary claims that old time -
+    // an odometer that stops is worse than no odometer (observed within
+    // the hour of the stamp's introduction, naturally).
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    for entry in std::fs::read_dir("src").expect("src") {
+        if let Ok(e) = entry {
+            println!("cargo:rerun-if-changed={}", e.path().display());
+        }
+    }
 }

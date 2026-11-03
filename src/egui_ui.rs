@@ -623,15 +623,21 @@ pub fn release_focus_if_closed(
 /// uglier app sharing the window. Everything derived (weak text, panel mix,
 /// borders) is a mix between the configured background and foreground, so
 /// light *and* dark palettes both get a coherent UI.
-pub fn ui_theme(cfg: &crate::config::Config) -> egui::Visuals {
+pub fn ui_theme(
+    cfg: &crate::config::Config,
+    bg: [f32; 3],
+    fg: [f32; 3],
+) -> egui::Visuals {
     let mix = |a: [f32; 3], b: [f32; 3], t: f32| -> egui::Color32 {
         let c = |i: usize| {
             ((a[i] * (1.0 - t) + b[i] * t) * 255.0).round().clamp(0.0, 255.0) as u8
         };
         egui::Color32::from_rgb(c(0), c(1), c(2))
     };
-    let bg = cfg.background_color.to_f32();
-    let fg = cfg.foreground_color.to_f32();
+    // bg/fg are the terminal's *effective* colours (theme, palette and
+    // overrides all resolved upstream) - exactly what the screen paints
+    // with. cfg.background_color alone would ignore a themed session and
+    // render the UI in default-dark while the terminal wore gruvbox.
     let accent = cfg.accent_color.to_f32();
     let tablist = cfg.tablist_background.to_f32();
     let black = [0.0f32; 3];
@@ -681,8 +687,7 @@ pub fn ui_theme(cfg: &crate::config::Config) -> egui::Visuals {
 /// not flat black. Over a light theme a black dim reads as smoke; over a
 /// dark one the difference is subtle - either way the overlay now belongs
 /// to the palette the user chose.
-pub fn dim_fill(cfg: &crate::config::Config, alpha: u8) -> egui::Color32 {
-    let bg = cfg.background_color.to_f32();
+pub fn dim_fill(cfg: &crate::config::Config, bg: [f32; 3], alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
         (bg[0] * 0.30 * 255.0) as u8,
         (bg[1] * 0.30 * 255.0) as u8,
@@ -1203,20 +1208,35 @@ pub fn config_window(
             });
             }); // ScrollArea contents
 
-            // Pinned at the panel bottom, outside the scroll area.
+            // Pinned at the panel bottom, outside the scroll area: two
+            // confident half-width actions filling the panel's base, not
+            // two tiny buttons marooned at the right margin. Revert left,
+            // Save right (the primary keeps the thumb's corner), and Save
+            // is set in strong text so the pair reads as [secondary |
+            // PRIMARY] rather than an apology.
             ui.separator();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Right-to-left layout: whichever is added first lands at the
-                // far right, so Save -- the primary action -- takes it.
-                if ui.button("Save").clicked() {
-                    ev.save = true;
-                    st.theme_fetched = false;
-                }
-                if ui.button("Revert").clicked() {
-                    ev.revert = true;
-                    st.theme_fetched = false;
-                }
-            });
+            ui.add_space(2.0);
+            let gap = ui.style().spacing.item_spacing.x;
+            let half = (ui.available_width() - gap) / 2.0;
+            let row_h = 34.0;
+            let strong = ui.style().visuals.strong_text_color();
+            let revert = ui.add_sized(
+                [half, row_h],
+                egui::Button::new(egui::RichText::new("Revert").strong()),
+            );
+            ui.add_space(gap);
+            let save = ui.add_sized(
+                [half, row_h],
+                egui::Button::new(egui::RichText::new("Save").strong().color(strong)),
+            );
+            if save.clicked() {
+                ev.save = true;
+                st.theme_fetched = false;
+            }
+            if revert.clicked() {
+                ev.revert = true;
+                st.theme_fetched = false;
+            }
         });
     if !*open {
         // Closed by the × button this frame: drop any open popup with the

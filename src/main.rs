@@ -1452,6 +1452,14 @@ impl App {
             crate::config::terminal_bg(&self.config),
             self.config.col,
         );
+        // The UI wears the terminal's EFFECTIVE colours (theme, palette and
+        // overrides resolved upstream - not the raw config fields, which a
+        // themed session bypasses entirely). Applied every frame: live
+        // theme changes edit the palette under a running UI, and egui
+        // reads visuals at layout time, not paint time.
+        if let Some(e) = self.wins[self.cur].egui.as_ref() {
+            e.ctx.set_visuals(egui_ui::ui_theme(&self.config, self.bg, self.fg));
+        }
         let mut full_output: Option<egui::FullOutput> = None;
         // The switcher draws through egui; its state machine stays in the
         // app (Alt-hold open, navigation, Alt release dismiss). The older
@@ -1495,7 +1503,11 @@ impl App {
             (acc[1] * 255.0) as u8,
             (acc[2] * 255.0) as u8,
         );
-        let sw_dim = egui_ui::dim_fill(&self.config, (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8);
+        let sw_dim = egui_ui::dim_fill(
+            &self.config,
+            self.bg,
+            (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8,
+        );
         {
             let mut egui = self.wins[self.cur].egui.take();
             if let Some(egui) = egui.as_mut() {
@@ -2814,8 +2826,10 @@ impl App {
                 self.reload_config();
             },
             "show_config" => {
+                // Toggle: the chord that summoned the panel is the natural
+                // way to dismiss it (same as every transient overlay here).
                 if let Some(e) = self.wins[self.cur].egui.as_mut() {
-                    e.config_open = true;
+                    e.config_open = !e.config_open;
                 }
                 if let Some(w) = &self.wins[self.cur].window {
                     w.request_redraw();
