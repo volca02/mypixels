@@ -51,6 +51,35 @@ hide and placement, opacity, palette + pywal + themes + live reload, the full
 selection model, async clipboard, scrollback, cursor blink, the Alt-held
 switcher with live real-frame previews, and HiDPI.
 
+## Command-output observability (requested, not yet built)
+
+The OSC 133 blocks (prompt line + exit status) are the seed; these turn
+them into a queryable session memory for shell users **and** for LLM
+tooling:
+
+1. **Scrollback is too small and fixed.** The library default (1000) was
+   silently in use; make `history` a config key, default ~20 000, and
+   measure the cell cost at 4K widths before promising more.
+2. **Command output spooled to files** - "hold those as long as seems
+   reasonable". When a block closes (D mark), snapshot its output text to
+   `$XDG_DATA_HOME/mypixels/history/<tab>/<prompt-line>_exit<N>.txt` while
+   it is still fully in scrollback; prune oldest (bounded per-tab and
+   globally). Files are the observability substrate today; the in-app
+   query core reads the same store.
+3. **`mypixels last [n] [--copy]`** over the session bus: `last | grep
+   error`, `last 2 --copy`. One extraction core serves this, the
+   `copy_last_output` action, and MCP - transports stay thin.
+4. **Images to clipboard**: when the last command displayed a Kitty
+   graphic, `--copy` (and a menu/keys action) puts the **image bytes** on
+   the clipboard losslessly - the upload payload is kept per image id, so
+   no screenshot round trip. Depends on the graphics store (M4 of
+   docs/graphics_osc133_implementation.md), not on the renderer.
+5. **MCP server endpoint over a unix pipe** for LLM observability:
+   windows, tabs, commands, and command outputs (files from #2 plus live
+   state). JSON-RPC thread mapping onto the same query core via the
+   existing main-thread channel pattern; per-display socket naming like
+   the D-Bus bus; read-only first.
+
 Known warts: a moved shell keeps its spawn-time `$MYPIXELS_WINDOW`, so
 `mypixels` typed in a window that RECEIVED a moved tab opens new tabs in the
 tab's old window (running environments cannot change; noted in `move_tab`).
