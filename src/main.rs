@@ -4074,6 +4074,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
+                if key.state == ElementState::Pressed {
+                    log::info!(
+                        "keydown logical={:?} text={:?} tracked={:?} consumed={}",
+                        key.logical_key, key.text, self.modifiers, egui_consumed
+                    );
+                }
                 if key.state == ElementState::Pressed && !egui_consumed {
                     let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
                     let repeatable = action.as_deref().is_none_or(|action| matches!(action,
@@ -4134,6 +4140,7 @@ impl ApplicationHandler for App {
             },
             WindowEvent::ModifiersChanged(m) => {
                 let new = m.state();
+                log::info!("mods changed -> {new:?}");
                 let alt_up = new.alt_key() && !self.modifiers.alt_key();
                 let alt_down = !new.alt_key() && self.modifiers.alt_key();
                 self.modifiers = new;
@@ -4298,8 +4305,51 @@ fn alpha_probe(event_loop: &EventLoop<()>) {
     log::info!("probe: done");
 }
 
+/// Which commit this exact process was built from. Printed at startup and
+/// by --version, because a single-instance session can outlive its own
+/// binary and then argue about what it contains.
+pub const BUILD: &str = env!("MYPIXELS_BUILD");
+
+/// The stamp as a local clock string: build.rs carries epoch seconds
+/// (constant-expression land has no formatter), we render it here.
+pub fn build_stamp() -> String {
+    let raw = BUILD;
+    match raw.rsplit_once("built ") {
+        Some((git, secs)) => {
+            let secs: u64 = secs.parse().unwrap_or_default();
+            let (h, m) = {
+                let mut t = secs % 86400;
+                if t < 0 { t += 86400; }
+                (t / 3600 % 24, t / 60 % 60)
+            };
+            let d = secs / 86400;
+            let (y, mo, da) = {
+                let z = d + 719468;
+                let era = z / 146097;
+                let doe = z % 146097;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                let yy = yoe + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let day = doy - (153 * mp + 2) / 5 + 1;
+                let mon = if mp < 10 { mp + 3 } else { mp - 9 };
+                let year = if mon <= 2 { yy + 1 } else { yy };
+                (year, mon, day)
+            };
+            format!("{git}, {y:04}-{mo:02}-{da:02} {h:02}:{m:02} UTC")
+        }
+        None => raw.to_string(),
+    }
+}
+
 fn main() {
+    if std::env::args().nth(1).is_some_and(|a| a == "--version" || a == "-V") {
+        println!("mypixels, build {}", build_stamp());
+        return;
+    }
+
     env_logger::init();
+    log::info!("mypixels build {}", build_stamp());
     let flags = leading_flags();
     if flags.iter().any(|a| a == "--help" || a == "-h") {
         println!(

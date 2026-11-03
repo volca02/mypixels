@@ -788,6 +788,25 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_config_chords_probe() {
+        let cfg = Config::load();
+        use winit::keyboard::NamedKey;
+        for (label, key, mods) in [
+            ("ctrl+w", Key::Character("w".into()), M::CONTROL),
+            ("ctrl+left", Key::Named(NamedKey::ArrowLeft), M::CONTROL),
+            ("ctrl+right", Key::Named(NamedKey::ArrowRight), M::CONTROL),
+            ("ctrl+backspace", Key::Named(NamedKey::Backspace), M::CONTROL),
+        ] {
+            let hit = find_action(&cfg.bindings, &key, mods, false);
+            println!("{label} -> {hit:?}");
+        }
+        for (action, list) in &cfg.bindings {
+            for b in list {
+                println!("BIND {action} = {:?} {:?}", b.key, b.mods);
+            }
+        }
+    }
     use super::*;
     use winit::keyboard::ModifiersState as M;
 
