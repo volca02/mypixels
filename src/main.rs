@@ -2498,6 +2498,14 @@ impl App {
             }
             return;
         }
+        // 0.5. A transient egui picker (context menu, window picker) owns
+        //      the keyboard the same way the rename box does: Escape closes
+        //      it (through egui's own dismissal), and no key may also reach
+        //      the shell underneath - the shell must not act on the very
+        //      keystroke that dismisses a menu.
+        if self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open) {
+            return;
+        }
         // 1. The switcher claims only its own keys (arrows, Home/End, digits
         //    and Esc with plain Alt); anything else falls through to the
         //    normal handler, so configured bindings and the terminal keep
@@ -2520,7 +2528,11 @@ impl App {
             return;
         }
         // 3. Everything else goes to the active terminal
-        if let Some(bytes) = key_bytes(key, self.modifiers) {
+        let app_cursor = self.wins[self.cur]
+            .tabs
+            .get(self.wins[self.cur].active)
+            .is_some_and(|t| t.term.lock().mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR));
+        if let Some(bytes) = key_bytes(key, self.modifiers, app_cursor) {
             // Typing counts as activity: keep the cursor solid (no blink)
             // right after a keypress.
             *self.last_activity.lock().unwrap() = std::time::Instant::now();
@@ -2544,6 +2556,21 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Whether an egui surface is open that the user could plausibly be
+    /// typing into right now. Keys belong to egui only under that
+    /// condition; anything else belongs to the terminal or the bindings.
+    fn egui_owns_keyboard(&self) -> bool {
+        let Some(e) = self.wins[self.cur].egui.as_ref() else {
+            return false;
+        };
+        let st = &e.ui_state;
+        e.config_open
+            || st.rename_open
+            || st.font_popup.as_ref().is_some_and(|p| p.open)
+            || st.menu_open
+            || st.move_open
     }
 
     /// Close the rename box without committing (app-side Escape).
@@ -3469,91 +3496,177 @@ fn parse_key_spec(spec: &str) -> Option<(ModifiersState, Key)> {
     Some((mods, key))
 }
 
-fn key_bytes(k: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
+/// The terminal's answer to a key press, in the encoding legacy programs
+/// expect (xterm's modified-keys conventions, DECCKM included):
+///   * Ctrl+letter is the control byte; Alt prefixes ESC; both combine.
+///   * Arrows/Home/End/PgUp/PgDn/Ins/Del/F-keys carry their modifiers as
+///     `ESC [ 1 ; m X` (m = 1 + shift + 2*alt + 4*ctrl), which is what
+///     vim, emacs, readline and friends parse. Dropping the modifier (the
+///     old behaviour) made Ctrl+Right a plain Right and Alt+Enter a plain
+///     Enter - the shell could not tell the chord had ever happened.
+///   * DECCKM (application cursor keys, set by vim/tmux with `ESC [ ? 1 h`)
+///     swaps the unmodified arrows/Home/End to the `ESC O X` forms.
+/// A `None` here means genuinely nothing to send (unknown keys), not "app
+/// shortcut" - those were matched by `find_action` upstream.
+fn key_bytes(k: &Key, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = mods.control_key();
     let alt = mods.alt_key();
-    let esc_seq = |body: &[u8]| -> Vec<u8> {
+    let shift = mods.shift_key();
+    let esc = |body: &[u8]| -> Vec<u8> {
         let mut v = vec![0x1b];
         v.extend_from_slice(body);
         v
     };
+    // xterm's modifier parameter: present only when something is actually
+    // held - `ESC [ 1 ; 5 C` is Ctrl+Right, `ESC [ C` is plain Right, and
+    // the difference is the only way the program can tell them apart.
+    let mcode = 1 + shift as u8 + (alt as u8) * 2 + (ctrl as u8) * 4;
+    // `ESC [ <n>;<m>~` for the numbered function keys.
+    let csn = |n: u8| -> Vec<u8> {
+        if mcode > 1 {
+            esc(format!("[{n};{mcode}~").as_bytes())
+        } else {
+            esc(format!("[{n}~").as_bytes())
+        }
+    };
+    // `ESC [ 1;<m> <fin>` for the lettered ones (arrows, Home/End, F1-F4).
+    let csi1 = |fin: u8| -> Vec<u8> {
+        if mcode > 1 {
+            esc(format!("[1;{mcode}{fin}").as_bytes())
+        } else {
+            vec![0x1b, b'[', fin]
+        }
+    };
     match k {
         Key::Character(c) => {
             if ctrl {
-                Some(match c.as_str() {
-                    " " => vec![0x00],
-                    "a" | "A" => vec![0x01],
-                    "b" | "B" => vec![0x02],
-                    "c" | "C" => vec![0x03],
-                    "d" | "D" => vec![0x04],
-                    "e" | "E" => vec![0x05],
-                    "f" | "F" => vec![0x06],
-                    "g" | "G" => vec![0x07],
-                    "h" | "H" => vec![0x08],
-                    "i" | "I" => vec![0x09],
-                    "j" | "J" => vec![0x0a],
-                    "k" | "K" => vec![0x0b],
-                    "l" | "L" => vec![0x0c],
-                    "m" | "M" => vec![0x0d],
-                    "n" | "N" => vec![0x0e],
-                    "o" | "O" => vec![0x0f],
-                    "p" | "P" => vec![0x10],
-                    "q" | "Q" => vec![0x11],
-                    "r" | "R" => vec![0x12],
-                    "s" | "S" => vec![0x13],
-                    "t" | "T" => vec![0x14],
-                    "u" | "U" => vec![0x15],
-                    "v" | "V" => vec![0x16],
-                    "w" | "W" => vec![0x17],
-                    "x" | "X" => vec![0x18],
-                    "y" | "Y" => vec![0x19],
-                    "z" | "Z" => vec![0x1a],
-                    "[" => vec![0x1b],
-                    "\\" => vec![0x1c],
-                    "]" => vec![0x1d],
-                    "^" => vec![0x1e],
-                    "_" => vec![0x1f],
-                    _ => return None,
-                })
+                let byte = match c.to_ascii_lowercase().as_str() {
+                    " " | "@" | "2" => Some(0x00u8),
+                    "3" => Some(0x1b),
+                    "6" => Some(0x1e),
+                    "7" => Some(0x1f),
+                    "8" => Some(0x7f),
+                    "[" => Some(0x1b),
+                    "\\" | "/" | "." | "," => Some(0x1c),
+                    "]" => Some(0x1d),
+                    "-" | "_" => Some(0x1f),
+                    s if s.len() == 1 && s.as_bytes()[0].is_ascii_alphabetic() => {
+                        Some(s.as_bytes()[0] & 0x1f)
+                    }
+                    // A control chord with no legacy control meaning: send
+                    // the character plain rather than swallow the keypress.
+                    // A dropped key is worse than a dropped modifier.
+                    s if s.len() == 1 => Some(s.as_bytes()[0]),
+                    s => {
+                        return if s.is_empty() {
+                            None
+                        } else {
+                            Some(if alt { esc(s.as_bytes()) } else { s.as_bytes().to_vec() })
+                        }
+                    }
+                };
+                let b = byte.unwrap();
+                Some(if alt { vec![0x1b, b] } else { vec![b] })
             } else if alt {
-                let mut v = vec![0x1b];
-                v.extend_from_slice(c.as_bytes());
-                Some(v)
+                Some(esc(c.as_bytes()))
             } else {
                 Some(c.as_bytes().to_vec())
             }
-        },
+        }
         Key::Named(n) => Some(match n {
-            NamedKey::Space => vec![0x20],
-            NamedKey::Enter => vec![0x0d],
-            NamedKey::Backspace => vec![0x7f],
-            NamedKey::Tab => vec![0x09],
-            NamedKey::Escape => vec![0x1b],
-            NamedKey::ArrowUp => esc_seq(b"[A"),
-            NamedKey::ArrowDown => esc_seq(b"[B"),
-            NamedKey::ArrowRight => esc_seq(b"[C"),
-            NamedKey::ArrowLeft => esc_seq(b"[D"),
-            NamedKey::Home => esc_seq(b"[H"),
-            NamedKey::End => esc_seq(b"[F"),
-            NamedKey::PageUp => esc_seq(b"[5~"),
-            NamedKey::PageDown => esc_seq(b"[6~"),
-            NamedKey::Delete => esc_seq(b"[3~"),
-            NamedKey::Insert => esc_seq(b"[2~"),
-            NamedKey::F1 => esc_seq(b"[OP"),
-            NamedKey::F2 => esc_seq(b"[OQ"),
-            NamedKey::F3 => esc_seq(b"[OR"),
-            NamedKey::F4 => esc_seq(b"[OS"),
-            NamedKey::F5 => esc_seq(b"[15~"),
-            NamedKey::F6 => esc_seq(b"[17~"),
-            NamedKey::F7 => esc_seq(b"[18~"),
-            NamedKey::F8 => esc_seq(b"[19~"),
-            NamedKey::F9 => esc_seq(b"[20~"),
-            NamedKey::F10 => esc_seq(b"[21~"),
-            NamedKey::F11 => esc_seq(b"[23~"),
-            NamedKey::F12 => esc_seq(b"[24~"),
+            // Space arrives here, not as Character(" "), whenever Ctrl or
+            // Alt was involved - winit reports the chord as a named key,
+            // and an old table that only knew plain space here silently
+            // turned Ctrl+Space (the classic emacs set-mark) into a space.
+            NamedKey::Space => {
+                if ctrl {
+                    vec![0x00]
+                } else if alt {
+                    vec![0x1b, 0x20]
+                } else {
+                    vec![0x20]
+                }
+            }
+            NamedKey::Enter => {
+                if alt {
+                    vec![0x1b, 0x0d]
+                } else {
+                    vec![0x0d]
+                }
+            }
+            // Ctrl+Backspace is C-h (xterm and VTE both send BS there);
+            // Alt gets the meta prefix, and meta+C-h is readline's
+            // backward-kill-word. Word-rubout proper remains Ctrl+W.
+            NamedKey::Backspace => match (ctrl, alt) {
+                (true, true) => vec![0x1b, 0x08],
+                (true, false) => vec![0x08],
+                (false, true) => vec![0x1b, 0x7f],
+                (false, false) => vec![0x7f],
+            },
+            NamedKey::Tab => {
+                if shift {
+                    vec![0x1b, b'[', b'Z']
+                } else if alt {
+                    vec![0x1b, 0x09]
+                } else {
+                    vec![0x09]
+                }
+            }
+            NamedKey::Escape => {
+                if alt {
+                    vec![0x1b, 0x1b]
+                } else {
+                    vec![0x1b]
+                }
+            }
+            NamedKey::ArrowUp => cursor_key(b'A', mcode, app_cursor),
+            NamedKey::ArrowDown => cursor_key(b'B', mcode, app_cursor),
+            NamedKey::ArrowRight => cursor_key(b'C', mcode, app_cursor),
+            NamedKey::ArrowLeft => cursor_key(b'D', mcode, app_cursor),
+            NamedKey::Home => cursor_key(b'H', mcode, app_cursor),
+            NamedKey::End => cursor_key(b'F', mcode, app_cursor),
+            NamedKey::PageUp => csn(5),
+            NamedKey::PageDown => csn(6),
+            NamedKey::Delete => csn(3),
+            NamedKey::Insert => csn(2),
+            NamedKey::F1 => lettered_f(b'P', mcode),
+            NamedKey::F2 => lettered_f(b'Q', mcode),
+            NamedKey::F3 => lettered_f(b'R', mcode),
+            NamedKey::F4 => lettered_f(b'S', mcode),
+            NamedKey::F5 => csn(15),
+            NamedKey::F6 => csn(17),
+            NamedKey::F7 => csn(18),
+            NamedKey::F8 => csn(19),
+            NamedKey::F9 => csn(20),
+            NamedKey::F10 => csn(21),
+            NamedKey::F11 => csn(23),
+            NamedKey::F12 => csn(24),
             _ => return None,
         }),
         _ => None,
+    }
+}
+
+/// Arrows/Home/End: modified keys take the `ESC [ 1;m X` form; plain keys
+/// take `ESC [ X`, or `ESC O X` while the program asked for application
+/// cursor keys (DECCKM) - vim and less set that, and they read the two
+/// forms differently.
+fn cursor_key(fin: u8, mcode: u8, app_cursor: bool) -> Vec<u8> {
+    if mcode > 1 {
+        vec![0x1b, b'[', b'1', b';', b'0' + mcode, fin]
+    } else if app_cursor {
+        vec![0x1b, b'O', fin]
+    } else {
+        vec![0x1b, b'[', fin]
+    }
+}
+
+/// F1-F4: `ESC O P` plain, `ESC [ 1;m P` with any modifier.
+fn lettered_f(fin: u8, mcode: u8) -> Vec<u8> {
+    if mcode > 1 {
+        vec![0x1b, b'[', b'1', b';', b'0' + mcode, fin]
+    } else {
+        vec![0x1b, b'[', b'O', fin]
     }
 }
 
@@ -3609,6 +3722,17 @@ impl ApplicationHandler for App {
             .as_mut()
             .map(|e| e.on_event(&window, &event))
             .unwrap_or(false);
+        // egui may claim the *keyboard* only while one of its surfaces is
+        // actually open. With nothing on screen, a Tab press still reached
+        // egui's focus-traversal machinery and got consumed there - the
+        // terminal never saw it, and Tab is the terminal's most demanded
+        // key (completion). Mouse events keep their old treatment: egui
+        // can consume those whether or not a panel is open.
+        let egui_consumed = if matches!(event, winit::event::WindowEvent::KeyboardInput { .. }) {
+            egui_consumed && self.egui_owns_keyboard()
+        } else {
+            egui_consumed
+        };
         // An event egui claimed was claimed *for* a visual change -- hover,
         // press, drag feedback all only exist in the next frame. Every
         // motion over the panel is claimed, so without this the panel's
@@ -4381,6 +4505,73 @@ mod tests {
         assert_eq!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).map(|(d, _)| d), Some(1));
         assert_eq!(App::autoscroll_tick(1.0, 0.0, 400.0, 16.0), Some((1, 3))); // near the border: three
         assert!(App::autoscroll_tick(-9000.0, 0.0, 400.0, 16.0).unwrap().1 <= cap);
+    }
+
+    fn kb(spec: &str, app_cursor: bool) -> Option<Vec<u8>> {
+        let (mods, key) = parse_key_spec(spec).expect("spec");
+        key_bytes(&key, mods, app_cursor)
+    }
+
+    #[test]
+    fn modified_named_keys_carry_the_modifier_to_the_terminal() {
+        // The reported breakage, as a truth table. Every one of these used
+        // to be sent as the *plain* key - the program could not tell the
+        // chord had ever happened.
+        assert_eq!(kb("ctrl+right", false), Some(b"\x1b[1;5C".to_vec()));
+        assert_eq!(kb("ctrl+left", false), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(kb("alt+right", false), Some(b"\x1b[1;3C".to_vec()));
+        assert_eq!(kb("ctrl+shift+left", false), Some(b"\x1b[1;6D".to_vec()));
+        assert_eq!(kb("ctrl+delete", false), Some(b"\x1b[3;5~".to_vec()));
+        assert_eq!(kb("ctrl+home", false), Some(b"\x1b[1;5H".to_vec()));
+        assert_eq!(kb("shift+tab", false), Some(b"\x1b[Z".to_vec()));
+        assert_eq!(kb("ctrl+space", false), Some(vec![0x00]));
+        assert_eq!(kb("alt+space", false), Some(vec![0x1b, 0x20]));
+        assert_eq!(kb("ctrl+backspace", false), Some(vec![0x08]));
+        assert_eq!(kb("alt+backspace", false), Some(vec![0x1b, 0x7f]));
+        assert_eq!(kb("ctrl+alt+backspace", false), Some(vec![0x1b, 0x08]));
+        assert_eq!(kb("ctrl+f5", false), Some(b"\x1b[15;5~".to_vec()));
+        assert_eq!(kb("alt+f1", false), Some(b"\x1b[1;3P".to_vec()));
+    }
+
+    #[test]
+    fn control_letters_and_meta_still_encode_classically() {
+        assert_eq!(kb("ctrl+w", false), Some(vec![0x17]));
+        assert_eq!(kb("ctrl+c", false), Some(vec![0x03]));
+        assert_eq!(kb("ctrl+[", false), Some(vec![0x1b]));
+        assert_eq!(kb("alt+f", false), Some(vec![0x1b, b'f']));
+        // The digits that DO have control meanings in xterm.
+        assert_eq!(kb("ctrl+2", false), Some(vec![0x00]));
+        assert_eq!(kb("ctrl+6", false), Some(vec![0x1e]));
+        assert_eq!(kb("ctrl+7", false), Some(vec![0x1f]));
+        // A control chord with no legacy meaning sends the character
+        // rather than swallowing the keystroke.
+        assert_eq!(kb("ctrl+9", false), Some(vec![b'9']));
+    }
+
+    #[test]
+    fn plain_keys_keep_their_traditional_bytes() {
+        // The regression guard for the rewrite: plain keys must not pick
+        // up modifier parameters, or every vim on the machine breaks.
+        assert_eq!(kb("up", false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(kb("home", false), Some(b"\x1b[H".to_vec()));
+        assert_eq!(kb("end", false), Some(b"\x1b[F".to_vec()));
+        assert_eq!(kb("pgup", false), Some(b"\x1b[5~".to_vec()));
+        assert_eq!(kb("delete", false), Some(b"\x1b[3~".to_vec()));
+        assert_eq!(kb("backspace", false), Some(vec![0x7f]));
+        assert_eq!(kb("tab", false), Some(vec![0x09]));
+        assert_eq!(kb("return", false), Some(vec![0x0d]));
+        assert_eq!(kb("f5", false), Some(b"\x1b[15~".to_vec()));
+    }
+
+    #[test]
+    fn application_cursor_mode_switches_the_plain_cursor_keys() {
+        // vim/tmux set DECCKM; the program then *reads* ESC O A where it
+        // reads ESC [ A otherwise.
+        assert_eq!(kb("up", true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(kb("home", true), Some(b"\x1bOH".to_vec()));
+        assert_eq!(kb("end", true), Some(b"\x1bOF".to_vec()));
+        // Modified keys never take the SS3 form, application mode or not.
+        assert_eq!(kb("ctrl+up", true), Some(b"\x1b[1;5A".to_vec()));
     }
 
     #[test]
