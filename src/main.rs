@@ -420,6 +420,13 @@ struct App {
     /// The egui window picker's answer, applied next frame by the drain
     /// (which has the event loop; the draw path does not). usize::MAX =
     /// detach into a fresh window.
+    /// One small expanding ring at the cursor's cell, re-armed whenever the
+    /// cursor actually moves cells. That is the whole of it: a 180 ms pulse
+    /// so the eye can keep the pointer's agent when it slides across the
+    /// grid (mouse-reporting apps, search jumps, wide terminals).
+    ripple: Option<Ripple>,
+    /// Cell the cursor was on in the last drawn frame, for move detection.
+    last_cursor: Option<(u32, u32)>,
     pending_move: Option<usize>,
     /// A context-menu choice, run by the drain (which has the event loop).
     pending_action: Option<String>,
@@ -666,6 +673,8 @@ impl App {
             session_rx,
             pending_move: None,
             pending_action: None,
+            ripple: None,
+            last_cursor: None,
             _session,
             modifiers: ModifiersState::empty(),
             program,
@@ -1231,7 +1240,14 @@ impl App {
         let resolve = |color: &Color| palette.resolve_with(color, self.fg, self.bg, self.config.cursor_color.to_f32());
         let fg = resolve(&Color::Named(NamedColor::Foreground));
         let bg = resolve(&Color::Named(NamedColor::Background));
-        let cursor_color = resolve(&Color::Named(NamedColor::Cursor));
+        // The cursor is the one element the user must never have to hunt
+        // for, whatever palette the theme carries: boost it halfway to
+        // white. A theme that already chose a bright cursor loses nothing
+        // (the mix flattens as it approaches 1.0), a dark one gains a lot.
+        let cursor_color = {
+            let c = resolve(&Color::Named(NamedColor::Cursor));
+            c.map(|v| v + (1.0 - v) * 0.5)
+        };
         let rows = self.wins[self.cur].rows;
         let cols = self.wins[self.cur].cols;
 
@@ -1540,6 +1556,29 @@ impl App {
                     egui_ui::rename_box(ui, &mut egui.ui_state);
                     egui_ui::move_pick_box(ui, &mut egui.ui_state);
                     egui_ui::ctx_menu(ui, &mut egui.ui_state);
+                    if let Some(r) = self.ripple.as_ref() {
+                        let t = r.at.elapsed().as_secs_f32() / 0.18;
+                        if t < 1.0 {
+                            let rad = self.cell_h * (0.45 + 1.9 * t);
+                            let a = ((1.0 - t) * 120.0) as u8;
+                            let col = egui::Color32::from_rgba_unmultiplied(
+                                (r.color[0] * 255.0) as u8,
+                                (r.color[1] * 255.0) as u8,
+                                (r.color[2] * 255.0) as u8,
+                                a,
+                            );
+                            ui.painter().circle_stroke(
+                                egui::pos2(r.x / self.scale, r.y / self.scale),
+                                rad,
+                                egui::Stroke::new(2.0, col),
+                            );
+                            // The pulse is a countdown: every live pulse
+                            // schedules the frame that fades it.
+                            window.request_redraw();
+                        } else {
+                            self.ripple = None;
+                        }
+                    }
                 });
                 // While the pointer is down on a slider, egui keeps asking
                 // for frames; forward that to winit's redraw path.
@@ -1863,6 +1902,20 @@ impl App {
                     [frame.cursor_color[0], frame.cursor_color[1], frame.cursor_color[2], 0.55],
                 );
             }
+            // Re-arm the pulse only on a real cell-to-cell move; appearing
+            // or vanishing (focus lost, app hid it) is not movement.
+            let cell = (cx, cy);
+            if self.last_cursor.is_some_and(|p| p != cell) {
+                self.ripple = Some(Ripple {
+                    x: cx as f32 * self.cell_w + self.cell_w * 0.5,
+                    y: strip_h + cy as f32 * self.cell_h + self.cell_h * 0.5,
+                    at: Instant::now(),
+                    color: frame.cursor_color,
+                });
+            }
+            self.last_cursor = Some(cell);
+        } else {
+            self.last_cursor = None;
         }
 
         // --- Terminal text ---
@@ -3377,6 +3430,16 @@ fn app_icon() -> Option<winit::window::Icon> {
 }
 
 /// Where `active` lands when tabs `a` and `b` trade places.
+/// State of the cursor's movement pulse (see `App::ripple`).
+struct Ripple {
+    /// Centre in PHYSICAL pixels (the draw path works there; egui divides
+    /// by the scale when painting).
+    x: f32,
+    y: f32,
+    at: Instant,
+    color: [f32; 3],
+}
+
 /// RGBA pixels -> PNG. The screenshot path; egui textures and glyphon
 /// agree on RGBA, so this is a header plus a pass-through.
 fn png_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
