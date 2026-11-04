@@ -119,6 +119,24 @@ under Wayland's pointer confinement -- `Alt+Shift+w` is that gesture there.
 Dragging a tab onto foreign applications would need the compositor
 data-device protocol.
 
+## Images must appear in every picture of the terminal
+
+- [ ] **Switcher previews and screenshot/readback paths skip Kitty
+      graphics.** The overview tiles are real offscreen terminal frames,
+      but the offscreen pass draws rects and glyphs only - `draw_images`
+      is a main-pass call, so any tab showing a Kitty image renders its
+      text without the picture on top: the image vanishes from the tile,
+      and from anything built on preview readback. Copy-as-image (GPU
+      readback of the *window*) already captures images truthfully -
+      that path is the proof the store and pipeline work; the offscreen
+      renderer just needs the same `draw_images` step with the offscreen
+      viewport's cell metrics, z-order under the cursor, and scroll offset
+      honoured. One fix serves: switcher tiles, TabMonitor (its live
+      snapshots are preview readbacks), and any future preview surface.
+      The tile is a downscaled frame, so expect image detail to want the
+      same anti-alias care the glyphs got; a scrolled or alt-screen tab
+      must show what that tab would show, not what it showed at rest.
+
 ## Interaction
 
 - [x] **Terminal mouse reporting.** Done (uncommitted). While any of the
