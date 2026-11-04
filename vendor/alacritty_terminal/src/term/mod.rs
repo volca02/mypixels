@@ -1110,7 +1110,11 @@ impl<T: EventListener> Handler for Term<T> {
         };
         let line = self.grid.history_size() + self.grid.cursor.point.line.0.max(0) as usize;
         let col = self.grid.cursor.point.column.0;
-        self.event_proxy.send_event(Event::Semantic { code, exit, line, col });
+        // mypixels: a row ID that survives eviction, and who owns the
+        // screen right now (see Event::Semantic).
+        let row = self.grid.scrolled_out() + self.grid.cursor.point.line.0.max(0) as usize;
+        let alt = self.mode.intersects(TermMode::ALT_SCREEN);
+        self.event_proxy.send_event(Event::Semantic { code, exit, line, col, row, alt });
     }
 
     /// A character to be displayed.

@@ -89,7 +89,16 @@ pub struct Config {
     pub palette: Option<[Rgb; 16]>,
     pub term_font: String,
     pub tablist_font: String,
+    /// Scrollback depth. Costs width*24+40 bytes per line (full-width
+    /// Vec<Cell>), so raising this is a real RAM decision; the command
+    /// output pool (`history_bytes`) is what keeps deep history cheap.
     pub scrollback_lines: usize,
+    /// Global budget for the command-output pool (all tabs, LRU-evicted
+    /// oldest closed block first). 32 MB typical-use is never approached.
+    pub history_bytes: usize,
+    /// A single command's captured output is capped here, with an explicit
+    /// truncation marker - one `ls -lR /` cannot eat the whole pool.
+    pub history_block_bytes: usize,
     // tab color groups
     pub col: [Rgb; 8],
     // behavior
@@ -207,7 +216,9 @@ impl Default for Config {
             palette: None,
             term_font: "Terminus 8".to_string(),
             tablist_font: "Liberation Mono 7".to_string(),
-            scrollback_lines: 1000,
+            scrollback_lines: 5000,
+            history_bytes: 32 * 1024 * 1024,
+            history_block_bytes: 8 * 1024 * 1024,
             col: [
                 parse_hex("#b58900"),
                 parse_hex("#cb4b16"),
@@ -359,6 +370,8 @@ impl Config {
             ("tablist_font".into(), str_(&self.tablist_font)),
             ("term_transparency".into(), self.term_transparency.to_string()),
             ("scrollback_lines".into(), self.scrollback_lines.to_string()),
+            ("history_bytes".into(), self.history_bytes.to_string()),
+            ("history_block_bytes".into(), self.history_block_bytes.to_string()),
             ("background_color".into(), rgb(&self.background_color)),
             ("foreground_color".into(), rgb(&self.foreground_color)),
             ("selection_color".into(), rgb(&self.selection_color)),
@@ -550,7 +563,17 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 },
                 "scrollback_lines" => {
                     if let Some(n) = val.as_u64() {
-                        cfg.scrollback_lines = n as usize;
+                        cfg.scrollback_lines = n.max(16) as usize;
+                    }
+                },
+                "history_bytes" => {
+                    if let Some(n) = val.as_u64() {
+                        cfg.history_bytes = (n as usize).max(64 * 1024);
+                    }
+                },
+                "history_block_bytes" => {
+                    if let Some(n) = val.as_u64() {
+                        cfg.history_block_bytes = (n as usize).max(4096);
                     }
                 },
                 "default_width" => {

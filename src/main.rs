@@ -422,7 +422,9 @@ struct App {
     /// every BEL as (tab_id, time), drained into attention + pulses
     bell_pings: Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
     /// OSC 133 marks as dispatched, drained into per-tab command blocks
-    sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize)>>>,
+    sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize, usize, bool)>>>,
+    /// Opens an order stamp per command (see `CommandBlock::seq`).
+    sem_seq: u64,
     /// Complete APC strings awaiting graphics interpretation.
     apcs_ring: Arc<std::sync::Mutex<Vec<(usize, Vec<u8>, usize, usize)>>>,
     pty_writes_ring: Arc<std::sync::Mutex<Vec<(usize, String)>>>,
@@ -724,6 +726,7 @@ impl App {
             bell,
             bell_pings: bells,
             sems_ring: sems,
+            sem_seq: 0,
             apcs_ring: apcs,
             pty_writes_ring: pty_writes,
             resets_ring: resets,
@@ -2985,26 +2988,72 @@ impl App {
     /// time; this only associates marks into blocks and forgets tabs that
     /// are gone (a mark racing its tab's death is simply irrelevant).
     fn drain_sems(&mut self) {
-        let evs: Vec<(usize, u8, Option<i32>, usize)> =
+        let evs: Vec<(usize, u8, Option<i32>, usize, usize, bool)> =
             std::mem::take(&mut *self.sems_ring.lock().unwrap());
         if !self.config.osc133 {
             return;
         }
-        let live: std::collections::HashSet<usize> = self
-            .wins
-            .iter()
-            .flat_map(|w| w.tabs.iter().map(|t| t.id))
-            .collect();
-        for (tab_id, code, exit, line) in evs {
-            if live.contains(&tab_id) {
-                apply_sem_mark(
-                    self.sem_blocks.entry(tab_id).or_default(),
-                    code,
-                    exit,
-                    line,
-                );
+        let cap = self.config.history_block_bytes;
+        for (tab_id, code, exit, line, row, alt) in evs {
+            // The tab the mark belongs to, wherever it lives now.
+            let tab = match self
+                .wins
+                .iter()
+                .find_map(|w| w.tabs.iter().find(|t| t.id == tab_id))
+            {
+                Some(t) => t,
+                None => continue,
+            };
+            let blocks = self.sem_blocks.entry(tab_id).or_default();
+            // D closes the newest open block; note which one BEFORE the
+            // fold, so the capture below can attribute the text even
+            // though the fold is what flips `done`.
+            let closing = if code == 3 {
+                blocks.iter().rposition(|b| !b.done)
+            } else {
+                None
+            };
+            if code == 0 {
+                self.sem_seq += 1;
+            }
+            apply_sem_mark(blocks, code, exit, line, row, alt, self.sem_seq);
+            if code != 3 {
+                continue;
+            }
+            let Some(i) = closing else { continue };
+            let Some(b) = blocks.get_mut(i) else { continue };
+            if !b.done {
+                continue; // a stray second D: the fold ignored it
+            }
+            if alt || b.alt_seen {
+                // A full-screen program owned the rows this command
+                // "wrote". There is no output to capture; say so.
+                b.alt_seen = true;
+                continue;
+            }
+            // Translate the block's row IDs into TODAY'S buffer rows:
+            // buffer row 0 is whichever row the ring's oldest survivor
+            // is, `scrolled_out - history_size` rows past the start of
+            // time. This translation is exact even after eviction,
+            // which is the whole reason marks carry `row` at all.
+            let (hist, prod) = tab.grid_metrics();
+            let base = prod.saturating_sub(hist);
+            let from = b.start_global.saturating_sub(base);
+            // D's cursor line is the fresh row the next prompt will
+            // paint: the output is above it. +1 includes a final
+            // partial line; max() keeps at least the prompt row itself.
+            // One row of slack: the prompt row of the NEXT command may
+            // share the physical row D's cursor sits on. The byte
+            // budget charges blocks for that padding, eviction
+            // included, so the two sides agree on what is held.
+            let to = (row + 1).saturating_sub(base).max(from + 1);
+            if let Some((txt, readable, _)) = tab.capture_rows(from, to) {
+                b.truncated_head |= b.start_global < base || readable > from;
+                push_block_text(b, &txt, cap);
             }
         }
+        let budget = self.config.history_bytes;
+        evict_to_budget(&mut self.sem_blocks, budget);
     }
 
     /// Scroll so the viewport top lands on the previous/next command's
@@ -3015,10 +3064,10 @@ impl App {
         let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
             return;
         };
-        let blocks: Vec<CommandBlock> = self
+        let blocks: Vec<usize> = self
             .sem_blocks
             .get(&tab.id)
-            .map(|b| b.iter().copied().collect())
+            .map(|b| b.iter().map(|b| b.prompt_line).collect())
             .unwrap_or_default();
         if blocks.is_empty() {
             return;
@@ -3029,13 +3078,13 @@ impl App {
         };
         let cur_top = hist - cur;
         let target = if back {
-            blocks.iter().map(|b| b.prompt_line).filter(|l| *l < cur_top).max()
+            blocks.iter().filter(|l| **l < cur_top).max()
         } else {
-            blocks.iter().map(|b| b.prompt_line).filter(|l| *l > cur_top).min()
+            blocks.iter().filter(|l| **l > cur_top).min()
         };
         log::debug!("jump back={back} blocks={} hist={hist} cur={cur} target={target:?}", blocks.len());
         if let Some(t) = target {
-            let want = hist.saturating_sub(t);
+            let want = hist.saturating_sub(*t);
             log::debug!("jump -> offset {want} (delta {})", want as i32 - cur as i32);
             tab.scroll(alacritty_terminal::grid::Scroll::Delta(
                 want as i32 - cur as i32,
@@ -4189,7 +4238,7 @@ fn url_spans_in_row(chars: &[char], row: usize) -> Vec<UrlSpan> {
 }
 
 /// One shell command delimited by OSC 133 A..D marks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandBlock {
     /// Absolute logical line of the prompt, as the state machine saw it
     /// when the prompt-start mark was dispatched.
@@ -4200,22 +4249,130 @@ pub struct CommandBlock {
     /// status", not "still open" - the two states must not share a
     /// sentinel, or a second D would reopen a finished command.
     pub done: bool,
+    /// Monotonic open order across the whole session, so budget
+    /// eviction can find the globally oldest closed block instead of
+    /// guessing per tab.
+    pub seq: u64,
+    /// Buffer-row ID (survives scrollback eviction) of the prompt when
+    /// the A mark landed. Capture starts AT the prompt so the echoed
+    /// command rides along in the block.
+    pub start_global: usize,
+    /// The alternate screen owned the display at one of this command's
+    /// marks: its "output" was a TUI's redraws, not capturable text.
+    pub alt_seen: bool,
+    /// Captured output: the prompt row (with the command) and everything
+    /// the command wrote, taken in one at the D mark.
+    pub text: String,
+    /// The capture could not reach as far back as the command began
+    /// (output larger than the scrollback), or the block cap clipped the
+    /// tail. Say so; never silently drop bytes.
+    pub truncated_head: bool,
+    pub truncated_tail: bool,
 }
 
-/// Fold one mark into a tab's blocks. Deliberately pure - the position was
-/// already computed where it was true; this only associates.
+/// Append output to a block honoring the per-block byte cap by keeping
+/// the TAIL (the interesting end of a build log is its last error) and
+/// flagging the clip. Zero-cap callers mean "no cap".
+fn push_block_text(b: &mut CommandBlock, chunk: &str, cap: usize) {
+    if chunk.is_empty() {
+        return;
+    }
+    b.text.push_str(chunk);
+    if cap > 0 && b.text.len() > cap {
+        let keep = cap / 2;
+        let lost = b.text.len() - keep;
+        // Cut on a char boundary.
+        let mut split = b.text.len() - keep;
+        while !b.text.is_char_boundary(split) {
+            split += 1;
+        }
+        b.text = format!("[... {lost} bytes omitted ...]\n{}", &b.text[split..]);
+        b.truncated_tail = true;
+    }
+}
+
+/// Enforce the global pool budget: evict the globally oldest CLOSED
+/// block until under budget. Open blocks are never evicted (their
+/// command is still writing), and a tab is never emptied of its last
+/// closed block unless there is nothing else to give.
+fn evict_to_budget(
+    blocks: &mut std::collections::HashMap<usize, std::collections::VecDeque<CommandBlock>>,
+    budget: usize,
+) {
+    loop {
+        let total: usize =
+            blocks.values().flat_map(|q| q.iter()).map(|b| b.text.len()).sum();
+        if total <= budget {
+            return;
+        }
+        // Globally oldest CLOSED block goes first (LRU by open order).
+        // A tab keeps its last closed block for as long as any other
+        // tab can pay; only when the budget demands the impossible do
+        // we strip those too. Open blocks are sacred: their command is
+        // still writing.
+        let mut done = false;
+        for protect_last_in_line in [true, false] {
+            let mut pick: Option<(u64, usize, usize)> = None; // (seq, tab, idx)
+            for (tab, q) in blocks.iter() {
+                let closed = q.iter().filter(|b| b.done).count();
+                if protect_last_in_line && closed < 2 {
+                    continue;
+                }
+                for (i, b) in q.iter().enumerate() {
+                    if b.done && pick.map_or(true, |(s, _, _)| b.seq < s) {
+                        pick = Some((b.seq, *tab, i));
+                    }
+                }
+            }
+            if let Some((_, tab, i)) = pick {
+                if let Some(q) = blocks.get_mut(&tab) {
+                    q.remove(i);
+                }
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            return; // nothing closed anywhere: over budget is temporarily sacred
+        }
+    }
+}
+
+/// Fold one OSC 133 mark into a tab's block ring (position and text are
+/// the caller's business; this only owns block identity and closure).
 fn apply_sem_mark(
     blocks: &mut std::collections::VecDeque<CommandBlock>,
     code: u8,
     exit: Option<i32>,
     line: usize,
+    row: usize,
+    alt: bool,
+    seq: u64,
 ) {
     match code {
         // A: prompt start opens a block.
         0 => {
-            blocks.push_back(CommandBlock { prompt_line: line, exit: None, done: false });
+            blocks.push_back(CommandBlock {
+                prompt_line: line,
+                seq,
+                exit: None,
+                done: false,
+                start_global: row,
+                alt_seen: alt,
+                text: String::new(),
+                truncated_head: false,
+                truncated_tail: false,
+            });
             while blocks.len() > 512 {
                 blocks.pop_front();
+            }
+        },
+        // C: command start. The position is not needed (capture begins
+        // at the prompt line anyway), but an alt-screen flag here dooms
+        // the capture, so it must be remembered.
+        2 => {
+            if let Some(b) = blocks.iter_mut().rev().find(|b| !b.done) {
+                b.alt_seen |= alt;
             }
         },
         // D: command end closes the newest still-open block. A D with no
@@ -4227,8 +4384,7 @@ fn apply_sem_mark(
                 b.done = true;
             }
         },
-        // B (prompt end) and C (command start) carry no position the v1 UI
-        // needs; the marks are consumed so they cannot misattribute later.
+        // B (prompt end) carries no position the v1 UI needs.
         _ => {},
     }
 }
@@ -5697,12 +5853,12 @@ mod sem_tests {
     #[test]
     fn marks_fold_into_blocks() {
         let mut b: VecDeque<super::CommandBlock> = VecDeque::new();
-        apply_sem_mark(&mut b, 0, None, 10); // A
-        apply_sem_mark(&mut b, 1, None, 10); // B
-        apply_sem_mark(&mut b, 2, None, 11); // C
-        apply_sem_mark(&mut b, 3, Some(0), 40); // D;0
-        apply_sem_mark(&mut b, 0, None, 41); // A
-        apply_sem_mark(&mut b, 3, Some(1), 55); // D;1
+        apply_sem_mark(&mut b, 0, None, 10, 10, false, 1); // A
+        apply_sem_mark(&mut b, 1, None, 10, 10, false, 1); // B
+        apply_sem_mark(&mut b, 2, None, 11, 11, false, 1); // C
+        apply_sem_mark(&mut b, 3, Some(0), 40, 40, false, 1); // D;0
+        apply_sem_mark(&mut b, 0, None, 41, 41, false, 2); // A
+        apply_sem_mark(&mut b, 3, Some(1), 55, 55, false, 2); // D;1
         assert_eq!(b.len(), 2);
         assert_eq!((b[0].prompt_line, b[0].exit), (10, Some(0)));
         assert_eq!((b[1].prompt_line, b[1].exit), (41, Some(1)));
@@ -5711,11 +5867,11 @@ mod sem_tests {
     #[test]
     fn stray_and_missing_marks_survive() {
         let mut b: VecDeque<super::CommandBlock> = VecDeque::new();
-        apply_sem_mark(&mut b, 3, Some(2), 5); // D without A: no block, no panic
+        apply_sem_mark(&mut b, 3, Some(2), 5, 5, false, 0); // D without A: no block, no panic
         assert!(b.is_empty());
-        apply_sem_mark(&mut b, 0, None, 6); // A
-        apply_sem_mark(&mut b, 3, None, 9); // D with unknown status
-        apply_sem_mark(&mut b, 3, Some(7), 9); // second D must not reopen D
+        apply_sem_mark(&mut b, 0, None, 6, 6, false, 1); // A
+        apply_sem_mark(&mut b, 3, None, 9, 9, false, 1); // D with unknown status
+        apply_sem_mark(&mut b, 3, Some(7), 9, 9, false, 1); // second D must not reopen D
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].exit, None); // first D won with "unknown"
     }
@@ -5724,9 +5880,62 @@ mod sem_tests {
     fn ring_is_bounded() {
         let mut b: VecDeque<super::CommandBlock> = VecDeque::new();
         for i in 0..600 {
-            apply_sem_mark(&mut b, 0, None, i);
+            apply_sem_mark(&mut b, 0, None, i, i, false, i as u64);
         }
         assert_eq!(b.len(), 512);
         assert_eq!(b.front().unwrap().prompt_line, 88);
+    }
+
+    fn block(text: &str, done: bool, seq: u64) -> super::CommandBlock {
+        let mut q: VecDeque<super::CommandBlock> = VecDeque::new();
+        apply_sem_mark(&mut q, 0, None, 0, 0, false, seq);
+        let mut b = q.pop_front().unwrap();
+        b.text = text.to_string();
+        b.done = done;
+        b
+    }
+
+    #[test]
+    fn block_cap_keeps_the_tail() {
+        let mut b = block("hello ", false, 1);
+        super::push_block_text(&mut b, &"x".repeat(500), 100);
+        assert!(b.text.len() < 200, "clipped to roughly the cap");
+        assert!(b.text.ends_with('x'), "the tail survives");
+        assert!(b.truncated_tail);
+        assert!(b.text.starts_with("[... 456 bytes omitted ...]"));
+    }
+
+    #[test]
+    fn block_cap_cuts_on_char_boundaries() {
+        let mut b = block("", false, 1);
+        // The keep-window may slice a multi-byte char in half.
+        super::push_block_text(&mut b, &"é".repeat(200), 50);
+        assert!(b.text.is_char_boundary(b.text.len()));
+    }
+
+    #[test]
+    fn budget_evicts_oldest_closed_first() {
+        let mut map: std::collections::HashMap<usize, VecDeque<super::CommandBlock>> =
+            std::collections::HashMap::new();
+        // Tab 9: three closed blocks; tab 4: one closed and one open.
+        map.insert(9, vec![block("aaaa", true, 1), block("bbbb", true, 2), block("cccc", true, 3)].into());
+        map.insert(4, vec![block("dddd", true, 4), block("eeee", false, 5)].into());
+        // Budget for exactly two 4-byte blocks.
+        super::evict_to_budget(&mut map, 8);
+        assert_eq!(map[&9].len(), 0, "global LRU: all three of tab 9 predate tab 4's");
+        assert_eq!(map[&4].len(), 2, "the open block is sacred and fills the budget exactly");
+        // An impossible budget strips everything that can be stripped.
+        super::evict_to_budget(&mut map, 0);
+        assert_eq!(map[&4].len(), 1);
+        assert!(!map[&4][0].done, "the open block survives any budget");
+    }
+
+    #[test]
+    fn all_open_over_budget_is_tolerated() {
+        let mut map: std::collections::HashMap<usize, VecDeque<super::CommandBlock>> =
+            std::collections::HashMap::new();
+        map.insert(1, vec![block("aaaa", false, 1), block("bbbb", false, 2)].into());
+        super::evict_to_budget(&mut map, 1); // nothing is closed
+        assert_eq!(map[&1].len(), 2, "running commands are sacred, over budget or not");
     }
 }

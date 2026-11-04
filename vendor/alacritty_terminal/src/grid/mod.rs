@@ -135,6 +135,13 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// mypixels patch: rows ever scrolled out of the viewport into
+    /// history (or evicted past it). Buffer rows are stable identities
+    /// only until scrollback caps; `scrolled_out + viewport row` is a
+    /// row ID that survives eviction, which is what lets command-output
+    /// capture translate a mark's position into today's buffer.
+    scrolled_out: usize,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -147,6 +154,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            scrolled_out: 0,
         }
     }
 
@@ -272,6 +280,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         if region.start == 0 {
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
+            // mypixels: count what left the viewport, eviction included.
+            self.scrolled_out += positions;
 
             // Swap the lines fixed at the top to their target positions after rotation.
             //
@@ -431,6 +441,13 @@ impl<T> Grid<T> {
     #[inline]
     pub fn display_offset(&self) -> usize {
         self.display_offset
+    }
+
+    /// mypixels patch: rows ever scrolled out of the viewport (see the
+    /// `scrolled_out` field).
+    #[inline]
+    pub fn scrolled_out(&self) -> usize {
+        self.scrolled_out
     }
 
     #[inline]

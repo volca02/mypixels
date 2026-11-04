@@ -64,11 +64,17 @@ pub enum Event {
     /// parsed - the only moment that position is guaranteed true.
     /// mypixels: code 0=A prompt start, 1=B prompt end, 2=C command start,
     /// 3=D command end (with exit status when the shell sent one).
+    /// mypixels further: `row` is a row ID that survives scrollback
+    /// eviction (scrolled-out count + viewport row), and `alt` says the
+    /// alternate screen owned the display at dispatch - output under a
+    /// TUI is not command output to capture.
     Semantic {
         code: u8,
         exit: Option<i32>,
         line: usize,
         col: usize,
+        row: usize,
+        alt: bool,
     },
 
     /// One complete APC string (mypixels patch; the Kitty graphics

@@ -50,10 +50,11 @@ pub struct SpikeListener {
     pub resets: Arc<Mutex<Vec<usize>>>,
     /// Tabs whose application just asked (CSI 16 t) for the cell size.
     pub cell_sizes: Arc<Mutex<Vec<usize>>>,
-    /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line).
-    /// Order per tab is the stream's own; the app folds them into command
-    /// blocks (see `App::drain_sems`).
-    pub sems: Arc<Mutex<Vec<(usize, u8, Option<i32>, usize)>>>,
+    /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line,
+    /// eviction-proof row id, alt-screen flag). Order per tab is the
+    /// stream's own; the app folds them into command blocks (see
+    /// `App::drain_sems`).
+    pub sems: Arc<Mutex<Vec<(usize, u8, Option<i32>, usize, usize, bool)>>>,
 }
 
 impl SpikeListener {
@@ -90,9 +91,9 @@ impl EventListener for SpikeListener {
             Event::Apc { payload, line, col } => {
                 self.apcs.lock().unwrap().push((self.tab_id, payload, line, col));
             },
-            Event::Semantic { code, exit, line, .. } => {
-                log::debug!("sem mark tab {} code {} exit {:?} line {}", self.tab_id, code, exit, line);
-                self.sems.lock().unwrap().push((self.tab_id, code, exit, line));
+            Event::Semantic { code, exit, line, row, alt, .. } => {
+                log::debug!("sem mark tab {} code {} exit {:?} line {} row {} alt {}", self.tab_id, code, exit, line, row, alt);
+                self.sems.lock().unwrap().push((self.tab_id, code, exit, line, row, alt));
             },
             Event::Bell => {
                 log::info!("bell received (tab {})", self.tab_id);
@@ -313,6 +314,55 @@ impl Tab {
 
     pub fn clear_selection(&mut self) {
         self.term.lock().selection = None;
+    }
+
+    /// Rows currently owned by scrollback: everything below this buffer
+    /// index is final and can never be rewritten by the application.
+    pub fn history_size(&self) -> usize {
+        self.term.lock().grid().history_size()
+    }
+
+    /// (history rows, rows ever scrolled out of the viewport): the pair
+    /// that translates mark row-IDs into today's buffer rows.
+    pub fn grid_metrics(&self) -> (usize, usize) {
+        let term = self.term.lock();
+        (term.grid().history_size(), term.grid().scrolled_out())
+    }
+
+    /// Capture buffer rows [from, to) as text (0 = oldest live row),
+    /// preserving soft-wrapped lines and trimming row ends - the same
+    /// rendering a selection copy produces. Returns the text plus the
+    /// readable window actually covered `[from, to)`, so the caller can
+    /// see when eviction had already eaten the head of the range and can
+    /// advance its cursor even across blank rows. Refuses (None) while
+    /// the alternate screen owns the grid: a TUI's in-place redraws are
+    /// not command output.
+    pub fn capture_rows(&self, from: usize, to: usize) -> Option<(String, usize, usize)> {
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let (total, lines, cols) = (term.total_lines(), term.screen_lines(), term.columns());
+        let hi = std::cmp::min(to, total);
+        if from >= hi {
+            return None; // the whole range has already scrolled out
+        }
+        let shift = lines as i32 - total as i32;
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(from as i32 + shift), Column(0)),
+            Side::Left,
+        );
+        sel.update(
+            Point::new(Line((hi - 1) as i32 + shift), Column(cols.saturating_sub(1))),
+            Side::Right,
+        );
+        sel.include_all();
+        let saved = term.selection.clone();
+        term.selection = Some(sel);
+        let text = term.selection_to_string().unwrap_or_default();
+        term.selection = saved;
+        Some((text, from, hi))
     }
 
     /// The text under the selection, or None if nothing is really selected.
