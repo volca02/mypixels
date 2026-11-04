@@ -66,6 +66,16 @@ pub struct Placement {
     pub z: i32,
 }
 
+/// Where transmitted image bytes come from beyond the stream itself.
+/// Shared memory is POSIX shm, which on Linux is a plain file under
+/// /dev/shm - no syscall is needed to read what the sender wrote.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathMode {
+    File,
+    TempFile,
+    Shm,
+}
+
 /// An in-progress chunked transfer.
 struct Pending {
     id: u32,
@@ -84,6 +94,8 @@ struct Pending {
     z: i32,
     anchor_line: usize,
     anchor_col: usize,
+    /// Non-direct medium (t=f/t/s): the payload is a path, not image data.
+    path_mode: Option<PathMode>,
     /// Decoded bytes so far. Base64 is decoded chunk by chunk: senders
     /// (broot among them) pad each chunk independently, so the texts of
     /// two chunks must never be pasted together and decoded as one.
@@ -204,13 +216,11 @@ impl TabKitty {
         // actions we implement, so absence says "no" without a lie.
         if action == b'q' {
             let id = num(b'i');
-            // Only direct transfer exists here. Answering OK to a
-            // tmpfile/shared-memory probe would advertise a medium this
-            // terminal then fails to read - any non-OK message reads as
-            // "no" to clients.
-            if matches!(get(b't'), Some(b"t") | Some(b"s") | Some(b"f")) {
-                return format!("\x1b_Gi={id};ENOTSUP:only direct transfer\x1b\\").into_bytes();
-            }
+            // Every medium is supported now (we share the filesystem with
+            // the client): direct, plain file, temp file, shared memory.
+            // Read failures answer with one identical EBADF below, per the
+            // spec's file-transmission security rules.
+            let _ = get(b't');
             let msg = match get(b'e') {
                 Some(e) if e == b"T" => format!("\x1b_Gi={id},e=T;OK\x1b\\"),
                 // Known non-default-free actions: we transmit and place, so
@@ -263,10 +273,17 @@ impl TabKitty {
                 }
                 // A genuinely new header frame while one is open abandons
                 // the old: the spec's resync rule.
+                let path_mode = match get(b't') {
+                    Some(b"f") => Some(PathMode::File),
+                    Some(b"t") => Some(PathMode::TempFile),
+                    Some(b"s") => Some(PathMode::Shm),
+                    _ => None,
+                };
                 let mut p = Pending {
                     id,
                     named: num(b'i') != 0,
                     display: action == b'T',
+                    path_mode,
                     format,
                     px_w: num(b's') as u32,
                     px_h: num(b'v') as u32,
@@ -374,6 +391,24 @@ impl TabKitty {
                 },
             }
         }
+        // Path mediums: the payload decodes to a filename, not pixels.
+        let mut temp_to_delete: Option<std::path::PathBuf> = None;
+        if let Some(mode) = p.path_mode {
+            let path = match std::str::from_utf8(&bytes) {
+                Ok(s) => std::path::PathBuf::from(s),
+                Err(_) => return err_ack(p.id, p.named, "Failed to read image file"),
+            };
+            match read_media(&path, mode) {
+                Some((data, delete)) => {
+                    bytes = data;
+                    temp_to_delete = delete;
+                },
+                // One identical error for every failure kind (missing,
+                // unreadable, not regular, disallowed location) - file
+                // existence must not leak through the ack text.
+                None => return err_ack(p.id, p.named, "Failed to read image file"),
+            }
+        }
         let src = Arc::new(bytes);
         let rgba = match p.format {
             100 => match decode_png(&src) {
@@ -400,6 +435,10 @@ impl TabKitty {
         };
         let generation = self.images.get(&p.id).map(|old| old.generation + 1).unwrap_or(0);
         self.images.insert(p.id, KittyImage { width: rgba.0, height: rgba.1, rgba: rgba.2, source: src, generation });
+        if let Some(path) = temp_to_delete {
+            // Only our own kind of temp path is ever removed (spec).
+            let _ = std::fs::remove_file(path);
+        }
         let ack = if p.display && p.named {
             format!("\x1b_Gi={};OK\x1b\\", p.id).into_bytes()
         } else {
@@ -482,6 +521,65 @@ fn decode_b64(data: &[u8]) -> Option<Vec<u8>> {
 /// PNG -> RGBA8, size-capped BEFORE allocating: width/height are read from
 /// the header and bounds-checked first, so a 100000x100000 claim never
 /// reaches the decoder's memory (checked against u64 products as well).
+/// A failed load's ack (empty when the sender named no id: silence is the
+/// spec answer for id=0 traffic).
+fn err_ack(id: u32, named: bool, why: &str) -> Vec<u8> {
+    if named {
+        format!("\x1b_Gi={id};EBADF:{why}\x1b\\").into_bytes()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Reads a file/shm transmission. Enforces the spec's rules: regular
+/// files only (symlinks are followed, but a symlink into a forbidden
+/// place still lands there, so the FINAL path is what's checked); refuses
+/// sensitive trees outright; caps size. Returns (data, delete-after) -
+/// delete-after is set only for temp-file transfers whose path lives in a
+/// temp directory and carries the protocol marker.
+fn read_media(
+    path: &std::path::Path,
+    mode: PathMode,
+) -> Option<(Vec<u8>, Option<std::path::PathBuf>)> {
+    use std::path::Component;
+    let shm = std::path::Path::new("/dev/shm");
+    let normalized = if mode == PathMode::Shm {
+        let name = path.file_name()?.to_str()?;
+        shm.join(name)
+    } else {
+        path.to_path_buf()
+    };
+    // Sensitive trees are refused before anything is opened. /dev/shm is
+    // the exception shared memory explicitly lives in (its /dev ancestor
+    // must not condemn it).
+    if !normalized.starts_with(shm) {
+        for parent in normalized.ancestors() {
+            if matches!(
+                parent.to_str()?,
+                "/proc" | "/sys" | "/etc" | "/dev" | "/boot" | "/run"
+            ) {
+                return None;
+            }
+        }
+    }
+    if normalized
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let canonical = normalized.canonicalize().ok()?;
+    let meta = std::fs::metadata(&canonical).ok()?;
+    if !meta.is_file() || meta.len() as usize > MAX_TRANSFER {
+        return None;
+    }
+    let data = std::fs::read(&canonical).ok()?;
+    let delete = mode == PathMode::TempFile
+        && canonical.starts_with(std::env::temp_dir())
+        && canonical.to_str().is_some_and(|s| s.contains("tty-graphics-protocol"));
+    Some((data, if delete { Some(canonical) } else { None }))
+}
+
 /// Raw RGB/RGBA pixels: length must be exactly w*h*bpp, sides within the
 /// cap; RGB grows an opaque alpha.
 fn raw_rgba(bytes: &[u8], format: u32, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
@@ -634,6 +732,38 @@ mod tests {
     }
 
     #[test]
+    fn file_and_shm_mediums_read_images() {
+        let png = tiny_png();
+        let path = std::env::temp_dir().join("mypixels-kittytest-file.png");
+        std::fs::write(&path, &png).unwrap();
+        let mut k = TabKitty::default();
+        let b64path = b64(path.to_str().unwrap().as_bytes());
+        let ack = k.on_apc(&apc("a=T,f=100,t=f,i=5", &b64path), 3, 0);
+        assert_eq!(ack, b"\x1b_Gi=5;OK\x1b\\");
+        assert!(k.image(5).is_some());
+        // Every failure shares one ack text: existence must not leak.
+        let miss = b64(b"/tmp/mypixels-kittytest-does-not-exist.png");
+        let r = String::from_utf8(k.on_apc(&apc("a=T,f=100,t=f,i=6", &miss), 3, 0)).unwrap();
+        assert_eq!(r, "\x1b_Gi=6;EBADF:Failed to read image file\x1b\\".to_string());
+        // Sensitive trees refused without opening anything.
+        let pw = b64(b"/etc/hostname");
+        let r = String::from_utf8(k.on_apc(&apc("a=T,f=100,t=f,i=7", &pw), 3, 0)).unwrap();
+        assert!(r.contains("EBADF"), "{r:?}");
+        assert!(k.image(7).is_none());
+        // Shared memory: a plain file under /dev/shm on Linux.
+        if std::path::Path::new("/dev/shm").is_dir() {
+            let shm = std::path::Path::new("/dev/shm").join("mypixels-kittytest");
+            std::fs::write(&shm, &png).unwrap();
+            let sp = b64(b"/mypixels-kittytest"); // shm names may be given bare
+            let ack = k.on_apc(&apc("a=T,f=100,t=s,i=8", &sp), 3, 0);
+            assert_eq!(ack, b"\x1b_Gi=8;OK\x1b\\");
+            assert!(k.image(8).is_some());
+            std::fs::remove_file(&shm).ok();
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn raw_rgb_and_rgba_are_accepted() {
         let mut k = TabKitty::default();
         // f=24: two red pixels, 2x1
@@ -669,11 +799,10 @@ mod tests {
         assert_eq!(k.on_apc(&apc("a=q,i=3,e=f", &[]), 1, 0), b"\x1b_Gi=3;OK\x1b\\"); // no animation
         // icat's exact detection query.
         assert_eq!(k.on_apc(&apc("i=31,s=1,v=1,a=q,t=d,f=24", b"AAAA"), 1, 0), b"\x1b_Gi=31;OK\x1b\\");
-        // icat 0.49 also probes tmpfile/shm mediums: only non-OK says no.
-        let r = String::from_utf8(k.on_apc(&apc("a=q,t=t,i=2,s=1,v=1,f=24", &b64(b"/tmp/x")), 1, 0)).unwrap();
-        assert!(r.contains("ENOTSUP") && !r.contains(";OK"), "{r:?}");
-        let r = String::from_utf8(k.on_apc(&apc("a=q,t=s,i=3,s=1,v=1,f=24", &b64(b"/icat-x")), 1, 0)).unwrap();
-        assert!(r.contains("ENOTSUP") && !r.contains(";OK"), "{r:?}");
+        // All mediums are implemented now, so probes for them get OK too
+        // (a read failure later answers EBADF, honestly and identically).
+        assert_eq!(k.on_apc(&apc("a=q,t=t,i=2,s=1,v=1,f=24", &b64(b"/tmp/x")), 1, 0), b"\x1b_Gi=2;OK\x1b\\");
+        assert_eq!(k.on_apc(&apc("a=q,t=s,i=3,s=1,v=1,f=24", &b64(b"/icat-x")), 1, 0), b"\x1b_Gi=3;OK\x1b\\");
         // Transfer-only frames answer nothing; named DISPLAYS ack.
         assert!(k.on_apc(&apc("a=t,i=5,f=100", &b64(&tiny_png())), 1, 0).is_empty());
         assert_eq!(k.on_apc(&apc("a=T,i=7,f=100", &b64(&tiny_png())), 1, 0), b"\x1b_Gi=7;OK\x1b\\");

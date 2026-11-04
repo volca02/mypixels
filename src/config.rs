@@ -103,6 +103,11 @@ pub struct Config {
     /// OSC 133 semantic shell integration: fold the shell's prompt/command
     /// marks into navigable command blocks (scripts/shell_integration.*).
     pub osc133: bool,
+    /// kitty-compatible identity in TERMINAL ("mypixels-kitty") for
+    /// allowlist-style detectors like broot. Never touches TERM (terminfo
+    /// honesty); the claim is backed by passing kitty's own icat
+    /// conformance. See docs/graphics notes.
+    pub kitty_compatible: bool,
     pub multiline_tabs: bool,
     pub tablist_top: bool,
     pub tablist_hide: bool,
@@ -214,6 +219,7 @@ impl Default for Config {
             focus_new_tabs: true,
             hide_single_tab: false,
             osc133: true,
+            kitty_compatible: true,
             multiline_tabs: true,
             tablist_top: true,
             tablist_hide: false,
@@ -357,6 +363,7 @@ impl Config {
             ("focus_new_tabs".into(), self.focus_new_tabs.to_string()),
             ("hide_single_tab".into(), self.hide_single_tab.to_string()),
             ("osc133".into(), self.osc133.to_string()),
+            ("kitty_compatible".into(), self.kitty_compatible.to_string()),
             ("multiline_tabs".into(), self.multiline_tabs.to_string()),
             ("tablist_top".into(), self.tablist_top.to_string()),
             ("tablist_hide".into(), self.tablist_hide.to_string()),
@@ -601,6 +608,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "osc133" => {
                     if let Some(b) = val.as_bool() {
                         cfg.osc133 = b;
+                    }
+                },
+                "kitty_compatible" => {
+                    if let Some(b) = val.as_bool() {
+                        cfg.kitty_compatible = b;
                     }
                 },
                 "multiline_tabs" => {

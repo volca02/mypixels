@@ -811,6 +811,7 @@ impl App {
             args,
             &self.listener(),
             self.config.scrollback_lines,
+            self.config.kitty_compatible,
             cwd,
             // The shell learns WHICH window of the session it lives in, so a
             // `mypixels` typed in it joins that window, not window 1. 1-based

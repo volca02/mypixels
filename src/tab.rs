@@ -165,6 +165,7 @@ impl Tab {
         args: Vec<String>,
         shared: &SpikeListener,
         history: usize,
+        kitty_compatible: bool,
         cwd: Option<std::path::PathBuf>,
         window: u32,
     ) -> Tab {
@@ -200,6 +201,22 @@ impl Tab {
         // env setup above is process-global by design; we inherit it).
         unsafe { std::env::set_var("TERM_PROGRAM", "mypixels") };
         unsafe { std::env::set_var("TERM_PROGRAM_VERSION", crate::build_stamp()) };
+        // TERMINAL: the honest corner of kitty alignment. Allowlist-style
+        // detectors (broot among them) grep TERM *or* TERMINAL for
+        // "kitty" and never query; terminfo never reads TERMINAL, so this
+        // advertises without making any terminfo promise TERM alone could
+        // not keep. The "kitty" here is earned, not borrowed: our graphics
+        // and keyboard stacks pass kitty's own reference client. MYPIXELS_TERMINAL
+        // overrides the value; an explicitly empty one claims nothing.
+        if kitty_compatible {
+            let hint = std::env::var("MYPIXELS_TERMINAL")
+                .unwrap_or_else(|_| "mypixels-kitty".to_string());
+            if hint.is_empty() {
+                unsafe { std::env::remove_var("TERMINAL") };
+            } else {
+                unsafe { std::env::set_var("TERMINAL", hint) };
+            }
+        }
         // alacritty_terminal advertises TERM=alacritty. We are not alacritty,
         // and more practically: shells' keybinding setups key off $TERM by
         // glob (the classic zsh `case $TERM in *xterm*)` idiom), and VTE -
