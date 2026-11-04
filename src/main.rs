@@ -2588,6 +2588,33 @@ impl App {
             // races the compositor and the user's own keyboard; these
             // directives speak to the child directly. `line:` appends \n.
             // The FIFO itself only exists when MYPIXELS_KEYS is set.
+            if line == "colors" {
+                // Test hook: dump every OSC-set entry in the terminal's
+                // color table. These override the config palette, so a
+                // shell/rc that emits OSC 4/10/11 can silently repaint
+                // the theme - this shows exactly who did what.
+                let Some(t) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
+                    continue;
+                };
+                let term = t.term.lock();
+                let content = term.renderable_content();
+                let names = [
+                    "fg", "bg", "cursor", "sel_fg", "sel_bg",
+                ];
+                let mut parts = Vec::new();
+                for i in 0..256 {
+                    if let Some(c) = &content.colors[i] {
+                        parts.push(format!("{i}#{:02x}{:02x}{:02x}", c.r, c.g, c.b));
+                    }
+                }
+                for (k, n) in (256..269).zip(names.into_iter().chain(std::iter::repeat("?"))) {
+                    if let Some(c) = &content.colors[k] {
+                        parts.push(format!("{k}{n}#{:02x}{:02x}{:02x}", c.r, c.g, c.b));
+                    }
+                }
+                log::info!("COLORS [{}]", parts.join(" "));
+                continue;
+            }
             if let Some(rest) =
                 line.strip_prefix("text:").or_else(|| line.strip_prefix("line:"))
             {

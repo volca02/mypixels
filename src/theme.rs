@@ -447,6 +447,14 @@ pub fn configure(cfg: &mut Config, value: &Value, base: &Path) -> Result<(), Str
         .replace('_', "-");
     if let Some(name) = name {
         if !matches!(normalized.as_str(), "" | "default" | "wal") {
+            // A theme owns the 16-slot palette. The UI's save writes the
+            // theme's colors back into the file as `palette:`/`col_*` copy
+            // lines for theme-ignorant tools; when the theme line later
+            // changes by hand those copies silently keep the OLD theme's
+            // indexed colors alive (the reported "dark parts of ls" under
+            // theme: dracula). Strip the palette copies from the merge so
+            // the theme wins; single-purpose keys (fg/bg/cursor, tab
+            // colors) stay overridable - they are deliberate one-off edits.
             if let Some(text) = builtin(&normalized) {
                 Theme::parse(text)?.apply(cfg);
             } else {
@@ -470,7 +478,34 @@ pub fn configure(cfg: &mut Config, value: &Value, base: &Path) -> Result<(), Str
             }
         }
     }
-    crate::config::merge(cfg, value);
+    // A theme owns the 16-slot palette. The UI's save writes the theme's
+    // colors back into the file as `palette:`/`col_*` copy lines for
+    // theme-ignorant tools; when the theme line later changes by hand,
+    // those stale copies silently keep the OLD theme's indexed colors
+    // alive (the reported "dark parts of ls" under theme: dracula). Drop
+    // the palette copies from the merge so the theme wins. Single-purpose
+    // keys (fg/bg/cursor, tab colors) stay overridable - deliberate
+    // one-off edits deserve that.
+    let mut merge_value = value.clone();
+    if !matches!(normalized.as_str(), "" | "default" | "wal") && name.is_some() {
+        if let Some(map) = merge_value.as_mapping_mut() {
+            map.retain(|k, _| {
+                !matches!(
+                    k.as_str(),
+                    Some("palette")
+                        | Some("col_0")
+                        | Some("col_1")
+                        | Some("col_2")
+                        | Some("col_3")
+                        | Some("col_4")
+                        | Some("col_5")
+                        | Some("col_6")
+                        | Some("col_7")
+                )
+            });
+        }
+    }
+    crate::config::merge(cfg, &merge_value);
     if normalized == "wal" && wal.is_none() {
         return Err("theme: wal needs a nonempty wal_palette path".into());
     }

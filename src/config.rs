@@ -1045,3 +1045,34 @@ mod tests {
 pub fn terminal_bg(c: &Config) -> Rgb {
     if c.palette.is_some() { c.background_color } else { c.bg_tint_color }
 }
+#[cfg(test)]
+mod theme_palette_tests {
+    use super::*;
+    #[test]
+    fn theme_supersedes_stale_palette_copy_lines() {
+        // The user's exact trap: theme line added below a years-old custom
+        // palette + col_* copies from an older theme save. The theme must
+        // own the 16 slots; fg/bg stay file-overridable.
+        let text = "col_0: '#141413'\ncol_4: '#0a9dff'\n\
+            palette: \"#141413:#ff2c4b:#aeee00:#fade3e:#0a9dff:#ff9eb8:#8cffba:#d9cec3:\
+            #000000:#ff2c4b:#aeee00:#ffa724:#0a9dff:#ff9eb8:#8cffba:#ffffff\"\n\
+            foreground_color: '#f8f8f2'\nbackground_color: '#282a36'\ntheme: 'dracula'\n";
+        let cfg = Config::from_text(text, std::path::Path::new(".")).unwrap();
+        let p = cfg.palette.expect("theme supplies the palette");
+        assert_eq!(p[0], Rgb(0x21, 0x22, 0x2c), "dracula black, not stale #141413");
+        assert_eq!(p[4], Rgb(0xbd, 0x93, 0xf9), "dracula blue, not stale #0a9dff");
+        assert_eq!(cfg.foreground_color, Rgb(0xf8, 0xf8, 0xf2), "explicit fg still wins");
+        // No theme: the palette lines are the config, untouched.
+        // No theme, and wal explicitly disabled: the palette line is the
+        // config, untouched. (Without `wal_palette: ''` a live
+        // ~/.cache/wal/colors.yml would win by design - implicit wal is
+        // the default when no theme is named.)
+        let cfg = Config::from_text(
+            "wal_palette: ''\npalette: \"#141413:#ff2c4b:#aeee00:#fade3e:#0a9dff:#ff9eb8:#8cffba:#d9cec3:#000000:#ff2c4b:#aeee00:#ffa724:#0a9dff:#ff9eb8:#8cffba:#ffffff\"\n",
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(cfg.palette.unwrap()[2], Rgb(0xae, 0xee, 0x00));
+        assert_eq!(cfg.palette.unwrap()[2], Rgb(0xae, 0xee, 0x00));
+    }
+}
