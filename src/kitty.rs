@@ -604,6 +604,17 @@ fn raw_rgba(bytes: &[u8], format: u32, w: u32, h: u32) -> Option<(u32, u32, Vec<
 fn decode_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let reader = std::io::Cursor::new(bytes);
     let mut decoder = png::Decoder::new(reader);
+    // Let the crate own every pixel-format problem: palettes expand to
+    // color, tRNS to alpha, 16-bit samples strip to 8, sub-byte gray
+    // scales to bytes. (The original code read each frame into a fixed
+    // w*h*4 buffer and TRUSTED it to be RGBA. A plain RGB8 screenshot -
+    // grim, hyprshot, any color-type-2 PNG - decodes to 3 bytes/pixel,
+    // and re-read at a 4-byte stride it shears one byte per pixel into
+    // diagonal "interlaced" garbage. Transformations first, then only
+    // the remaining channel counts are ours to convert.)
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
     let Ok(mut reader) = decoder.read_info() else { return None };
     // Dimensions come from the header and are bounded BEFORE any pixel
     // allocation: the output buffer below is the decoder's only canvas,
@@ -614,9 +625,50 @@ fn decode_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         log::warn!("kitty: image {w}x{h} out of bounds, dropped");
         return None;
     }
-    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-    reader.next_frame(&mut buf).ok()?;
-    Some((w, h, buf))
+    let size = reader.output_buffer_size();
+    let mut raw = vec![0u8; size];
+    // next_frame's OutputInfo is the truth about what was written (info()
+    // still describes the file header); ALPHA above usually made it RGBA
+    // already, and the test suite proved both readings occur.
+    let out_info = reader.next_frame(&mut raw).ok()?;
+    let rgba = to_rgba8(&raw, out_info.color_type, w, h)?;
+    Some((w, h, rgba))
+}
+
+/// Shapes the transformations can still hand us at 8-bit: RGBA passes
+/// through; RGB/Gray/Grayalpha grow into it. Anything else is refused -
+/// silently guessing is what produced the shear in the first place.
+fn to_rgba8(raw: &[u8], ct: png::ColorType, w: u32, h: u32) -> Option<Vec<u8>> {
+    use png::ColorType as C;
+    let px = w as usize * h as usize;
+    match ct {
+        C::Rgba if raw.len() >= px * 4 => Some(raw[..px * 4].to_vec()),
+        C::Rgb if raw.len() >= px * 3 => {
+            let mut out = Vec::with_capacity(px * 4);
+            for p in raw[..px * 3].chunks_exact(3) {
+                out.extend_from_slice(&[p[0], p[1], p[2], 255]);
+            }
+            Some(out)
+        },
+        C::Grayscale if raw.len() >= px => {
+            let mut out = Vec::with_capacity(px * 4);
+            for &g in &raw[..px] {
+                out.extend_from_slice(&[g, g, g, 255]);
+            }
+            Some(out)
+        },
+        C::GrayscaleAlpha if raw.len() >= px * 2 => {
+            let mut out = Vec::with_capacity(px * 4);
+            for p in raw[..px * 2].chunks_exact(2) {
+                out.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
+            }
+            Some(out)
+        },
+        other => {
+            log::warn!("kitty: png color type {other:?} unsupported, frame dropped");
+            None
+        },
+    }
 }
 
 #[cfg(test)]
@@ -651,6 +703,42 @@ mod tests {
             v.extend_from_slice(data);
         }
         v
+    }
+
+    /// Build an arbitrary-shape PNG through the encoder, so fixtures stay
+    /// honest about what real encoders (grim, hyprshot, IM) emit.
+    fn enc_png(w: u32, h: u32, ct: png::ColorType, data: &[u8], pal: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(ct);
+            enc.set_depth(png::BitDepth::Eight);
+            if let Some(p) = pal {
+                enc.set_palette(p);
+            }
+            let mut wt = enc.write_header().unwrap();
+            wt.write_image_data(data).unwrap();
+            wt.finish().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn png_color_types_all_reach_the_gpu_as_rgba() {
+        // The hyprshot case: color type 2. Decoded at a 4-byte stride
+        // unchecked, this is the diagonal shear; here it must be exact.
+        let rgb = enc_png(2, 1, png::ColorType::Rgb, &[1, 2, 3, 4, 5, 6], None);
+        let (w, h, rgba) = decode_png(&rgb).unwrap();
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(rgba, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        // Grayscale 8.
+        let g = enc_png(2, 1, png::ColorType::Grayscale, &[7, 9], None);
+        let (_, _, rgba) = decode_png(&g).unwrap();
+        assert_eq!(rgba, vec![7, 7, 7, 255, 9, 9, 9, 255]);
+        // Palette (index) expands through the crate's EXPAND.
+        let p = enc_png(2, 1, png::ColorType::Indexed, &[0, 1], Some(&[20, 21, 22, 40, 41, 42]));
+        let (_, _, rgba) = decode_png(&p).unwrap();
+        assert_eq!(rgba, vec![20, 21, 22, 255, 40, 41, 42, 255]);
     }
 
     #[test]

@@ -2583,6 +2583,26 @@ impl App {
                 }
                 continue;
             }
+            // Test hooks: raw pty writes to the active tab. Composing a
+            // shell command out of key specs (or uinput) is how a harness
+            // races the compositor and the user's own keyboard; these
+            // directives speak to the child directly. `line:` appends \n.
+            // The FIFO itself only exists when MYPIXELS_KEYS is set.
+            if let Some(rest) =
+                line.strip_prefix("text:").or_else(|| line.strip_prefix("line:"))
+            {
+                let nl = line.starts_with("line:");
+                if let Some(t) =
+                    self.wins[self.cur].tabs.get(self.wins[self.cur].active)
+                {
+                    let mut bytes = rest.as_bytes().to_vec();
+                    if nl {
+                        bytes.push(b'\n');
+                    }
+                    t.write(&bytes);
+                }
+                continue;
+            }
             if let Some((mods, key)) = parse_key_spec(line) {
                 self.modifiers = mods;
                 // Mirror the real path's egui-first routing: while an egui
