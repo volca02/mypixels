@@ -1314,7 +1314,11 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                // mypixels patch: answer as the VT220-class terminal we
+                // behave as, and (practical) note that kitty's icat parser
+                // discards replies shorter than `?6c` - a bare `?6c` reads
+                // as "not a real terminal" to it. No `6`: we speak no sixel.
+                let text = String::from("\x1b[?62;9;15;22c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {

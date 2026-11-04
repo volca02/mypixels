@@ -428,6 +428,10 @@ struct App {
     pty_writes_ring: Arc<std::sync::Mutex<Vec<(usize, String)>>>,
     resets_ring: Arc<std::sync::Mutex<Vec<usize>>>,
     cell_sizes_ring: Arc<std::sync::Mutex<Vec<usize>>>,
+    /// MYPIXELS_APC_DUMP=<file>: append every graphics frame verbatim for
+    /// offline replay (tests a real sender's exact bytes against the
+    /// parser). Debug hook, off by default.
+    apc_dump: Option<std::path::PathBuf>,
     /// Per-tab Kitty graphics state, keyed by stable tab id; created on
     /// first use, removed when the tab dies.
     kitty: std::collections::HashMap<usize, kitty::TabKitty>,
@@ -724,6 +728,7 @@ impl App {
             pty_writes_ring: pty_writes,
             resets_ring: resets,
             cell_sizes_ring: cell_sizes,
+            apc_dump: std::env::var("MYPIXELS_APC_DUMP").ok().map(std::path::PathBuf::from),
             kitty: Default::default(),
             sem_blocks: Default::default(),
             session_rx,
@@ -3000,6 +3005,13 @@ impl App {
         let evs: Vec<(usize, Vec<u8>, usize, usize)> =
             std::mem::take(&mut *self.apcs_ring.lock().unwrap());
         for (tab_id, payload, line, col) in evs {
+            if let Some(path) = &self.apc_dump.clone() {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "APCFRAME {tab_id} {line} {col} {}", payload.len());
+                    let _ = f.write_all(&payload);
+                }
+            }
             let live = self.wins.iter().any(|w| w.tabs.iter().any(|t| t.id == tab_id));
             if !live {
                 continue;

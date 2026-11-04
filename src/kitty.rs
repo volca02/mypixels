@@ -69,6 +69,10 @@ pub struct Placement {
 /// An in-progress chunked transfer.
 struct Pending {
     id: u32,
+    /// True when the sender named an id: unnamed (id=0) traffic must stay
+    /// unacked, even though we give the image an internal id so several
+    /// transient images can coexist.
+    named: bool,
     display: bool,
     format: u32,
     px_w: u32,
@@ -190,25 +194,45 @@ impl TabKitty {
         let action = get(b'a').and_then(|v| v.first()).copied().unwrap_or(b't');
         let more = num(b'm') == 1;
 
-        // Interrogation: answer truthfully about the subset implemented.
-        // `f=24,32,100` (raw RGB, raw RGBA, PNG), no `o=` field at all
-        // (no compression). A
-        // sender that reads this honestly will send plain base64 PNG in
-        // chunks, which is exactly what this terminal can do; senders that
-        // demand zlib or raw RGB are told the truth by absence.
+        // Interrogation. The spec's answer is minimal and this is NOT
+        // negotiable on shape: `ESC_G i=<id>;OK ESC\`. (A richer `:OK,f=`
+        // dialect is not in the protocol; `kitten icat --detect-support`
+        // ignores anything else and times out.) Support for a format is
+        // demonstrated by answering a query that ASKED about that format;
+        // we answer for the formats we actually decode: f=24/32/100.
+        // Feature queries (`e=<action>`, kitty 0.50): echo `e` only for
+        // actions we implement, so absence says "no" without a lie.
         if action == b'q' {
             let id = num(b'i');
-            let msg = format!("\x1b_G:OK,a=i,f=24,32,100,i={id};mypixels\x1b\\");
+            // Only direct transfer exists here. Answering OK to a
+            // tmpfile/shared-memory probe would advertise a medium this
+            // terminal then fails to read - any non-OK message reads as
+            // "no" to clients.
+            if matches!(get(b't'), Some(b"t") | Some(b"s") | Some(b"f")) {
+                return format!("\x1b_Gi={id};ENOTSUP:only direct transfer\x1b\\").into_bytes();
+            }
+            let msg = match get(b'e') {
+                Some(e) if e == b"T" => format!("\x1b_Gi={id},e=T;OK\x1b\\"),
+                // Known non-default-free actions: we transmit and place, so
+                // plain OK; unknown/`f` (animation): no `e` in the reply,
+                // which is exactly how the spec spells "not supported".
+                Some(_) => format!("\x1b_Gi={id};OK\x1b\\"),
+                None => format!("\x1b_Gi={id};OK\x1b\\"),
+            };
             return msg.into_bytes();
         }
         // Other unknown actions: ignored. Answering `q` is above; anything
         // else would just be noise on the wire.
+        // Placement acks, spec-mandated: requests that name an image id get
+        // `i=<id>[,p=<pid>];OK` back on success, ENOENT when the id is
+        // unknown. Callers sync state on that reply - silence reads as
+        // loss and provokes retransmission storms.
 
         // Continuation, shape two: a frame carrying neither `a` nor `i`
         // while a transfer lives can only belong to it.
         if self.pending.is_some() && get(b'a').is_none() && get(b'i').is_none() {
             if append(self, data) && !more {
-                self.complete_pending();
+                return self.complete_pending();
             }
             return Vec::new();
         }
@@ -233,7 +257,7 @@ impl TabKitty {
                     .is_some_and(|p| p.id == id && (p.display == (action == b'T')));
                 if repeat {
                     if append(self, data) && !more {
-                        self.complete_pending();
+                        return self.complete_pending();
                     }
                     return Vec::new();
                 }
@@ -241,6 +265,7 @@ impl TabKitty {
                 // the old: the spec's resync rule.
                 let mut p = Pending {
                     id,
+                    named: num(b'i') != 0,
                     display: action == b'T',
                     format,
                     px_w: num(b's') as u32,
@@ -260,13 +285,19 @@ impl TabKitty {
                 }
                 self.pending = Some(p);
                 if append(self, data) && !more {
-                    self.complete_pending();
+                    return self.complete_pending();
                 }
+                return Vec::new();
             },
             b'p' => {
                 let id = num(b'i') as u32;
                 if !self.images.contains_key(&id) {
-                    return Vec::new();
+                    let ack = if id != 0 {
+                        format!("\x1b_Gi={id};ENOENT:image not found\x1b\\").into_bytes()
+                    } else {
+                        Vec::new()
+                    };
+                    return ack;
                 }
                 let placement_id = {
                     let p = num(b'p') as u32;
@@ -287,6 +318,15 @@ impl TabKitty {
                     y_off: num(b'y') as u32,
                     z: num(b'z') as u32 as i32,
                 });
+                if id != 0 {
+                    let pkey = num(b'p');
+                    let ack = if pkey != 0 {
+                        format!("\x1b_Gi={id},p={placement_id};OK\x1b\\")
+                    } else {
+                        format!("\x1b_Gi={id};OK\x1b\\")
+                    };
+                    return ack.into_bytes();
+                }
             },
             b'd' => {
                 let id = num(b'i') as u32;
@@ -317,8 +357,10 @@ impl TabKitty {
         }
     }
 
-    fn complete_pending(&mut self) {
-        let Some(p) = self.pending.take() else { return };
+    /// Finishes an open transfer; returns the display ack, if this
+    /// transfer was also a display (`a=T`) of a named image.
+    fn complete_pending(&mut self) -> Vec<u8> {
+        let Some(p) = self.pending.take() else { return Vec::new() };
         if p.id >= self.next_id {
             self.next_id = p.id + 1;
         }
@@ -328,7 +370,7 @@ impl TabKitty {
                 Some(mut t) => bytes.append(&mut t),
                 None => {
                     log::warn!("kitty: base64 decode failed, frame dropped");
-                    return;
+                    return Vec::new();
                 },
             }
         }
@@ -338,7 +380,7 @@ impl TabKitty {
                 Some(img) => img,
                 None => {
                     log::warn!("kitty: png decode failed, frame dropped");
-                    return;
+                    return Vec::new();
                 },
             },
             // Raw RGB/RGBA (f=24/f=32): no header to learn geometry from,
@@ -348,16 +390,21 @@ impl TabKitty {
                 Some(img) => img,
                 None => {
                     log::warn!("kitty: raw f={f} rejected ({}x{}, {} bytes)", p.px_w, p.px_h, src.len());
-                    return;
+                    return Vec::new();
                 },
             },
             other => {
                 log::warn!("kitty: format {other} not supported, frame dropped");
-                return;
+                return Vec::new();
             },
         };
         let generation = self.images.get(&p.id).map(|old| old.generation + 1).unwrap_or(0);
         self.images.insert(p.id, KittyImage { width: rgba.0, height: rgba.1, rgba: rgba.2, source: src, generation });
+        let ack = if p.display && p.named {
+            format!("\x1b_Gi={};OK\x1b\\", p.id).into_bytes()
+        } else {
+            Vec::new()
+        };
         while self.images.len() > MAX_IMAGES {
             // Evict an image nothing displays, oldest id order aside -
             // any unreferenced one will do; the cap is a flood gate, not
@@ -387,6 +434,7 @@ impl TabKitty {
                 z: p.z,
             });
         }
+        ack
     }
 
     /// Placements in paint order: z first, then anchor (the grid's own
@@ -613,12 +661,29 @@ mod tests {
     fn interrogation_answers_truthfully() {
         let mut k = TabKitty::default();
         let r = k.on_apc(&apc("a=q,i=1", &[]), 1, 0);
-        let r = String::from_utf8(r).unwrap();
-        assert!(r.starts_with("\x1b_G:OK,a=i,f=24,32,100,i=1;"), "{r:?}");
-        // No `o=` field: no compression is claimed.
-        assert!(!r.contains(",o="), "{r:?}");
-        // Ordinary frames answer nothing.
+        // Exact spec shape: ESC_G i=<id>;OK ST - `kitten icat
+        // --detect-support` parses for nothing else.
+        assert_eq!(r, b"\x1b_Gi=1;OK\x1b\\");
+        // Feature query (0.50): e echoes only what is implemented.
+        assert_eq!(k.on_apc(&apc("a=q,i=2,e=T", &[]), 1, 0), b"\x1b_Gi=2,e=T;OK\x1b\\");
+        assert_eq!(k.on_apc(&apc("a=q,i=3,e=f", &[]), 1, 0), b"\x1b_Gi=3;OK\x1b\\"); // no animation
+        // icat's exact detection query.
+        assert_eq!(k.on_apc(&apc("i=31,s=1,v=1,a=q,t=d,f=24", b"AAAA"), 1, 0), b"\x1b_Gi=31;OK\x1b\\");
+        // icat 0.49 also probes tmpfile/shm mediums: only non-OK says no.
+        let r = String::from_utf8(k.on_apc(&apc("a=q,t=t,i=2,s=1,v=1,f=24", &b64(b"/tmp/x")), 1, 0)).unwrap();
+        assert!(r.contains("ENOTSUP") && !r.contains(";OK"), "{r:?}");
+        let r = String::from_utf8(k.on_apc(&apc("a=q,t=s,i=3,s=1,v=1,f=24", &b64(b"/icat-x")), 1, 0)).unwrap();
+        assert!(r.contains("ENOTSUP") && !r.contains(";OK"), "{r:?}");
+        // Transfer-only frames answer nothing; named DISPLAYS ack.
         assert!(k.on_apc(&apc("a=t,i=5,f=100", &b64(&tiny_png())), 1, 0).is_empty());
+        assert_eq!(k.on_apc(&apc("a=T,i=7,f=100", &b64(&tiny_png())), 1, 0), b"\x1b_Gi=7;OK\x1b\\");
+        // Placement of a known id acks (with p= when one was requested);
+        // of an unknown id it says ENOENT so the client can resync.
+        assert_eq!(k.on_apc(&apc("a=p,i=7", &[]), 2, 0), b"\x1b_Gi=7;OK\x1b\\");
+        assert_eq!(k.on_apc(&apc("a=p,i=7,p=42", &[]), 2, 0), b"\x1b_Gi=7,p=42;OK\x1b\\");
+        assert_eq!(k.on_apc(&apc("a=p,i=99", &[]), 2, 0), b"\x1b_Gi=99;ENOENT:image not found\x1b\\");
+        // Unnamed traffic stays unacked - silence is the spec for id=0.
+        assert!(k.on_apc(&apc("a=T,f=100", &b64(&tiny_png())), 3, 0).is_empty());
     }
 
     #[test]
