@@ -422,7 +422,7 @@ struct App {
     /// every BEL as (tab_id, time), drained into attention + pulses
     bell_pings: Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
     /// OSC 133 marks as dispatched, drained into per-tab command blocks
-    sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize, usize, bool)>>>,
+    sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize, usize, usize, bool)>>>,
     /// Opens an order stamp per command (see `CommandBlock::seq`).
     sem_seq: u64,
     /// Complete APC strings awaiting graphics interpretation.
@@ -3011,13 +3011,13 @@ impl App {
     /// time; this only associates marks into blocks and forgets tabs that
     /// are gone (a mark racing its tab's death is simply irrelevant).
     fn drain_sems(&mut self) {
-        let evs: Vec<(usize, u8, Option<i32>, usize, usize, bool)> =
+        let evs: Vec<(usize, u8, Option<i32>, usize, usize, usize, bool)> =
             std::mem::take(&mut *self.sems_ring.lock().unwrap());
         if !self.config.osc133 {
             return;
         }
         let cap = self.config.history_block_bytes;
-        for (tab_id, code, exit, line, row, alt) in evs {
+        for (tab_id, code, exit, line, row, col, alt) in evs {
             // The tab the mark belongs to, wherever it lives now.
             let tab = match self
                 .wins
@@ -3065,11 +3065,14 @@ impl App {
             // D's cursor line is the fresh row the next prompt will
             // paint: the output is above it. +1 includes a final
             // partial line; max() keeps at least the prompt row itself.
-            // One row of slack: the prompt row of the NEXT command may
-            // share the physical row D's cursor sits on. The byte
-            // budget charges blocks for that padding, eviction
-            // included, so the two sides agree on what is held.
-            let to = (row + 1).saturating_sub(base).max(from + 1);
+            // D's cursor column says whether the command's last line
+            // ended with a newline: col 0 means the cursor sits on a
+            // fresh row the output never touched, so that row (which
+            // the next prompt will paint, and HAS painted by the time
+            // we capture) must stay out. col > 0 means output shares
+            // the row - include it, prompt smear and all; there is no
+            // way to split a row the terminal already merged.
+            let to = if col > 0 { row + 1 } else { row }.saturating_sub(base).max(from + 1);
             if let Some((txt, readable, _)) = tab.capture_rows(from, to) {
                 b.truncated_head |= b.start_global < base || readable > from;
                 push_block_text(b, &txt, cap);
@@ -4419,9 +4422,15 @@ fn apply_sem_mark(
 /// full-screen-program notes ride along as comments; a block that
 /// captured nothing still says so rather than vanishing.
 fn format_last_output(q: &std::collections::VecDeque<CommandBlock>, n: usize) -> String {
-    // The newest n blocks, emitted oldest-first: the newest command
-    // lands last, right where the eye already is - the prompt below.
-    let blocks: Vec<&CommandBlock> = q.iter().rev().take(n).rev().collect();
+    // The newest n blocks that actually have something to show, emitted
+    // oldest-first: the newest command lands last, right where the eye
+    // already is - the prompt below. v1 captures a block's text only at
+    // its D mark, so the very command that invoked this query - still
+    // open, therefore textless - would otherwise occupy slot 1 of
+    // `last 1 --copy` and copy nothing. It is skipped, not listed.
+    let mut blocks: Vec<&CommandBlock> =
+        q.iter().rev().filter(|b| b.done || !b.text.is_empty()).take(n).collect();
+    blocks.reverse();
     let mut out = String::new();
     for (i, b) in blocks.iter().enumerate() {
         if blocks.len() > 1 {
@@ -6068,6 +6077,20 @@ mod sem_tests {
         assert!(out.contains("2 of 2 · ok"));
         // Chronological: newest last, beside the prompt the user reads next.
         assert!(out.find("one").unwrap() < out.find("two").unwrap());
+    }
+
+    #[test]
+    fn the_running_query_command_yields_its_slot() {
+        // `mypixels last 1 --copy` runs AS a command: its own block is
+        // open and textless. The answer must be the last finished
+        // command, not an empty copy.
+        let mut q: VecDeque<super::CommandBlock> = VecDeque::new();
+        apply_sem_mark(&mut q, 0, None, 0, 0, false, 1);
+        apply_sem_mark(&mut q, 3, Some(0), 4, 4, false, 1);
+        q.back_mut().unwrap().text = "echoed\n".into();
+        apply_sem_mark(&mut q, 0, None, 5, 5, false, 2); // the query itself
+        let out = super::format_last_output(&q, 1);
+        assert_eq!(out, "echoed\n", "the live query block is skipped, not served");
     }
 
     #[test]

@@ -45,6 +45,14 @@ const PATH: &str = "/com/github/volca/mypixels/Session";
 /// per-display exactly as the original's GApplication id is: an X11 instance
 /// must never adopt a Wayland tab request, or vice versa.
 pub fn bus_name() -> Option<String> {
+    // MYPIXELS_BUS names a private session: a test (or a second parallel
+    // session on one display) hosts and queries a name the display's real
+    // session never sees - and cannot disturb.
+    if let Ok(v) = std::env::var("MYPIXELS_BUS") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
     let disp = std::env::var("WAYLAND_DISPLAY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -159,14 +167,15 @@ async fn serve(
                         let (send, reply_rx) = futures::channel::oneshot::channel();
                         let _ = tx.send(Request::LastOutput { window, n, copy: copy != 0, respond: send });
                         wake();
-                        if copy == 0 {
-                            // The querying client wants the text back;
-                            // a departed app answers empty, never hangs.
-                            let text = reply_rx.await.unwrap_or_default();
-                            let reply = zbus::Message::method_return(&header)?.build(&(text,))?;
-                            conn.send(&reply).await?;
-                            continue; // acknowledged already, on this path
-                        }
+                        // Both modes hold the reply until the app has
+                        // acted: answering a --copy early would let the
+                        // querying command finish, close its own command
+                        // block, and then BE the newest output copied.
+                        // A departed app answers empty, never hangs.
+                        let text = reply_rx.await.unwrap_or_default();
+                        let reply = zbus::Message::method_return(&header)?.build(&(text,))?;
+                        conn.send(&reply).await?;
+                        continue; // acknowledged on this path
                     }
                     Err(e) => log::warn!("session bus: bad LastOutput body: {e}"),
                 }
@@ -248,6 +257,8 @@ async fn remote_last_async(name: &str, n: u64, copy: bool) -> zbus::Result<Optio
     let reply = conn
         .call_method(Some(name), PATH, Some(IFACE), "LastOutput", &(window, n, copy as u8))
         .await?;
+    // Both modes get the text back (the copy already happened inside the
+    // terminal, where the clipboard lives); the display mode prints it.
     let (text,) = reply.body().deserialize::<(String,)>()?;
     Ok(Some(text))
 }

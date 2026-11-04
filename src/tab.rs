@@ -51,10 +51,10 @@ pub struct SpikeListener {
     /// Tabs whose application just asked (CSI 16 t) for the cell size.
     pub cell_sizes: Arc<Mutex<Vec<usize>>>,
     /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line,
-    /// eviction-proof row id, alt-screen flag). Order per tab is the
-    /// stream's own; the app folds them into command blocks (see
-    /// `App::drain_sems`).
-    pub sems: Arc<Mutex<Vec<(usize, u8, Option<i32>, usize, usize, bool)>>>,
+    /// eviction-proof row id, cursor column, alt-screen flag). Order per
+    /// tab is the stream's own; the app folds them into command blocks
+    /// (see `App::drain_sems`).
+    pub sems: Arc<Mutex<Vec<(usize, u8, Option<i32>, usize, usize, usize, bool)>>>,
 }
 
 impl SpikeListener {
@@ -91,9 +91,9 @@ impl EventListener for SpikeListener {
             Event::Apc { payload, line, col } => {
                 self.apcs.lock().unwrap().push((self.tab_id, payload, line, col));
             },
-            Event::Semantic { code, exit, line, row, alt, .. } => {
-                log::debug!("sem mark tab {} code {} exit {:?} line {} row {} alt {}", self.tab_id, code, exit, line, row, alt);
-                self.sems.lock().unwrap().push((self.tab_id, code, exit, line, row, alt));
+            Event::Semantic { code, exit, line, row, col, alt } => {
+                log::debug!("sem mark tab {} code {} exit {:?} line {} row {} col {} alt {}", self.tab_id, code, exit, line, row, col, alt);
+                self.sems.lock().unwrap().push((self.tab_id, code, exit, line, row, col, alt));
             },
             Event::Bell => {
                 log::info!("bell received (tab {})", self.tab_id);
