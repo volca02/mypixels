@@ -73,6 +73,16 @@ tooling:
    scrollback depth. Streaming extraction while a command runs (per
    input drain) is needed for blocks larger than scrollback, else the
    head of the output evicts before the block closes.
+2b. **Compress pool blocks with a fast codec (LATER).** Block text is
+   plain output - lz4/zstd level-1 typically gives 3-6x on terminal text,
+   turning the 32 MB budget into ~100-200 MB of effective memory at a
+   microsecond-per-MB cost on append. Compress per-block at close (the D
+   mark), keep the in-progress block uncompressed (it is appended hot),
+   decompress lazily on query. `flate2` is already in the tree (png);
+   `lz4_flex` or fast-mode zstd would be the first direct addition.
+   Same lever could shrink scrollback itself (kitty-style line storage),
+   but that means rewriting the vendored fixed-cell grid - a separate,
+   much bigger project; do NOT conflate them.
 3. **`mypixels last [n] [--copy]`** over the session bus: `last | grep
    error`, `last 2 --copy`. One extraction core serves this, the
    `copy_last_output` action, and MCP - transports stay thin.
