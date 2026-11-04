@@ -1830,23 +1830,23 @@ impl App {
 
         // Window background
         // The terminal background is the only translucent layer, matching the
-        // original: it sets VTE's background to alpha = 1 - term_opacity and
-        // leaves the tab strip opaque. `term_opacity` is therefore an amount of
-        // *transparency*, not of opacity -- 0.1 means 10% see-through.
-        let term_opacity = effective_opacity(self.config.term_opacity);
-        let bg_a = if gpu.alpha_ok && term_opacity > 0.0 {
-            1.0 - term_opacity
+        // original: it sets VTE's background to alpha = 1 - transparency and
+        // leaves the tab strip opaque. `term_transparency` is therefore an
+        // amount of *transparency*, not of opacity -- 0.1 means 10% see-through.
+        let transparency = effective_transparency(self.config.term_transparency);
+        let bg_a = if gpu.alpha_ok && transparency > 0.0 {
+            1.0 - transparency
         } else {
             1.0
         };
         static BG_LOG: std::sync::Once = std::sync::Once::new();
         BG_LOG.call_once(|| {
             log::info!(
-                "background alpha {:.3} (alpha_ok {}, term_opacity {:.2} -> effective {:.2}, surface alpha {:?})",
+                "background alpha {:.3} (alpha_ok {}, term_transparency {:.2} -> effective {:.2}, surface alpha {:?})",
                 bg_a,
                 gpu.alpha_ok,
-                self.config.term_opacity,
-                term_opacity,
+                self.config.term_transparency,
+                transparency,
                 gpu.config.alpha_mode
             );
         });
@@ -3942,7 +3942,7 @@ impl App {
                             .with_maximized(self.config.default_maximize)
                             // Only worth requesting when we will use it: an
                             // ARGB visual costs the compositor a second blend.
-                            .with_transparent(self.config.term_opacity > 0.0)
+                            .with_transparent(self.config.term_transparency > 0.0)
                             .with_title("mypixels")
                             // Compositor identity: this is the wayland app_id
                             // (and the X11 WM_CLASS), which the original set
@@ -5166,11 +5166,12 @@ impl ApplicationHandler for App {
 }
 
 /// TEMPORARY compensation for the difference between our one alpha stage and the
-/// original's, applied by default; `MYPIXELS_OPACITY` replaces it outright.
+/// original's, applied by default; `MYPIXELS_TRANSPARENCY` (or the deprecated
+/// `MYPIXELS_OPACITY`) replaces it outright.
 ///
 /// Two readings from the user, at the values actually used:
-///   term_opacity 0.1 -> ours too dark (needs to be more see-through)
-///   term_opacity 0.6 -> ours too transparent (needs to be less see-through)
+///   transparency 0.1 -> ours too dark (needs to be more see-through)
+///   transparency 0.6 -> ours too transparent (needs to be less see-through)
 /// The first wants eff > x, the second eff < x, so the correction must cross and
 /// no constant or scale factor can do it. Modelled as a bump that ramps in over
 /// the first tenth and a flatter slope above it:
@@ -5180,10 +5181,11 @@ impl ApplicationHandler for App {
 /// the likely real cause is that VTE composites its *text* inside the translucent
 /// layer as well, which lifts the whole appearance rather than the background.
 /// Re-check after the window/tint layer is modelled; then keep or delete this.
-fn effective_opacity(cfg: f32) -> f32 {
+fn effective_transparency(cfg: f32) -> f32 {
     static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     let over = *OVERRIDE.get_or_init(|| {
-        std::env::var("MYPIXELS_OPACITY")
+        std::env::var("MYPIXELS_TRANSPARENCY")
+            .or_else(|_| std::env::var("MYPIXELS_OPACITY"))
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))

@@ -116,7 +116,14 @@ pub struct Config {
     pub default_width: u32,
     pub default_height: u32,
     pub default_maximize: bool,
-    pub term_opacity: f32,
+    /// Amount of *transparency*: 0 = opaque, 1 = fully see-through. Named
+    /// for what it does; the inverted `term_opacity` spelling it replaces is
+    /// still parsed (see term_opacity_legacy).
+    pub term_transparency: f32,
+    /// Deprecated `term_opacity:` value, kept only so a file predating the
+    /// rename keeps working. The new key always wins when both are present.
+    term_opacity_legacy: Option<f32>,
+    transparency_explicit: bool,
     pub bg_tint_color: Rgb,
     pub tab_format: String,
     pub tab_prepend: Option<String>,
@@ -228,7 +235,9 @@ impl Default for Config {
             default_width: 640,
             default_height: 480,
             default_maximize: false,
-            term_opacity: 0.1,
+            term_transparency: 0.1,
+            term_opacity_legacy: None,
+            transparency_explicit: false,
             bg_tint_color: parse_hex("#140008"),
             tab_format: "<span %(color)s>%(tcorner)s%(entangled)s%(tname)s]</span>".to_string(),
             tab_prepend: Some("clock".to_string()),
@@ -308,6 +317,15 @@ impl Config {
         if !value.is_mapping() { return Err("Configuration must be a YAML mapping".into()); }
         let mut cfg = Self::default();
         crate::theme::configure(&mut cfg, &value, base)?;
+        // Legacy `term_opacity:` feeds the renamed setting only when the
+        // file does not carry the new key - file order cannot matter, and a
+        // save (which only ever writes the new key) supersedes the stale
+        // old line that replace-in-place cannot remove.
+        if let Some(legacy) = cfg.term_opacity_legacy {
+            if !cfg.transparency_explicit {
+                cfg.term_transparency = legacy;
+            }
+        }
         cfg.theme_files.sort();
         cfg.theme_files.dedup();
         Ok(cfg)
@@ -339,7 +357,7 @@ impl Config {
         let mut keys = vec![
             ("term_font".into(), str_(&self.term_font)),
             ("tablist_font".into(), str_(&self.tablist_font)),
-            ("term_opacity".into(), self.term_opacity.to_string()),
+            ("term_transparency".into(), self.term_transparency.to_string()),
             ("scrollback_lines".into(), self.scrollback_lines.to_string()),
             ("background_color".into(), rgb(&self.background_color)),
             ("foreground_color".into(), rgb(&self.foreground_color)),
@@ -562,7 +580,13 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 },
                 "term_opacity" => {
                     if let Some(f) = val.as_f64() {
-                        cfg.term_opacity = f.clamp(0.0, 1.0) as f32;
+                        cfg.term_opacity_legacy = Some(f.clamp(0.0, 1.0) as f32);
+                    }
+                },
+                "term_transparency" => {
+                    if let Some(f) = val.as_f64() {
+                        cfg.term_transparency = f.clamp(0.0, 1.0) as f32;
+                        cfg.transparency_explicit = true;
                     }
                 },
                 "tab_overview_opacity" => {
@@ -1048,6 +1072,30 @@ pub fn terminal_bg(c: &Config) -> Rgb {
 #[cfg(test)]
 mod theme_palette_tests {
     use super::*;
+    #[test]
+    fn legacy_term_opacity_feeds_term_transparency() {
+        // Files predating the rename keep working...
+        let cfg = Config::from_text("term_opacity: 0.4\n", std::path::Path::new(".")).unwrap();
+        assert!((cfg.term_transparency - 0.4).abs() < 1e-6);
+        // ...but the new key always wins, whatever the file order.
+        let cfg = Config::from_text(
+            "term_opacity: 0.4\nterm_transparency: 0.8\n",
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        assert!((cfg.term_transparency - 0.8).abs() < 1e-6);
+        let cfg = Config::from_text(
+            "term_transparency: 0.8\nterm_opacity: 0.4\n",
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        assert!((cfg.term_transparency - 0.8).abs() < 1e-6);
+        // Saves write only the new spelling.
+        let keys = Config::default().ui_keys();
+        assert!(keys.iter().any(|(k, _)| k == "term_transparency"));
+        assert!(!keys.iter().any(|(k, _)| k == "term_opacity"));
+    }
+
     #[test]
     fn theme_supersedes_stale_palette_copy_lines() {
         // The user's exact trap: theme line added below a years-old custom

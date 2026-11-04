@@ -1234,7 +1234,7 @@ pub fn config_window(
             section(ui, "TRANSPARENCY & WINDOW");
             egui::Grid::new("window").show(ui, |ui| {
                 row(ui, "Transparency", |ui| {
-                    if ui.add(egui::Slider::new(&mut cfg.term_opacity, 0.0..=1.0)).changed() {
+                    if ui.add(egui::Slider::new(&mut cfg.term_transparency, 0.0..=1.0)).changed() {
                         ev.apply = true;
                     }
                 });
