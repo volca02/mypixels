@@ -57,15 +57,22 @@ The OSC 133 blocks (prompt line + exit status) are the seed; these turn
 them into a queryable session memory for shell users **and** for LLM
 tooling:
 
-1. **Scrollback is too small and fixed.** The library default (1000) was
-   silently in use; make `history` a config key, default ~20 000, and
-   measure the cell cost at 4K widths before promising more.
-2. **Command output spooled to files** - "hold those as long as seems
-   reasonable". When a block closes (D mark), snapshot its output text to
-   `$XDG_DATA_HOME/mypixels/history/<tab>/<prompt-line>_exit<N>.txt` while
-   it is still fully in scrollback; prune oldest (bounded per-tab and
-   globally). Files are the observability substrate today; the in-app
-   query core reads the same store.
+1. **Scrollback is small and fixed.** The library default (1000) was
+   silently in use; make `history` a config key. NOT 20 000: a grid line
+   costs width*24+40 bytes (full-width Vec<Cell>, 24 B asserted cell),
+   so 20k lines is ~59 MB per tab at 120 cols. 5 000 (~15 MB/tab) is
+   the sane default; the output pool (#2) is what makes depth cheap.
+2. **Command output held in a memory pool, not files** (decided
+   2026-11-04: little result files around the filesystem are worse than
+   RAM). Per-tab `VecDeque<CmdBlock { exit, cwd, text, truncated, ts }>`
+   fed when a block closes (D mark), LRU-evicted under a GLOBAL byte
+   budget (default 32 MB, config `history_bytes`), per-block cap ~8 MB
+   with an explicit truncation marker, never evicting a tab's newest
+   block. The pool also removes the pressure to grow scrollback huge
+   (#1): a command's text outlives its grid lines by budget, not by
+   scrollback depth. Streaming extraction while a command runs (per
+   input drain) is needed for blocks larger than scrollback, else the
+   head of the output evicts before the block closes.
 3. **`mypixels last [n] [--copy]`** over the session bus: `last | grep
    error`, `last 2 --copy`. One extraction core serves this, the
    `copy_last_output` action, and MCP - transports stay thin.
