@@ -991,6 +991,29 @@ impl App {
                     opened = true;
                 }
                 session::Request::Raise => opened = true,
+                session::Request::LastOutput { window, n, copy, respond } => {
+                    // Fold any marks still in the ring first: the shell
+                    // that typed `mypixels last` emitted its D mark
+                    // moments ago, and that command is exactly what the
+                    // user is asking about.
+                    self.drain_sems();
+                    let win = if window >= 1 && (window as usize) <= self.wins.len() {
+                        window as usize - 1
+                    } else {
+                        self.cur
+                    };
+                    let text = self
+                        .wins
+                        .get(win)
+                        .and_then(|w| w.tabs.get(w.active))
+                        .and_then(|t| self.sem_blocks.get(&t.id))
+                        .map(|q| format_last_output(q, n.max(1) as usize))
+                        .unwrap_or_default();
+                    if copy && !text.is_empty() {
+                        self.copy_text(clipboard::Kind::Clipboard, text.clone());
+                    }
+                    let _ = respond.send(text);
+                }
             }
         }
         if opened {
@@ -4389,6 +4412,53 @@ fn apply_sem_mark(
     }
 }
 
+/// Render the last `n` commands' captured output for `mypixels last`.
+/// A single block is bare text - it is meant to be piped or pasted.
+/// Several blocks get `#` headers carrying position and exit status,
+/// because then the reader is navigating, not consuming. Truncation and
+/// full-screen-program notes ride along as comments; a block that
+/// captured nothing still says so rather than vanishing.
+fn format_last_output(q: &std::collections::VecDeque<CommandBlock>, n: usize) -> String {
+    // The newest n blocks, emitted oldest-first: the newest command
+    // lands last, right where the eye already is - the prompt below.
+    let blocks: Vec<&CommandBlock> = q.iter().rev().take(n).rev().collect();
+    let mut out = String::new();
+    for (i, b) in blocks.iter().enumerate() {
+        if blocks.len() > 1 {
+            let status = match (b.done, b.exit) {
+                (false, _) => "running".into(),
+                (true, Some(0)) => "ok".into(),
+                (true, Some(code)) => format!("exit {code}"),
+                (true, None) => "no status".into(),
+            };
+            out.push_str(&format!(
+                "\n# ── {} of {} · {status} ──\n",
+                i + 1,
+                blocks.len()
+            ));
+        }
+        if b.alt_seen {
+            out.push_str("# (full-screen program; output not captured)\n");
+        } else if b.text.is_empty() && b.done && !b.truncated_head {
+            out.push_str("# (no output captured)\n");
+        } else {
+            out.push_str(&b.text);
+            if !b.text.is_empty() && !b.text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if b.truncated_head || b.truncated_tail {
+            let which = match (b.truncated_head, b.truncated_tail) {
+                (true, true) => "head and tail",
+                (true, false) => "head",
+                _ => "tail",
+            };
+            out.push_str(&format!("# (output truncated: {which})\n"));
+        }
+    }
+    out
+}
+
 /// What a dying tab leaves behind for the reopen ring.
 fn tab_death(tab: &Tab) -> (String, Option<std::path::PathBuf>) {
     (tab.title.lock().unwrap().clone(), tab.cwd_raw())
@@ -5474,6 +5544,10 @@ Options:\n  \
   -n, --new-window   open a new window instead of joining the session\n  \
   -s, --standalone   run a private instance: never join or host a session\n  \
   -h, --help         show this text\n\n\
+  mypixels last [n] [--copy]
+                   show (or clipboard-copy) the last n commands' output\
+                   from the running session's memory pool\
+\
 Without flags, a mypixels window already running on this display is found\n\
 over D-Bus and asked to open a tab for this command, in this directory.\n\
 Typed inside a window, the tab opens in that same window. With no session\n\
@@ -5487,6 +5561,38 @@ to answer -- or with -n -- this process becomes a window of the session."
     // window, a session too old to speak this protocol -- means "become a
     // window yourself", never "lose the command". -n skips asking entirely:
     // an explicit second window.
+    // `mypixels last [n] [--copy]`: the running session's memory pool of
+    // command output, queried, not launched. Intercepted before the
+    // open-a-tab path below, or "last" would spawn a program named last.
+    {
+        let terms = positional_terms();
+        if terms.first().map(|s| s.as_str()) == Some("last") {
+            let mut n: u64 = 1;
+            let mut copy = false;
+            for a in &terms[1..] {
+                match a.parse::<u64>() {
+                    Ok(v) if v >= 1 => n = v,
+                    _ if a == "--copy" => copy = true,
+                    _ => {
+                        eprintln!("usage: mypixels last [n] [--copy]");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            match session::remote_last(n, copy) {
+                Some(text) => {
+                    if !copy {
+                        print!("{text}");
+                    }
+                }
+                None => {
+                    eprintln!("mypixels last: no running session to ask");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+    }
     let standalone = flags.iter().any(|a| a == "--standalone" || a == "-s");
     if !standalone {
         let new_window = flags.iter().any(|a| a == "--new-window" || a == "-n");
@@ -5937,5 +6043,44 @@ mod sem_tests {
         map.insert(1, vec![block("aaaa", false, 1), block("bbbb", false, 2)].into());
         super::evict_to_budget(&mut map, 1); // nothing is closed
         assert_eq!(map[&1].len(), 2, "running commands are sacred, over budget or not");
+    }
+
+    #[test]
+    fn last_one_is_bare_pasteable_text() {
+        let mut q: VecDeque<super::CommandBlock> = VecDeque::new();
+        apply_sem_mark(&mut q, 0, None, 0, 0, false, 1);
+        apply_sem_mark(&mut q, 3, Some(0), 4, 4, false, 1);
+        q.back_mut().unwrap().text = "total 42\nREADME.md\n".into();
+        let out = super::format_last_output(&q, 1);
+        assert_eq!(out, "total 42\nREADME.md\n", "one block pipes like a file, headers would corrupt it");
+    }
+
+    #[test]
+    fn last_many_navigates_with_headers() {
+        let mut q: VecDeque<super::CommandBlock> = VecDeque::new();
+        for (i, (exit, text)) in [(Some(2), "one\n"), (Some(0), "two\n")].iter().enumerate() {
+            apply_sem_mark(&mut q, 0, None, i, i, false, i as u64 + 1);
+            apply_sem_mark(&mut q, 3, *exit, i + 1, i + 1, false, i as u64 + 1);
+            q.back_mut().unwrap().text = text.to_string();
+        }
+        let out = super::format_last_output(&q, 5);
+        assert!(out.contains("1 of 2 · exit 2"), "oldest-numbered first, failing command visible: {out}");
+        assert!(out.contains("2 of 2 · ok"));
+        // Chronological: newest last, beside the prompt the user reads next.
+        assert!(out.find("one").unwrap() < out.find("two").unwrap());
+    }
+
+    #[test]
+    fn last_reports_what_cannot_be_shown() {
+        let mut q: VecDeque<super::CommandBlock> = VecDeque::new();
+        // A full-screen program and a head-truncated giant.
+        apply_sem_mark(&mut q, 0, None, 0, 0, true, 1);
+        apply_sem_mark(&mut q, 3, Some(0), 4, 4, false, 1);
+        apply_sem_mark(&mut q, 0, None, 5, 5, false, 2);
+        apply_sem_mark(&mut q, 3, Some(0), 9, 9, false, 2);
+        q.back_mut().unwrap().truncated_head = true;
+        let out = super::format_last_output(&q, 2);
+        assert!(out.contains("full-screen program"));
+        assert!(out.contains("truncated: head"));
     }
 }

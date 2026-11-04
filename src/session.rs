@@ -27,6 +27,14 @@ pub enum Request {
     NewWindow { cwd: Option<String>, argv: Vec<String> },
     /// Present the window without opening anything.
     Raise,
+    /// Hand the last `n` commands' captured output of `window`'s active
+    /// tab to the requester (`mypixels last`): reply on `respond` for
+    /// stdout, and/or place it on the clipboard when `copy`. The pool
+    /// lives in the app, so the answer comes back on this channel
+    /// rather than in the D-Bus reply body directly; the bus thread
+    /// waits on it (bounded by one event-loop pass, the app is alive by
+    /// construction or the send above failed and nobody waits).
+    LastOutput { window: u32, n: u64, copy: bool, respond: futures::channel::oneshot::Sender<String> },
 }
 
 const IFACE: &str = "com.github.volca.mypixels.Session";
@@ -145,6 +153,24 @@ async fn serve(
                 let _ = tx.send(Request::Raise);
                 wake();
             }
+            Some("LastOutput") => {
+                match msg.body().deserialize::<(u32, u64, u8)>() {
+                    Ok((window, n, copy)) => {
+                        let (send, reply_rx) = futures::channel::oneshot::channel();
+                        let _ = tx.send(Request::LastOutput { window, n, copy: copy != 0, respond: send });
+                        wake();
+                        if copy == 0 {
+                            // The querying client wants the text back;
+                            // a departed app answers empty, never hangs.
+                            let text = reply_rx.await.unwrap_or_default();
+                            let reply = zbus::Message::method_return(&header)?.build(&(text,))?;
+                            conn.send(&reply).await?;
+                            continue; // acknowledged already, on this path
+                        }
+                    }
+                    Err(e) => log::warn!("session bus: bad LastOutput body: {e}"),
+                }
+            }
             other => log::warn!("session bus: unknown method {other:?}"),
         }
         let ack = zbus::Message::method_return(&header)?.build(&())?;
@@ -179,6 +205,51 @@ pub fn remote_open(cwd: Option<String>, argv: Vec<String>, new_window: bool) -> 
             false
         }
     }
+}
+
+/// Ask the running session for its last `n` command outputs. None means
+/// no session answered - the same "nothing to ask" every other command
+/// treats as "start our own", except a query has no fallback: the
+/// caller gets an error, not a window.
+pub fn remote_last(n: u64, copy: bool) -> Option<String> {
+    let base = bus_name()?;
+    match futures::executor::block_on(remote_last_async(&base, n, copy)) {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("session query failed: {e}");
+            None
+        }
+    }
+}
+
+async fn remote_last_async(name: &str, n: u64, copy: bool) -> zbus::Result<Option<String>> {
+    let Ok(conn) = zbus::Connection::session().await else {
+        return Ok(None);
+    };
+    let owner = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetNameOwner",
+            &[name],
+        )
+        .await;
+    match owner {
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.DBus.Error.NameHasNoOwner" =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
+    let window = launch_window().unwrap_or(0);
+    let reply = conn
+        .call_method(Some(name), PATH, Some(IFACE), "LastOutput", &(window, n, copy as u8))
+        .await?;
+    let (text,) = reply.body().deserialize::<(String,)>()?;
+    Ok(Some(text))
 }
 
 async fn remote_open_async(
