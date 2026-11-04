@@ -51,28 +51,42 @@ hide and placement, opacity, palette + pywal + themes + live reload, the full
 selection model, async clipboard, scrollback, cursor blink, the Alt-held
 switcher with live real-frame previews, and HiDPI.
 
-## Command-output observability (requested, not yet built)
+## Command-output observability
 
 The OSC 133 blocks (prompt line + exit status) are the seed; these turn
 them into a queryable session memory for shell users **and** for LLM
 tooling:
 
-1. **Scrollback is small and fixed.** The library default (1000) was
-   silently in use; make `history` a config key. NOT 20 000: a grid line
-   costs width*24+40 bytes (full-width Vec<Cell>, 24 B asserted cell),
-   so 20k lines is ~59 MB per tab at 120 cols. 5 000 (~15 MB/tab) is
-   the sane default; the output pool (#2) is what makes depth cheap.
-2. **Command output held in a memory pool, not files** (decided
-   2026-11-04: little result files around the filesystem are worse than
-   RAM). Per-tab `VecDeque<CmdBlock { exit, cwd, text, truncated, ts }>`
-   fed when a block closes (D mark), LRU-evicted under a GLOBAL byte
-   budget (default 32 MB, config `history_bytes`), per-block cap ~8 MB
-   with an explicit truncation marker, never evicting a tab's newest
-   block. The pool also removes the pressure to grow scrollback huge
-   (#1): a command's text outlives its grid lines by budget, not by
-   scrollback depth. Streaming extraction while a command runs (per
-   input drain) is needed for blocks larger than scrollback, else the
-   head of the output evicts before the block closes.
+1. **Scrollback config key: DONE.** `history` is spelled `scrollback_lines`
+   and now defaults to 5 000 (~15 MB/tab at 120 cols, was 1 000). A grid
+   line costs width*24+40 bytes (full-width Vec<Cell>, 24 B asserted
+   cell), so 20k lines would be ~59 MB/tab; the output pool (#2) is what
+   makes depth cheap.
+2. **Command output held in a memory pool, not files: DONE.**
+   `CommandBlock` (per-tab `VecDeque`) grows a captured `text` at its D
+   mark, LRU-evicted by `evict_to_budget` under the GLOBAL `history_bytes`
+   budget (default 32 MB), per-block `history_block_bytes` cap (8 MB,
+   keeps the TAIL - the last error of a build log is its point), open
+   blocks never evicted. Capture extracts rows through a synthetic
+   selection (`Tab::capture_rows`: wrap-aware, trim-aware, same semantics
+   as copying), translating each mark's eviction-proof row id
+   (`scrolled_out + viewport row`, a Term-patch counter) into today's
+   buffer - exact across scrollback wrap. Streaming per-drain was
+   designed and REJECTED: at the cap, buffer indices slide under every
+   new row and a streaming cursor cannot tell how far; the tail-keeping
+   cap makes head-streaming moot anyway (what streams past the cap would
+   be clipped at the cap). Truncated heads/tails and alternate-screen
+   commands (`alt_seen`, a TUI's redraws are not output) are marked, never
+   silently empty. `mypixels last` reads this pool; `seq` gives the LRU
+   order a session-wide truth.
+3. **`mypixels last [n] [--copy]`: DONE.** Over the session bus
+   (`LastOutput`), the reply held until the app acts - answering early
+   let a `--copy` query finish, close its own block, and copy ITSELF.
+   `last` alone prints bare pasteable text; `last n` adds
+   `# N of M · exit` headers, chronological, newest beside the prompt.
+   `--copy` lands on the clipboard inside the terminal process. The
+   extraction core (`format_last_output`) is pure: MCP (#5) is another
+   thin transport over the same pool.
 2b. **Compress pool blocks with a fast codec (LATER).** Block text is
    plain output - lz4/zstd level-1 typically gives 3-6x on terminal text,
    turning the 32 MB budget into ~100-200 MB of effective memory at a
