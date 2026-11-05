@@ -3,17 +3,23 @@ background_color: '#141413'
 cursor_color: '#fade3e'
 selection_color: '#ff9eb8'
 accent_color: '#ff9eb8'
+# Palette, by name from the badwolf theme:
+#   blackestgravel  taffy    lime     dale's pale  tardis   dress   salt watertaffy  brightgravel
+#   lightgravel     taffy    lime     orange       tardis   dress   salt watertaffy  snow
+# Bright black (slot 8) is what tools use for dim text (exa's permission dashes
+# are SGR 90): coal #000000 on blackestgravel is invisible, so the theme's own
+# dimmest text color, lightgravel, stands there instead.
 palette:
   - '#141413'
-  - '#ff2c4b'
+  - '#ff0208'
   - '#aeee00'
   - '#fade3e'
   - '#0a9dff'
   - '#ff9eb8'
   - '#8cffba'
   - '#d9cec3'
-  - '#000000'
-  - '#ff2c4b'
+  - '#998f84'
+  - '#ff0208'
   - '#aeee00'
   - '#ffa724'
   - '#0a9dff'

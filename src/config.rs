@@ -946,10 +946,10 @@ mod tests {
 
     #[test]
     fn palette_badwolf_first_sixteen() {
-        let full = "#141413:#ff2c4b:#aeee00:#fade3e:#0a9dff:#ff9eb8:#8cffba:#d9cec3:#000000:#ff2c4b:#aeee00:#ffa724:#0a9dff:#ff9eb8:#8cffba:#ffffff";
+        let full = "#141413:#ff0208:#aeee00:#fade3e:#0a9dff:#ff9eb8:#8cffba:#d9cec3:#998f84:#ff0208:#aeee00:#ffa724:#0a9dff:#ff9eb8:#8cffba:#ffffff";
         let p = parse_palette(&full).expect("16 colors");
         assert_eq!(p[0], Rgb(20, 20, 19));
-        assert_eq!(p[1], Rgb(255, 44, 75));
+        assert_eq!(p[1], Rgb(255, 2, 8));
         assert_eq!(p[2], Rgb(174, 238, 0));
         assert_eq!(p[15], Rgb(255, 255, 255));
         assert_eq!(parse_palette(""), None);
