@@ -40,6 +40,30 @@ pub enum Request {
 const IFACE: &str = "com.github.volca.mypixels.Session";
 const PATH: &str = "/com/github/volca/mypixels/Session";
 
+/// The display this process lives on, sanitized to a file-safe token: the
+/// per-display scoping key shared by the bus name and the MCP socket path,
+/// so an X11 client can never reach a Wayland session (or vice versa).
+pub fn display_key() -> Option<String> {
+    let disp = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("DISPLAY").ok().filter(|s| !s.is_empty()))?;
+    let safe: String = disp
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let safe = if safe
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        safe
+    } else {
+        format!("d_{safe}")
+    };
+    Some(safe)
+}
+
 /// The well-known name for this display's session, or None when there is no
 /// display to key on (no way to scope the session sanely). The name is
 /// per-display exactly as the original's GApplication id is: an X11 instance
@@ -53,11 +77,7 @@ pub fn bus_name() -> Option<String> {
             return Some(v);
         }
     }
-    let disp = std::env::var("WAYLAND_DISPLAY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("DISPLAY").ok().filter(|s| !s.is_empty()))?;
-    bus_name_for(&disp)
+    Some(format!("com.github.volca.mypixels.{}", display_key()?))
 }
 
 /// Which window this process was launched *from*: inherited by every shell

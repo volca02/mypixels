@@ -11,6 +11,7 @@ mod fonts;
 mod gpu;
 mod kitty;
 mod kitty_kb;
+mod mcp;
 mod tab;
 mod session;
 mod theme;
@@ -443,6 +444,7 @@ struct App {
     sem_blocks: std::collections::HashMap<usize, std::collections::VecDeque<CommandBlock>>,
     /// Daemon: tab/rise requests forwarded by other mypixels processes.
     session_rx: std::sync::mpsc::Receiver<session::Request>,
+    mcp_rx: std::sync::mpsc::Receiver<mcp::Query>,
     /// The egui window picker's answer, applied next frame by the drain
     /// (which has the event loop; the draw path does not). usize::MAX =
     /// detach into a fresh window.
@@ -588,6 +590,7 @@ impl App {
             .take_while(|a| a.starts_with('-'))
             .any(|a| a == "--standalone" || a == "-s");
         let (session_tx, session_rx) = std::sync::mpsc::channel();
+        let (mcp_tx, mcp_rx) = std::sync::mpsc::channel();
         let _session = if standalone {
             None
         } else {
@@ -602,6 +605,21 @@ impl App {
                         }
                     })
                 })
+        };
+        // LLM observability: read-only MCP endpoint on a per-display unix
+        // socket (windows, tabs, captured command output). Same
+        // standalone carve-out as the session bus.
+        let _mcp = if standalone {
+            None
+        } else {
+            let slot = Arc::clone(&window_slot);
+            mcp::start(mcp_tx, Arc::new(move || {
+                if let Ok(slot) = slot.lock() {
+                    for w in slot.iter() {
+                        w.request_redraw();
+                    }
+                }
+            }))
         };
         let shared = SpikeListener {
             window: Arc::clone(&window_slot),
@@ -735,6 +753,7 @@ impl App {
             kitty: Default::default(),
             sem_blocks: Default::default(),
             session_rx,
+            mcp_rx,
             pending_move: None,
             pending_action: None,
             ripple: None,
@@ -996,23 +1015,34 @@ impl App {
                     // that typed `mypixels last` emitted its D mark
                     // moments ago, and that command is exactly what the
                     // user is asking about.
-                    self.drain_sems();
-                    let win = if window >= 1 && (window as usize) <= self.wins.len() {
-                        window as usize - 1
-                    } else {
-                        self.cur
-                    };
-                    let text = self
-                        .wins
-                        .get(win)
-                        .and_then(|w| w.tabs.get(w.active))
-                        .and_then(|t| self.sem_blocks.get(&t.id))
-                        .map(|q| format_last_output(q, n.max(1) as usize))
-                        .unwrap_or_default();
+                    let text = self.last_output_text(window, n);
                     if copy && !text.is_empty() {
                         self.copy_text(clipboard::Kind::Clipboard, text.clone());
                     }
                     let _ = respond.send(text);
+                }
+            }
+        }
+        // The MCP endpoint's queries take the same channel shape as the
+        // session bus's: answer on the main thread, reply on the oneshot.
+        while let Ok(q) = self.mcp_rx.try_recv() {
+            match q {
+                mcp::Query::ListWindows { respond } => {
+                    let v = serde_json::json!([
+                        self.wins.iter().enumerate().map(|(i, w)| serde_json::json!({
+                            "window": i + 1,
+                            "active_tab": w.active + 1,
+                            "tabs": w.tabs.iter().enumerate().map(|(j, t)| serde_json::json!({
+                                "tab": j + 1,
+                                "title": t.display_title(),
+                                "cwd": t.cwd_raw().map(|p| p.to_string_lossy().into_owned()),
+                            })).collect::<Vec<_>>()
+                        })).collect::<Vec<_>>()
+                    ]);
+                    let _ = respond.send(v);
+                }
+                mcp::Query::LastOutput { window, n, respond } => {
+                    let _ = respond.send(self.last_output_text(window, n));
                 }
             }
         }
@@ -1354,6 +1384,12 @@ impl App {
             .tabs
             .get(w.active)
             .is_some_and(|t| t.term.lock().selection_to_string().is_some());
+        let has_image = w.tabs.get(w.active).is_some_and(|t| {
+            self
+                .kitty
+                .get(&t.id)
+                .is_some_and(|k| k.placements().iter().any(|p| k.image(p.image_id).is_some()))
+        });
         let mut items: Vec<(String, String, bool)> = Vec::new();
         let mut seps: Vec<usize> = Vec::new();
         let mut add = |label: &str, action: &str, enabled: bool, sep: bool| {
@@ -1367,6 +1403,7 @@ impl App {
         add("Paste primary", "paste_primary", true, false);
         add("Select all", "select_all", has_tab, true);
         add("Copy as image", "copy_as_image", has_tab, true);
+        add("Copy last image", "copy_last_image", has_image, false);
         add("New tab", "new_tab", true, true);
         add("Rename tab", "rename_tab", has_tab, false);
         add("Close tab", "close_tab", has_tab, false);
@@ -3086,9 +3123,29 @@ impl App {
                 b.truncated_head |= b.start_global < base || readable > from;
                 push_block_text(b, &txt, cap);
             }
+            compress_closed_block(b);
         }
         let budget = self.config.history_bytes;
         evict_to_budget(&mut self.sem_blocks, budget);
+    }
+
+    /// The last `n` commands' captured output of `window`'s active tab
+    /// (1-based; 0 or out of range = the window the user is looking at).
+    /// Shared by the session bus's `mypixels last` and the MCP endpoint:
+    /// one extraction core, thin transports.
+    fn last_output_text(&mut self, window: u32, n: u64) -> String {
+        self.drain_sems();
+        let win = if window >= 1 && (window as usize) <= self.wins.len() {
+            window as usize - 1
+        } else {
+            self.cur
+        };
+        self.wins
+            .get(win)
+            .and_then(|w| w.tabs.get(w.active))
+            .and_then(|t| self.sem_blocks.get_mut(&t.id))
+            .map(|q| format_last_output(q, n.max(1) as usize))
+            .unwrap_or_default()
     }
 
     /// Scroll so the viewport top lands on the previous/next command's
@@ -3682,6 +3739,35 @@ impl App {
                 self.wins[self.cur].shot = true;
                 for w in self.window_slot.lock().unwrap().iter() {
                     w.request_redraw();
+                }
+            }
+            // The lossless path: the store keeps the untouched upload bytes
+            // per image id, so this never round-trips through pixels.
+            "copy_last_image" => {
+                let src = self
+                    .wins[self.cur]
+                    .tabs
+                    .get(self.wins[self.cur].active)
+                    .and_then(|t| {
+                        self.kitty.get(&t.id).and_then(|k| {
+                            k.placements()
+                                .iter()
+                                .rev()
+                                .find_map(|p| k.image(p.image_id).map(|img| (*img.source).to_vec()))
+                        })
+                    });
+                match src {
+                    Some(bytes) => match self.clipboard.as_ref() {
+                        None => self.show_error("Copy last image: no clipboard backend".into()),
+                        Some(cb) => match cb.set_image(clipboard::Kind::Clipboard, bytes) {
+                            Ok(()) => {
+                                self.wins[self.cur].notice =
+                                    Some(("Image copied to clipboard".to_string(), Instant::now()));
+                            }
+                            Err(e) => self.show_error(format!("Copy last image: {e}")),
+                        },
+                    },
+                    None => self.show_error("No image to copy".into()),
                 }
             }
             "shrink_font" => self.zoom_term(false),
@@ -4296,13 +4382,63 @@ pub struct CommandBlock {
     /// marks: its "output" was a TUI's redraws, not capturable text.
     pub alt_seen: bool,
     /// Captured output: the prompt row (with the command) and everything
-    /// the command wrote, taken in one at the D mark.
+    /// the command wrote, taken in one at the D mark. Empty while the
+    /// block's text lives in `compressed`.
     pub text: String,
+    /// The closed block's text, compressed at the D mark. The in-progress
+    /// block stays plain (it is appended to hot); only finished output is
+    /// worth a codec. The budget counts this, not the inflated size.
+    /// Layout: 8-byte little-endian inflated length, then the lz4 frame
+    /// (the codec wants the destination length up front).
+    pub compressed: Option<Vec<u8>>,
     /// The capture could not reach as far back as the command began
     /// (output larger than the scrollback), or the block cap clipped the
     /// tail. Say so; never silently drop bytes.
     pub truncated_head: bool,
     pub truncated_tail: bool,
+}
+
+impl CommandBlock {
+    /// Stored size for budget accounting: the compressed form when the
+    /// block closed, the live text while it runs.
+    pub fn stored_len(&self) -> usize {
+        self.compressed.as_ref().map(|c| c.len()).unwrap_or(self.text.len())
+    }
+
+    /// Readable output. A closed block inflates on first read and drops
+    /// its compressed copy, so repeated queries pay the codec once.
+    pub fn readable_text(&mut self) -> &str {
+        if let Some(c) = self.compressed.take() {
+            let (len, frame) = if c.len() > 8 {
+                let len = u64::from_le_bytes(c[0..8].try_into().unwrap());
+                (len as usize, &c[8..])
+            } else {
+                (0, &c[..])
+            };
+            self.text = match lz4_flex::decompress(frame, len) {
+                Ok(t) => String::from_utf8_lossy(&t).into_owned(),
+                Err(e) => format!("# (pool block unreadable: {e})"),
+            };
+        }
+        &self.text
+    }
+}
+
+/// Compress a finished block's text in place. Blocks too small to be
+/// worth it, and ones the codec could not shrink, stay plain - the budget
+/// counts stored bytes either way, so both cases cost nothing to detect.
+fn compress_closed_block(b: &mut CommandBlock) {
+    if !b.done || b.text.len() < 512 {
+        return;
+    }
+    let frame = lz4_flex::compress(b.text.as_bytes());
+    let mut c = Vec::with_capacity(8 + frame.len());
+    c.extend_from_slice(&(b.text.len() as u64).to_le_bytes());
+    c.extend_from_slice(&frame);
+    if c.len() < b.text.len() {
+        b.compressed = Some(c);
+        b.text.clear();
+    }
 }
 
 /// Append output to a block honoring the per-block byte cap by keeping
@@ -4336,7 +4472,7 @@ fn evict_to_budget(
 ) {
     loop {
         let total: usize =
-            blocks.values().flat_map(|q| q.iter()).map(|b| b.text.len()).sum();
+            blocks.values().flat_map(|q| q.iter()).map(|b| b.stored_len()).sum();
         if total <= budget {
             return;
         }
@@ -4395,6 +4531,7 @@ fn apply_sem_mark(
                 start_global: row,
                 alt_seen: alt,
                 text: String::new(),
+                compressed: None,
                 truncated_head: false,
                 truncated_tail: false,
             });
@@ -4430,20 +4567,27 @@ fn apply_sem_mark(
 /// because then the reader is navigating, not consuming. Truncation and
 /// full-screen-program notes ride along as comments; a block that
 /// captured nothing still says so rather than vanishing.
-fn format_last_output(q: &std::collections::VecDeque<CommandBlock>, n: usize) -> String {
+fn format_last_output(q: &mut std::collections::VecDeque<CommandBlock>, n: usize) -> String {
     // The newest n blocks that actually have something to show, emitted
     // oldest-first: the newest command lands last, right where the eye
     // already is - the prompt below. v1 captures a block's text only at
     // its D mark, so the very command that invoked this query - still
     // open, therefore textless - would otherwise occupy slot 1 of
     // `last 1 --copy` and copy nothing. It is skipped, not listed.
-    let mut blocks: Vec<&CommandBlock> =
-        q.iter().rev().filter(|b| b.done || !b.text.is_empty()).take(n).collect();
+    let mut blocks: Vec<&mut CommandBlock> =
+        q.iter_mut().rev().filter(|b| b.done || !b.text.is_empty()).take(n).collect();
     blocks.reverse();
+    let count = blocks.len();
     let mut out = String::new();
-    for (i, b) in blocks.iter().enumerate() {
-        if blocks.len() > 1 {
-            let status = match (b.done, b.exit) {
+    for (i, b) in blocks.iter_mut().enumerate() {
+        // Copy the flags before inflating: the returned `&str` holds the
+        // mutable borrow for the rest of the body.
+        let (done, exit, alt, th, tt) = (b.done, b.exit, b.alt_seen, b.truncated_head, b.truncated_tail);
+        // Inflate once; the rest of the loop reads `text`, never the
+        // compressed form.
+        let text = b.readable_text();
+        if count > 1 {
+            let status = match (done, exit) {
                 (false, _) => "running".into(),
                 (true, Some(0)) => "ok".into(),
                 (true, Some(code)) => format!("exit {code}"),
@@ -4452,21 +4596,21 @@ fn format_last_output(q: &std::collections::VecDeque<CommandBlock>, n: usize) ->
             out.push_str(&format!(
                 "\n# ── {} of {} · {status} ──\n",
                 i + 1,
-                blocks.len()
+                count
             ));
         }
-        if b.alt_seen {
+        if alt {
             out.push_str("# (full-screen program; output not captured)\n");
-        } else if b.text.is_empty() && b.done && !b.truncated_head {
+        } else if text.is_empty() && done && !th {
             out.push_str("# (no output captured)\n");
         } else {
-            out.push_str(&b.text);
-            if !b.text.is_empty() && !b.text.ends_with('\n') {
+            out.push_str(text);
+            if !text.is_empty() && !text.ends_with('\n') {
                 out.push('\n');
             }
         }
-        if b.truncated_head || b.truncated_tail {
-            let which = match (b.truncated_head, b.truncated_tail) {
+        if th || tt {
+            let which = match (th, tt) {
                 (true, true) => "head and tail",
                 (true, false) => "head",
                 _ => "tail",
@@ -6038,6 +6182,23 @@ mod sem_tests {
     }
 
     #[test]
+    fn closed_block_compresses_and_round_trips() {
+        let original = "line of build output\n".repeat(200);
+        let mut b = block(&original, true, 1);
+        super::compress_closed_block(&mut b);
+        assert!(b.compressed.is_some(), "repetitive text compresses");
+        assert!(b.text.is_empty(), "the live buffer gives way to the codec");
+        assert!(b.stored_len() < original.len() / 2, "the budget sees the compressed size");
+        assert_eq!(b.readable_text(), original, "the query path gets the exact bytes back");
+        assert!(b.compressed.is_none(), "a second query pays nothing");
+        // Small blocks are not worth a frame header.
+        let mut s = block("tiny", true, 2);
+        super::compress_closed_block(&mut s);
+        assert!(s.compressed.is_none());
+        assert_eq!(s.readable_text(), "tiny");
+    }
+
+    #[test]
     fn budget_evicts_oldest_closed_first() {
         let mut map: std::collections::HashMap<usize, VecDeque<super::CommandBlock>> =
             std::collections::HashMap::new();
@@ -6069,7 +6230,7 @@ mod sem_tests {
         apply_sem_mark(&mut q, 0, None, 0, 0, false, 1);
         apply_sem_mark(&mut q, 3, Some(0), 4, 4, false, 1);
         q.back_mut().unwrap().text = "total 42\nREADME.md\n".into();
-        let out = super::format_last_output(&q, 1);
+        let out = super::format_last_output(&mut q, 1);
         assert_eq!(out, "total 42\nREADME.md\n", "one block pipes like a file, headers would corrupt it");
     }
 
@@ -6081,7 +6242,7 @@ mod sem_tests {
             apply_sem_mark(&mut q, 3, *exit, i + 1, i + 1, false, i as u64 + 1);
             q.back_mut().unwrap().text = text.to_string();
         }
-        let out = super::format_last_output(&q, 5);
+        let out = super::format_last_output(&mut q, 5);
         assert!(out.contains("1 of 2 · exit 2"), "oldest-numbered first, failing command visible: {out}");
         assert!(out.contains("2 of 2 · ok"));
         // Chronological: newest last, beside the prompt the user reads next.
@@ -6098,7 +6259,7 @@ mod sem_tests {
         apply_sem_mark(&mut q, 3, Some(0), 4, 4, false, 1);
         q.back_mut().unwrap().text = "echoed\n".into();
         apply_sem_mark(&mut q, 0, None, 5, 5, false, 2); // the query itself
-        let out = super::format_last_output(&q, 1);
+        let out = super::format_last_output(&mut q, 1);
         assert_eq!(out, "echoed\n", "the live query block is skipped, not served");
     }
 
@@ -6111,7 +6272,7 @@ mod sem_tests {
         apply_sem_mark(&mut q, 0, None, 5, 5, false, 2);
         apply_sem_mark(&mut q, 3, Some(0), 9, 9, false, 2);
         q.back_mut().unwrap().truncated_head = true;
-        let out = super::format_last_output(&q, 2);
+        let out = super::format_last_output(&mut q, 2);
         assert!(out.contains("full-screen program"));
         assert!(out.contains("truncated: head"));
     }

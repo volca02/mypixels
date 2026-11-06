@@ -87,29 +87,42 @@ tooling:
    `--copy` lands on the clipboard inside the terminal process. The
    extraction core (`format_last_output`) is pure: MCP (#5) is another
    thin transport over the same pool.
-2b. **Compress pool blocks with a fast codec (LATER).** Block text is
-   plain output - lz4/zstd level-1 typically gives 3-6x on terminal text,
-   turning the 32 MB budget into ~100-200 MB of effective memory at a
-   microsecond-per-MB cost on append. Compress per-block at close (the D
-   mark), keep the in-progress block uncompressed (it is appended hot),
-   decompress lazily on query. `flate2` is already in the tree (png);
-   `lz4_flex` or fast-mode zstd would be the first direct addition.
-   Same lever could shrink scrollback itself (kitty-style line storage),
-   but that means rewriting the vendored fixed-cell grid - a separate,
-   much bigger project; do NOT conflate them.
+2b. **Compress pool blocks with a fast codec: DONE.** `lz4_flex`,
+   per-block at the D mark (`compress_closed_block`): the in-progress
+   block stays plain (it is appended hot), blocks under 512 bytes stay
+   plain (not worth a frame header), and a block the codec cannot shrink
+   stays plain too. Storage is an 8-byte little-endian inflated length
+   plus the lz4 frame (the 0.11 API wants the destination length up
+   front). `CommandBlock::readable_text` inflates on first read and drops
+   the frame, so a block pays the codec once per session, and
+   `stored_len` feeds the budget, so the 32 MB `history_bytes` now buys
+   3-6x the effective memory. Scrollback-grid compression (kitty-style
+   line storage) remains the separate, much bigger vendored-grid project;
+   do NOT conflate them.
 3. **`mypixels last [n] [--copy]`** over the session bus: `last | grep
    error`, `last 2 --copy`. One extraction core serves this, the
    `copy_last_output` action, and MCP - transports stay thin.
-4. **Images to clipboard**: when the last command displayed a Kitty
-   graphic, `--copy` (and a menu/keys action) puts the **image bytes** on
-   the clipboard losslessly - the upload payload is kept per image id, so
-   no screenshot round trip. Depends on the graphics store (M4 of
-   docs/graphics_osc133_implementation.md), not on the renderer.
-5. **MCP server endpoint over a unix pipe** for LLM observability:
-   windows, tabs, commands, and command outputs (files from #2 plus live
-   state). JSON-RPC thread mapping onto the same query core via the
-   existing main-thread channel pattern; per-display socket naming like
-   the D-Bus bus; read-only first.
+4. **Images to clipboard: DONE (menu action).** Right-click > "Copy last
+   image" puts the untouched upload payload of the tab's newest placed
+   image on the clipboard losslessly - `kitty::KittyImage.source` per
+   image id, straight into `Clipboard::set_image`, no pixel round trip.
+   The menu row is enabled only while the tab holds a placed image, and a
+   placement whose image was evicted falls back to the newest survivor.
+   The `mypixels last --copy` spelling (image bytes when the last BLOCK
+   displayed one) is the remaining half: it needs the block to remember
+   which image ids it placed.
+5. **MCP server endpoint over a unix pipe: DONE.** `src/mcp.rs` hosts a
+   read-only MCP server (newline-delimited JSON-RPC 2.0, the stdio
+   framing) on `$XDG_RUNTIME_DIR/mypixels-<display>.mcp.sock` (0600;
+   `MYPIXELS_MCP` names a private socket for tests). Per-display keying
+   is the session bus's own `display_key()`, so an X11 client cannot read
+   Wayland state. Tools: `list_windows` (windows, tabs, titles, cwds,
+   active tab) and `last_output` (window, n) over the same
+   `last_output_text` core as `mypixels last`. Queries cross to the event
+   loop on the `mcp::Query` channel with a 2 s reply timeout that answers
+   honestly instead of hanging. E2E-verified against the release binary:
+   initialize handshake, tools/list, live list_windows, empty last_output
+   as `isError`, -32601 on unknown methods.
 
 Known warts: a moved shell keeps its spawn-time `$MYPIXELS_WINDOW`, so
 `mypixels` typed in a window that RECEIVED a moved tab opens new tabs in the

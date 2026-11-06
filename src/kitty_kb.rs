@@ -554,7 +554,7 @@ mod tests {
         // Text key releases are silent unless all-keys (explicit nothing).
         let mut plain_rel = mk(&a, Some("a"), 3);
         plain_rel.release = true;
-        assert_eq!(encode(&plain_rel).unwrap(), Vec::new());
+        assert_eq!(encode(&plain_rel).unwrap(), Vec::<u8>::new());
         // Functional keys gain the sub-parameter in their legacy shape.
         let up = Key::Named(NamedKey::ArrowUp);
         let mut up_rel = mk(&up, None, 3);
