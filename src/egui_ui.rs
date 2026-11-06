@@ -1033,29 +1033,41 @@ pub struct SwitcherCard {
     pub thumb: Option<(egui::TextureHandle, (u32, u32))>,
 }
 
-/// Columns shared by preview sizing, drawing, and arrow-key navigation.
-pub fn switcher_columns(screen_width: f32, count: usize) -> usize {
-    ((((screen_width * 0.84).min(1400.0) - 36.0 + CARD_GAP) / 220.0).floor().max(1.0) as usize).min(4).min(count.max(1))
-}
-
 const CARD_GAP: f32 = 14.0;
 const CARD_PAD: f32 = 8.0;
 const CARD_HEADER: f32 = 40.0;
 
-/// Preview dimensions fit the responsive grid and retain the terminal aspect.
-pub fn thumbnail_size(screen_width: f32, aspect: f32, max_tw: u32, max_th: u32) -> (f32, f32) {
+/// The switcher's usable panel width.
+fn switcher_panel_w(screen_width: f32) -> f32 {
+    (screen_width * 0.84).min(1400.0)
+}
+
+/// Preview dimensions: the terminal frame shrunk by `scale`, capped so one
+/// card still fits the panel. The aspect is the terminal's own, always --
+/// the preview is a scaled picture of the tab, so it can never differ in
+/// shape. The grid reflows around the size (fewer columns, more rows) rather
+/// than squeezing it.
+pub fn thumbnail_size(screen_width: f32, aspect: f32, scale: f32) -> (f32, f32) {
     if aspect <= 0.0 {
         return (0.0, 0.0);
     }
-    let cols = switcher_columns(screen_width, usize::MAX) as f32;
-    let panel_w = (screen_width * 0.84).min(1400.0);
-    let box_w = ((panel_w - 36.0 - CARD_GAP * (cols - 1.0)) / cols - CARD_PAD * 2.0).min(max_tw as f32).max(48.0);
-    let box_h = (max_th as f32).max(1.0);
-    if box_w / box_h > aspect {
-        (box_h * aspect, box_h)
-    } else {
-        (box_w, box_w / aspect)
-    }
+    let one_card = switcher_panel_w(screen_width) - 36.0 - CARD_PAD * 2.0;
+    let box_w = (screen_width * scale).min(one_card).max(48.0);
+    (box_w, box_w / aspect)
+}
+
+/// The card the preview sits in: padding around, never narrower than 204 so
+/// the header and index chip keep their room.
+pub fn switcher_card_width(screen_width: f32, aspect: f32, scale: f32) -> f32 {
+    let (tw, _) = thumbnail_size(screen_width, aspect, scale);
+    (tw + CARD_PAD * 2.0).max(204.0)
+}
+
+/// Columns shared by drawing and arrow-key navigation. The cards pick the
+/// column count, not the other way round: as many as fit the panel.
+pub fn switcher_columns(screen_width: f32, count: usize, card_w: f32) -> usize {
+    let fit = ((switcher_panel_w(screen_width) - 36.0 + CARD_GAP) / (card_w + CARD_GAP)).floor().max(1.0) as usize;
+    fit.min(4).min(count.max(1))
 }
 
 /// Release egui keyboard focus. A TextEdit that vanishes with its panel or
@@ -1122,8 +1134,8 @@ pub fn switcher_screen(
         TermStyle::new(ui, egui::Color32::from_rgb(104, 239, 145), egui::Color32::from_rgb(245, 115, 126));
     colors.accent = accent;
     let screen = ui.max_rect();
-    let cols = switcher_columns(screen.width(), cards.len());
     let card_size = egui::vec2((preview.x + CARD_PAD * 2.0).max(204.0), preview.y + CARD_HEADER + CARD_PAD);
+    let cols = switcher_columns(screen.width(), cards.len(), card_size.x);
     let grid_w = card_size.x * cols as f32 + CARD_GAP * (cols - 1) as f32;
     let rows = cards.len().div_ceil(cols);
     let grid_h = card_size.y * rows as f32 + CARD_GAP * (rows - 1) as f32;
@@ -1517,11 +1529,8 @@ pub fn config_window(
                                     row(ui, "Delay (ms)", |ui| {
                                         ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_overview_delay_ms)).changed();
                                     });
-                                    row(ui, "Thumb width", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_overview_thumb_width)).changed();
-                                    });
-                                    row(ui, "Thumb height", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_overview_thumb_height)).changed();
+                                    row(ui, "Preview scale", |ui| {
+                                        ev.apply |= ui.add(egui::Slider::new(&mut cfg.tab_overview_scale, 0.05..=1.0)).changed();
                                     });
                                 });
                             });
@@ -2198,7 +2207,7 @@ mod regression {
     fn switcher_keeps_selection_and_previews_inside_the_surface() {
         let ctx = Context::default();
         for (w, h) in [(1920.0, 1080.0), (560.0, 480.0)] {
-            let (tw, th) = thumbnail_size(w, 1.78, 300, 225);
+            let (tw, th) = thumbnail_size(w, 1.78, 0.25);
             let (tw, th) = (tw.round() as u32, th.round() as u32);
             let tex = ctx.load_texture("preview", egui::ColorImage::new(
                 [tw as usize, th as usize], vec![egui::Color32::BLACK; (tw * th) as usize]), egui::TextureOptions::LINEAR);

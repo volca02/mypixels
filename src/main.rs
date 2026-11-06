@@ -1673,8 +1673,7 @@ impl App {
         let (sw_preview_w, sw_preview_h) = egui_ui::thumbnail_size(
             w as f32 / self.scale.max(1.0),
             w as f32 / (h as f32 - if show_strip { self.tab_h } else { 0.0 }).max(1.0),
-            self.config.tab_overview_thumb_width,
-            self.config.tab_overview_thumb_height,
+            self.config.tab_overview_scale,
         );
         let sw_cards: Vec<egui_ui::SwitcherCard> = if sw_open {
             self.wins[self.cur].tabs
@@ -2379,14 +2378,13 @@ impl App {
             let n = self.wins[self.cur].tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
             let term_h = ((h as f32) - strip_h).max(1.0);
-            // The point size (egui space) follows the same config values as
-            // the hand-drawn overview: `tab_overview_thumb_width/height`,
-            // capped so four fit across the window, aspect fitted.
+            // The point size (egui space) follows `tab_overview_scale`: the
+            // tab's frame shrunk by that factor, capped so four fit across
+            // the window, the terminal's own aspect kept.
             let (ptw, pth) = egui_ui::thumbnail_size(
                 (w as f32) / self.scale.max(1.0),
                 (w as f32) / term_h,
-                self.config.tab_overview_thumb_width,
-                self.config.tab_overview_thumb_height,
+                self.config.tab_overview_scale,
             );
             // The egui context runs at the display's pixels-per-point, so
             // read the preview back at full pixel density -- a texture at
@@ -3508,9 +3506,19 @@ impl App {
             self.close_switcher();
             return true;
         }
-        let screen_width = self.wins[self.cur].window.as_ref()
-            .map(|w| w.inner_size().width as f32 / self.scale.max(1.0)).unwrap_or(1280.0);
-        let cols = egui_ui::switcher_columns(screen_width, n);
+        let (screen_w, screen_h) = self.wins[self.cur].window.as_ref()
+            .map(|w| (w.inner_size().width as f32 / self.scale.max(1.0),
+                      w.inner_size().height as f32 / self.scale.max(1.0)))
+            .unwrap_or((1280.0, 800.0));
+        // The drawing side sizes the cards from the same inputs, so the
+        // arrow keys and the grid agree on the column count.
+        let strip_h = self.show_tab_strip().then(|| self.tab_h).unwrap_or(0.0);
+        let card_w = egui_ui::switcher_card_width(
+            screen_w,
+            screen_w / (screen_h - strip_h).max(1.0),
+            self.config.tab_overview_scale,
+        );
+        let cols = egui_ui::switcher_columns(screen_w, n, card_w);
         let handled = match key {
             Key::Named(NamedKey::Tab) => {
                 let step = if self.modifiers.shift_key() { n - 1 } else { 1 };
