@@ -327,6 +327,13 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Pixel size of one cell `(width, height)`, set by the app on create
+    /// and resize. The Kitty graphics protocol lets a client place an image
+    /// at native size (no `c`/`r`), in which case the cursor must still
+    /// advance by the image's pixel size expressed in cells - which needs
+    /// this. Defaults to `(1, 1)` so nothing divides by zero before it is set.
+    cell_px: (u32, u32),
 }
 
 /// Configuration options for the [`Term`].
@@ -441,7 +448,16 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            cell_px: (1, 1),
         }
+    }
+
+    /// Set the pixel size of one cell. Called by the app on tab creation and
+    /// on every resize; it is what lets a native-sized Kitty image advance
+    /// the cursor by the right number of cells.
+    #[inline]
+    pub fn set_cell_pixels(&mut self, width: u32, height: u32) {
+        self.cell_px = (width.max(1), height.max(1));
     }
 
     /// Collect the information about the changes in the lines, which
@@ -1056,6 +1072,79 @@ impl<T> Dimensions for Term<T> {
     }
 }
 
+/// Decide whether a Kitty graphics APC must move the terminal cursor, and
+/// by how much. The protocol places a displayed image at the cursor and then
+/// requires the cursor to advance past it - right by the placement's columns
+/// and down by its rows - unless the sender set the `C=1` no-movement policy
+/// or the placement is relative (a `p=` parent).
+///
+/// The rectangle comes from `c`/`r` when the client states it. Most clients
+/// (icat in its normal mode) instead place the image at native size and give
+/// only `s`/`v` (the pixel dimensions); the rectangle is then those pixel
+/// sizes rounded up to cells, which needs `cell_w`/`cell_h`. Returns
+/// `Some((right, down))` for a cursor-anchored display (`a=T`/`a=p`/`a=1`) of
+/// a fully-determined rectangle; `None` for transmit-only (`a=t`), deletes,
+/// queries, `C=1`, relative placements, or a rectangle that can't be derived.
+///
+/// Kept deliberately tiny and separate from the application's parser
+/// (`src/kitty.rs`): this is the one protocol decision that must be made at
+/// APC time, when the cursor is still at the placement anchor.
+pub fn kitty_placement_cursor_advance(payload: &[u8], cell_w: u32, cell_h: u32) -> Option<(u32, u32)> {
+    // Only Kitty graphics frames: the namespace letter `G`. Anything else
+    // (tmux passes several APC dialects through) is not ours to move for.
+    if payload.first() != Some(&b'G') {
+        return None;
+    }
+    // Wire shape is `G;<params>;<data>`: strip the namespace and the framing
+    // `;` after it, then cut the params off the base64 data at the next `;`
+    // (same framing the application's parser uses in `src/kitty.rs`).
+    let bare = &payload[1..];
+    let rest: &[u8] = if bare.first() == Some(&b';') { &bare[1..] } else { bare };
+    let params = match rest.iter().position(|&b| b == b';') {
+        Some(p) => &rest[..p],
+        None => rest,
+    };
+    let s = std::str::from_utf8(params).ok()?;
+    let mut action: Option<char> = None;
+    let mut cols: Option<u32> = None; // explicit `c`, in cells
+    let mut rows: Option<u32> = None; // explicit `r`, in cells
+    let mut px_w: Option<u32> = None; // `s`, image width in pixels
+    let mut px_h: Option<u32> = None; // `v`, image height in pixels
+    let mut no_move = false;
+    let mut has_parent = false;
+    for tok in s.split(',') {
+        let Some((k, v)) = tok.split_once('=') else {
+            continue;
+        };
+        if k.len() > 2 {
+            continue; // a data token (base64), not a key
+        }
+        match k {
+            "a" => action = v.chars().next(),
+            "c" => cols = v.trim().parse().ok(),
+            "r" => rows = v.trim().parse().ok(),
+            "s" => px_w = v.trim().parse().ok(),
+            "v" => px_h = v.trim().parse().ok(),
+            "C" => no_move = v.trim() == "1",
+            "p" => has_parent = true,
+            _ => {},
+        }
+    }
+    let display = matches!(action, Some('T' | 'p' | '1'));
+    if !display || no_move || has_parent {
+        return None;
+    }
+    // An explicit cell dimension wins; otherwise round the pixel size up to
+    // the cells it spans. `ceil(a / b) = (a + b - 1) / b` for b >= 1.
+    let right = cols.or_else(|| {
+        px_w.and_then(|w| (cell_w > 0).then(|| w.saturating_add(cell_w - 1) / cell_w))
+    })?;
+    let down = rows.or_else(|| {
+        px_h.and_then(|h| (cell_h > 0).then(|| h.saturating_add(cell_h - 1) / cell_h))
+    })?;
+    Some((right, down))
+}
+
 impl<T: EventListener> Handler for Term<T> {
 
     /// OSC 133 semantic shell integration (mypixels patch; see
@@ -1084,6 +1173,27 @@ impl<T: EventListener> Handler for Term<T> {
         let line = self.grid.history_size() + self.grid.cursor.point.line.0.max(0) as usize;
         let col = self.grid.cursor.point.column.0;
         self.event_proxy.send_event(Event::Apc { payload: bytes.to_vec(), line, col });
+        // A displayed image lands at the anchor captured above; the protocol
+        // then requires the cursor to move past it. That move must happen
+        // here, at APC time - the only moment the cursor is still at the
+        // anchor. By the time the app drains the event, the app's own
+        // following bytes (icat prints a newline) have already moved it.
+        if let Some((right, down)) =
+            kitty_placement_cursor_advance(bytes, self.cell_px.0, self.cell_px.1)
+        {
+            // Right by the placement's columns, clamped at the right edge (the
+            // protocol leaves positioning past the screen to implementations),
+            // then down by its rows - scrolling the screen at the bottom
+            // exactly as `down` line feeds would.
+            if right > 0 {
+                let cols = self.grid.columns().max(1);
+                let col = (self.grid.cursor.point.column.0 + right as usize).min(cols - 1);
+                self.grid.cursor.point.column = Column(col);
+            }
+            for _ in 0..down {
+                self.linefeed();
+            }
+        }
     }
 
     #[inline]

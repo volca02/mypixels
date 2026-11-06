@@ -911,4 +911,47 @@ mod tests {
         k.on_apc(&apc("a=t,i=4,f=100", &b64(&tiny_png())), 1, 0);
         assert_eq!(k.image(4).unwrap().generation, 1);
     }
+
+    /// The terminal-side rule for moving the cursor past a displayed image.
+    /// This is what keeps a prompt clear of an icat-drawn image: icat sends
+    /// `c`/`r` and one trailing newline and expects the terminal to have
+    /// advanced the cursor by the placement rectangle.
+    #[test]
+    fn placement_cursor_advance_rule() {
+        use alacritty_terminal::term::kitty_placement_cursor_advance as adv;
+        // A 10x20 px cell, as the parser would be handed from the term.
+        let (cw, ch) = (10u32, 20u32);
+        // Explicit rectangle (c/r): used as-is, pixels ignored.
+        assert_eq!(adv(&apc("a=T,i=7,f=100,c=42,r=17", b""), cw, ch), Some((42, 17)));
+        assert_eq!(adv(&apc("a=p,i=7,c=10,r=3", b""), cw, ch), Some((10, 3)));
+        assert_eq!(adv(&apc("a=1,i=7,c=5,r=2", b""), cw, ch), Some((5, 2)));
+        // Key order is irrelevant.
+        assert_eq!(adv(&apc("r=9,a=T,c=8,i=1", b""), cw, ch), Some((8, 9)));
+        // Native size (icat's normal mode): only s/v, derived from the cell.
+        // 200x100 px in a 10x20 cell -> 20 x 5 cells.
+        assert_eq!(adv(&apc("a=T,q=2,f=100,t=f,s=200,v=100", b""), cw, ch), Some((20, 5)));
+        // Rounded up: 201x101 px -> 21 x 6 cells.
+        assert_eq!(adv(&apc("a=T,f=100,s=201,v=101", b""), cw, ch), Some((21, 6)));
+        // An exact multiple is not rounded up: 200x100 -> 20 x 5, not 21 x 6.
+        assert_eq!(adv(&apc("a=T,f=100,s=200,v=100", b""), cw, ch), Some((20, 5)));
+        // Explicit c/r beat the pixel-derived size when both are present.
+        assert_eq!(adv(&apc("a=T,f=100,c=3,r=2,s=200,v=100", b""), cw, ch), Some((3, 2)));
+        // Transmit-only stores but never displays: no movement.
+        assert_eq!(adv(&apc("a=t,i=7,f=100,c=10,r=3", b""), cw, ch), None);
+        // Deletes and queries don't advance from the cursor.
+        assert_eq!(adv(&apc("a=d,i=7,c=10,r=3", b""), cw, ch), None);
+        assert_eq!(adv(&apc("a=q,i=7,c=10,r=3", b""), cw, ch), None);
+        // The C=1 no-movement policy (icat sets this with --place).
+        assert_eq!(adv(&apc("a=T,i=7,c=10,r=3,C=1", b""), cw, ch), None);
+        // A relative placement (p= parent) is anchored elsewhere.
+        assert_eq!(adv(&apc("a=T,i=7,c=10,r=3,p=4", b""), cw, ch), None);
+        // A rectangle that can't be derived (no c/r and no s/v) moves nothing.
+        assert_eq!(adv(&apc("a=T,i=7,f=100", b""), cw, ch), None);
+        // Trailing base64 data must not be misread as keys: it is cut off at
+        // the data-separating ';' before the params are scanned.
+        let data = b64(&tiny_png());
+        assert_eq!(adv(&apc("a=T,i=7,f=100,s=4,v=2", &data), cw, ch), Some((1, 1)));
+        // A non-Kitty APC (tmux passes other dialects through) never moves.
+        assert_eq!(adv(b"q;some other dialect", cw, ch), None);
+    }
 }

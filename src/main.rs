@@ -1122,6 +1122,7 @@ impl App {
             };
             for tab in &self.wins[self.cur].tabs {
                 tab.term.lock().resize(self.wins[self.cur].dims);
+                tab.term.lock().set_cell_pixels(self.cell_w as u32, self.cell_h as u32);
                 let _ = tab.sender.send(Msg::Resize(window_size));
             }
         }
@@ -1214,6 +1215,14 @@ impl App {
         }
         // Cell size changed -> the grid that fits the surface changes.
         self.sync_term_size();
+        // The cell size is global, so refresh every tab's term - not just the
+        // active window's - so a native-sized Kitty image in any window is
+        // measured in the current cell, not a stale one.
+        for w in self.wins.iter() {
+            for t in &w.tabs {
+                t.term.lock().set_cell_pixels(self.cell_w as u32, self.cell_h as u32);
+            }
+        }
         // Font routing depends on the terminal font, so rebuild it with it.
         *self.coverage.borrow_mut() = Some(fonts::Coverage::new(
             &self.font_system,

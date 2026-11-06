@@ -196,6 +196,10 @@ impl Tab {
             dims,
             listener.clone(),
         )));
+        // The cell geometry the PTY is told about is exactly what a
+        // native-sized Kitty image must be measured in to advance the cursor
+        // by the right number of cells.
+        term.lock().set_cell_pixels(window_size.cell_width as u32, window_size.cell_height as u32);
 
         tty::setup_env();
         // Honest identity for anything that branches on it (alacritty's
