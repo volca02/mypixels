@@ -334,6 +334,9 @@ pub struct Term<T> {
     /// advance by the image's pixel size expressed in cells - which needs
     /// this. Defaults to `(1, 1)` so nothing divides by zero before it is set.
     cell_px: (u32, u32),
+
+    /// OSC 133 B input anchor, as an eviction-proof row ID and cell column.
+    shell_input_start: Option<(usize, usize)>,
 }
 
 /// Configuration options for the [`Term`].
@@ -449,6 +452,7 @@ impl<T> Term<T> {
             title: Default::default(),
             mode: Default::default(),
             cell_px: (1, 1),
+            shell_input_start: None,
         }
     }
 
@@ -1224,7 +1228,34 @@ impl<T: EventListener> Handler for Term<T> {
         // screen right now (see Event::Semantic).
         let row = self.grid.scrolled_out() + self.grid.cursor.point.line.0.max(0) as usize;
         let alt = self.mode.intersects(TermMode::ALT_SCREEN);
-        self.event_proxy.send_event(Event::Semantic { code, exit, line, col, row, alt });
+        // Copy input HERE: a fast command can clear the screen, enter a
+        // TUI, or evict its input before the UI thread drains this event.
+        let command = if code == 2 && !alt {
+            self.shell_input_start.take().and_then(|start| {
+                let base = self.grid.scrolled_out().saturating_sub(self.grid.history_size());
+                if start.0 < base || start >= (row, col) || start.1 >= self.columns() {
+                    return None;
+                }
+                let end = if col == 0 {
+                    (row.checked_sub(1)?, self.columns() - 1)
+                } else {
+                    (row, col - 1)
+                };
+                let point = |(r, c): (usize, usize)| {
+                    Point::new(Line((r - base) as i32 - self.grid.history_size() as i32), Column(c))
+                };
+                let text = self.bounds_to_string(point(start), point(end));
+                Some(text.trim_end().to_owned()).filter(|s| !s.is_empty())
+            })
+        } else {
+            None
+        };
+        if code == 0 || code == 3 {
+            self.shell_input_start = None;
+        } else if code == 1 && !alt {
+            self.shell_input_start = Some((row, col));
+        }
+        self.event_proxy.send_event(Event::Semantic { code, exit, line, col, row, alt, command });
     }
 
     /// A character to be displayed.
@@ -2026,6 +2057,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.title_stack = Vec::new();
         self.title = None;
         self.selection = None;
+        self.shell_input_start = None;
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();

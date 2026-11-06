@@ -13,7 +13,7 @@ env = dict(os.environ, HOME=str(work), RUST_LOG='info', PATH=str(helpers)+os.pat
 env.pop('WAYLAND_DISPLAY', None)
 env.pop('MYPIXELS_KEYS', None)
 log = (work / 'app.log').open('w')
-app = sp.Popen([(os.environ.get('MYPIXELS_BIN') or os.environ.get('MYPIXELS_BIN') or str(root / 'target/debug/mypixels')), '/usr/bin/python3', str(root / 'tests/pty_fixture.py'), str(work)], env=env, stdout=log, stderr=log)
+app = sp.Popen([(os.environ.get('MYPIXELS_BIN') or os.environ.get('MYPIXELS_BIN') or str(root / 'target/debug/mypixels')), '-s', '/usr/bin/python3', str(root / 'tests/pty_fixture.py'), str(work)], env=env, stdout=log, stderr=log)
 
 def run(*args, **kw):
     if args[0] == 'xsel': args = ('/usr/bin/xsel', *args[1:])
@@ -117,7 +117,8 @@ try:
     for seq in (b'\x1b[0;1;1M', b'\x1b[32;2;1M', b'\x1b[32;3;1M', b'\x1b[3;3;1m'):
         assert seq in reported, f'mouse report {seq!r} missing from {reported!r}'
     assert primary()==last_primary, 'a reported drag must not touch the selection'
-    mouse(cw,strip+ch/2)
+    # Use the center of column 1; x=cw is already column 2.
+    mouse(cw/2,strip+ch/2)
     run('xdotool','click','4')
     wait(lambda: b'\x1b[64;1;1M' in cap()[before:], 'wheel report missing')
     # Shift bypasses reporting: the click selects instead, nothing hits the PTY

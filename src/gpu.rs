@@ -297,13 +297,7 @@ pub struct Gpu {
     /// unchanged run skip shaping, which is the single most expensive thing a
     /// frame does (see `run_sig`).
     pub slot_sig: Vec<u64>,
-    /// Pooled buffers for tab-strip labels.
-    pub tab_pool: Vec<Buffer>,
-    /// Pooled buffers for tab-switcher tile text. Kept separate from `pool`
-    /// because the overview and the terminal draw in the same frame: sharing
-    /// buffers would let the tile headers overwrite terminal runs at prepare
-    /// time.
-    /// Single buffer for the inline rename prompt (terminal font metrics).
+    /// Single buffer for terminal notices (terminal font metrics).
     pub prompt_buf: Buffer,
     // --- Overview previews: real terminal frames, sampled down -------------
     /// Each tab has its own run buffers, using the live terminal's metrics
@@ -369,8 +363,6 @@ impl Gpu {
         font_system: &mut FontSystem,
         font_px: f32,
         font_lh: f32,
-        tab_font_px: f32,
-        tab_font_lh: f32,
     ) -> Gpu {
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
@@ -645,9 +637,6 @@ impl Gpu {
         let pool: Vec<Buffer> = (0..MAX_RUNS)
             .map(|_| Buffer::new(font_system, Metrics::new(font_px, font_lh)))
             .collect();
-        let tab_pool: Vec<Buffer> = (0..16)
-            .map(|_| Buffer::new(font_system, Metrics::new(tab_font_px, tab_font_lh)))
-            .collect();
         let prompt_buf = Buffer::new(font_system, Metrics::new(font_px, font_lh));
 
         // Kitty image pipeline. The preview bind layout and sampler fit it
@@ -748,7 +737,6 @@ impl Gpu {
             img_buffer,
             img_cache: std::collections::HashMap::new(),
             images: Vec::new(),
-            tab_pool,
             prompt_buf,
         }
     }

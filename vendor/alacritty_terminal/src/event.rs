@@ -75,6 +75,8 @@ pub enum Event {
         col: usize,
         row: usize,
         alt: bool,
+        /// Command input copied at C, before output can overwrite the grid.
+        command: Option<String>,
     },
 
     /// One complete APC string (mypixels patch; the Kitty graphics

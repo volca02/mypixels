@@ -7,6 +7,8 @@
 mod clipboard;
 mod config;
 mod egui_ui;
+mod ui_style;
+mod tab_bar;
 mod fonts;
 mod gpu;
 mod kitty;
@@ -41,17 +43,10 @@ use winit::window::{Window, WindowId};
 
 use config::Config;
 use gpu::Gpu;
-use tab::{SpikeListener, Tab};
+use tab::{SemanticMark, SpikeListener, Tab};
 
 const HISTORY: usize = 10_000;
 const MAX_RUNS: usize = 4096;
-const TAB_PAD: f32 = 8.0;
-/// Gap between tabs -- the original gets it from `margin-right: 1px`.
-const TAB_GAP: f32 = 1.0;
-/// Vertical padding inside a tab. The original gets 21px for Terminus 12 from
-/// GTK (`padding: 2px 8px` plus 2px label margins); we reproduce the 2+2.
-const TAB_VPAD: f32 = 2.0;
-
 const PALETTE: [[f32; 3]; 16] = [
     [0.0, 0.0, 0.0], [0.8, 0.2, 0.2], [0.2, 0.6, 0.2], [0.6, 0.6, 0.2],
     [0.2, 0.2, 0.8], [0.6, 0.2, 0.6], [0.2, 0.6, 0.6], [0.8, 0.8, 0.8],
@@ -259,15 +254,8 @@ enum OverviewMode {
 struct OverviewState {
     mode: OverviewMode,
     selected: usize,
-}
-
-/// Grid columns for a tab overview, matching the original:
-/// `ceil(sqrt(n * 1.5))`, at least 1.
-fn grid_cols(n: usize) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    ((n as f32 * 1.5).sqrt().ceil() as usize).max(1)
+    /// Escape restores the tab that was active before this gesture.
+    original: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +297,8 @@ struct Win {
     rows: usize,
     tab_hits: Vec<(f32, f32)>,
     add_hit: (f32, f32),
+    tab_close_hits: Vec<egui::Rect>,
+    tab_close_press: Option<usize>,
     pointer: (f32, f32),
     mouse_button: Option<MouseButton>,
     mouse_last: Option<(u16, u16)>,
@@ -389,6 +379,7 @@ struct App {
     font_system: FontSystem,
     mono_attrs: Attrs<'static>,
     tab_attrs: Attrs<'static>,
+    tab_face_key: String,
     /// Per-codepoint font routing, rebuilt whenever the terminal font changes.
     coverage: RefCell<Option<fonts::Coverage>>,
     /// Runtime terminal font state. `term_pt` is the live size (enlarge/
@@ -423,7 +414,7 @@ struct App {
     /// every BEL as (tab_id, time), drained into attention + pulses
     bell_pings: Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
     /// OSC 133 marks as dispatched, drained into per-tab command blocks
-    sems_ring: Arc<std::sync::Mutex<Vec<(usize, u8, Option<i32>, usize, usize, usize, bool)>>>,
+    sems_ring: Arc<std::sync::Mutex<Vec<SemanticMark>>>,
     /// Opens an order stamp per command (see `CommandBlock::seq`).
     sem_seq: u64,
     /// Complete APC strings awaiting graphics interpretation.
@@ -506,6 +497,7 @@ impl App {
         let tab = fonts::resolve_font(font_system.db(), &tab_spec);
         let term_family: &'static str = Box::leak(term.family.into_boxed_str());
         let tab_family: &'static str = Box::leak(tab.family.into_boxed_str());
+        let tab_face_key = egui_ui::preview_family_name(tab_family, tab.weight, tab.slant);
         let (term_weight, term_slant) = (term.weight, term.slant);
         let (mono_attrs, tab_attrs) = {
             let db = font_system.db();
@@ -568,7 +560,7 @@ impl App {
             }
         }
         let tab_char_w = (ttotal / 4.0).max(1.0);
-        let tab_h = (tab_lh + TAB_VPAD * 2.0).round();
+        let tab_h = ui_style::tab_height(tab_lh, 1.0);
 
         log::info!(
             "font: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}, strip = {tab_h:.1}px"
@@ -730,6 +722,7 @@ impl App {
             font_system,
             mono_attrs,
             tab_attrs,
+            tab_face_key,
             coverage: RefCell::new(None),
             term_family,
             term_weight,
@@ -772,20 +765,15 @@ impl App {
 
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
         // Live sizes, not the config's: `term_pt` carries any zoom applied this
-        // session, `self.scale` the display's factor, and cell_h/tab_text_h
-        // are the rounded line heights we lay the grid out with, so the glyph
-        // buffers must match them exactly.
+        // session, `self.scale` the display's factor, and cell_h the rounded
+        // terminal line height, so the glyph buffers match the live grid.
         let term_px = self.term_pt * 96.0 / 72.0 * self.scale;
-        let (_, tab_pt) = config::parse_font(&self.config.tablist_font);
-        let tab_px = tab_pt * 96.0 / 72.0 * self.scale;
         let gpu = Gpu::init(
             event_loop,
             window,
             &mut self.font_system,
             term_px,
             self.cell_h,
-            tab_px,
-            self.tab_text_h,
         );
         // The font popup previews from the app's own database, so the list
         // is exactly what the terminal can actually load.
@@ -1283,13 +1271,13 @@ impl App {
         cov.styled_attrs(self.font_system.db(), ch, flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC))
     }
 
-    /// Rebuild the tablist font from config (family + size): attrs, tab
-    /// metrics, and the tab glyph pool.
+    /// Resolve the configured tab face for egui and refresh strip metrics.
     fn rebuild_tab_font(&mut self) {
         let (tab_spec, tab_pt) = config::parse_font(&self.config.tablist_font);
         let tab_font_px = tab_pt * 96.0 / 72.0 * self.scale;
         let tab = fonts::resolve_font(self.font_system.db(), &tab_spec);
         let tab_family: &'static str = Box::leak(tab.family.into_boxed_str());
+        self.tab_face_key = egui_ui::preview_family_name(tab_family, tab.weight, tab.slant);
         self.tab_metrics =
             fonts::line_metrics(&mut self.font_system, tab_family, tab.weight, tab.slant)
                 .unwrap_or(fonts::LineMetrics::DEFAULT);
@@ -1315,18 +1303,8 @@ impl App {
         self.tab_char_w = tab_char_w;
         self.tab_text_h = tab_lh;
         // Whole pixels again, for the same reason as the cell grid.
-        self.tab_h = (tab_lh + TAB_VPAD * 2.0).round().max(1.0);
+        self.tab_h = ui_style::tab_height(tab_lh, self.scale);
 
-        if let Some(gpu) = &mut self.wins[self.cur].gpu {
-            gpu.tab_pool = (0..16)
-                .map(|_| {
-                    Buffer::new(
-                        &mut self.font_system,
-                        Metrics::new(tab_font_px, tab_lh),
-                    )
-                })
-                .collect();
-        }
         self.sync_term_size();
         log::info!(
             "tab font: {} {:.0}pt; text {:.0}, strip {:.0}",
@@ -1405,6 +1383,7 @@ impl App {
         add("Copy as image", "copy_as_image", has_tab, true);
         add("Copy last image", "copy_last_image", has_image, false);
         add("Copy last output", "copy_last_output", has_tab, false);
+        add("Command history", "show_history", has_tab, false);
         add("New tab", "new_tab", true, true);
         add("Rename tab", "rename_tab", has_tab, false);
         add("Close tab", "close_tab", has_tab, false);
@@ -1659,8 +1638,26 @@ impl App {
         // theme changes edit the palette under a running UI, and egui
         // reads visuals at layout time, not paint time.
         if let Some(e) = self.wins[self.cur].egui.as_ref() {
-            e.ctx.set_visuals(egui_ui::ui_theme(&self.config, self.bg, self.fg));
+            e.ctx.set_visuals(ui_style::theme(&self.config, self.bg, self.fg));
         }
+        let tab_faces: Vec<tab_bar::TabFace> = if show_strip {
+            self.wins[self.cur].tabs.iter().enumerate().map(|(i, tab)| tab_bar::TabFace {
+                id: tab.id,
+                title: tab_title(tab, i == self.wins[self.cur].active, self.config.tab_title_max_length,
+                    self.config.tab_title_short_current, &self.config.tab_shorten_str),
+                tooltip: format!("{}\n{}", tab.display_title(), tab.current_dir().unwrap_or_default()),
+                group: if tab.group < 8 { Some(ui_style::rgb_c32(self.config.col[tab.group])) } else { None },
+                entangled: tab.entangled,
+                attention: self.wins[self.cur].bell_pulse.filter(|(index, _)| *index == i)
+                    .map_or(0.0, |(_, at)| (1.0 - at.elapsed().as_secs_f32() / 0.9).clamp(0.0, 1.0)),
+            }).collect()
+        } else { Vec::new() };
+        let tab_font = egui::FontId::new(config::parse_font(&self.config.tablist_font).1 * 96.0 / 72.0,
+            egui::FontFamily::Name(self.tab_face_key.clone().into()));
+        let clock = (self.config.tab_prepend.as_deref() == Some("clock")).then(|| {
+            let (hour, minute) = local_hhmm(); format!("{hour:02}:{minute:02}")
+        });
+        let mut strip_geometry = tab_bar::Geometry::default();
         let mut full_output: Option<egui::FullOutput> = None;
         // The switcher draws through egui; its state machine stays in the
         // app (Alt-hold open, navigation, Alt release dismiss). The older
@@ -1670,23 +1667,35 @@ impl App {
                 self.wins[self.cur].overview.map(|o| o.mode),
             Some(OverviewMode::Switcher));
         let sw_selected = self.wins[self.cur].active;
+        let (sw_preview_w, sw_preview_h) = egui_ui::thumbnail_size(
+            w as f32 / self.scale.max(1.0),
+            w as f32 / (h as f32 - if show_strip { self.tab_h } else { 0.0 }).max(1.0),
+            self.config.tab_overview_thumb_width,
+            self.config.tab_overview_thumb_height,
+        );
         let sw_cards: Vec<egui_ui::SwitcherCard> = if sw_open {
             self.wins[self.cur].tabs
                 .iter()
                 .enumerate()
                 .map(|(i, t)| {
                     let title = t.display_title();
-                    // No strip truncation here: the strip's character budget
-                    // is not the card's. The card lays the full title out and
-                    // wraps it to two lines, ellipsizing only what a third
-                    // line would need -- the original's overview labels.
+                    // Cards truncate within their header; the tooltip retains
+                    // the full title and working directory.
                     let cwd_line = t.current_dir().filter(|c| c != &title);
                     let thumb = self.wins[self.cur].
                         sw_thumbs
                         .get(i)
                         .and_then(|t| t.as_ref())
                         .map(|t| (t.handle.clone(), t.size));
+                    let status = self.sem_blocks.get(&t.id)
+                        .and_then(|blocks| blocks.iter().rev().find(|b| b.is_history_command()))
+                        .map(|b| if !b.done { egui_ui::SwitcherStatus::Running }
+                            else if b.exit.is_some_and(|e| e != 0) { egui_ui::SwitcherStatus::Failed }
+                            else if b.exit == Some(0) { egui_ui::SwitcherStatus::Passed }
+                            else { egui_ui::SwitcherStatus::Completed })
+                        .unwrap_or_default();
                     egui_ui::SwitcherCard {
+                        status,
                         title,
                         active: i == self.wins[self.cur].active,
                         marker: t.entangled,
@@ -1716,14 +1725,32 @@ impl App {
                 raw.events
                     .extend(std::mem::take(&mut self.wins[self.cur].fifo_egui_events));
                 let ctx = egui.ctx.clone();
+                // The history panel's rows are a snapshot of the pool,
+                // rebuilt every frame while it is open: new commands show
+                // up in the list with no extra plumbing, and a tab switch
+                // swaps the list without the app noticing.
+                if egui.ui_state.panel_is(egui_ui::RightPanel::History) {
+                    if let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
+                        egui.ui_state.history_rows = self.history_rows_for(tab.id);
+                    }
+                }
+                egui.ui_state.panel_top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
                 let full = ctx.run_ui(raw, |ui| {
+                    if show_strip {
+                        strip_geometry = tab_bar::show(ui, self.tab_h / ctx.pixels_per_point(), tab_font.clone(),
+                            &tab_faces, self.wins[self.cur].active, clock.as_deref(), &self.config);
+                    }
+                    let mut config_open = egui.ui_state.panel_is(egui_ui::RightPanel::Settings);
                     let ev = egui_ui::config_window(
                         ui,
-                        &mut egui.config_open,
+                        &mut config_open,
                         &mut self.config,
                         &mut egui.ui_state,
                         &egui.font_choices,
                     );
+                    if !config_open {
+                        egui.ui_state.close_panel(egui_ui::RightPanel::Settings);
+                    }
                     egui.config_changed = ev.apply;
                     egui.save_requested = ev.save;
                     egui.revert_requested = ev.revert;
@@ -1735,12 +1762,22 @@ impl App {
                             sw_dim,
                             sw_accent,
                             &sw_cards,
+                            egui::vec2(sw_preview_w.round(), sw_preview_h.round()),
                             &mut egui.switcher_pick,
                         );
                     }
                     egui_ui::rename_box(ui, &mut egui.ui_state);
                     egui_ui::move_pick_box(ui, &mut egui.ui_state);
                     egui_ui::ctx_menu(ui, &mut egui.ui_state);
+                    if !sw_open && egui.ui_state.panel_is(egui_ui::RightPanel::History) {
+                        // Status dots wear the palette's own green and red
+                        // (the fixed pair only when no palette is set).
+                        let pal = self.config.palette;
+                        let ok = ui_style::rgb_c32(pal.map(|p| p[2]).unwrap_or(crate::config::Rgb(59, 193, 126)));
+                        let err = ui_style::rgb_c32(pal.map(|p| p[1]).unwrap_or(crate::config::Rgb(239, 97, 109)));
+                        let top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
+                        egui_ui::history_panel(ui, &mut egui.ui_state, ok, err, top);
+                    }
                     if let Some(r) = self.ripple.as_ref() {
                         let t = r.at.elapsed().as_secs_f32() / 0.18;
                         if t < 1.0 {
@@ -1765,9 +1802,13 @@ impl App {
                         }
                     }
                 });
-                // While the pointer is down on a slider, egui keeps asking
-                // for frames; forward that to winit's redraw path.
-                if ctx.requested_repaint_last_pass() {
+                egui.ui_state.release_passive_focus(&ctx, &full.platform_output);
+                // New windows/areas need a sizing pass before they can
+                // paint. Forward THIS pass's immediate repaint request;
+                // checking only the previous pass can strand a new menu.
+                if full.viewport_output.get(&egui::ViewportId::ROOT)
+                    .is_some_and(|output| output.repaint_delay.is_zero())
+                {
                     window.request_redraw();
                 }
                 // A panel/popup that closed this frame must surrender
@@ -1797,20 +1838,32 @@ impl App {
                 }
                 if let Some(pick) = egui.ui_state.menu_out.take() {
                     egui.ui_state.menu_open = false;
+                    // History can remain open, so the combined popup-open
+                    // flag has no falling edge to release the menu's focus.
+                    egui_ui::release_focus(&ctx);
                     if let Some(action) = pick {
                         self.pending_action = Some(action);
                     }
+                    window.request_redraw();
+                }
+                if let Some((seq, action)) = egui.ui_state.history_out.take() {
+                    self.do_history_action(seq, &action);
                     window.request_redraw();
                 }
                 let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open)
                     || egui.ui_state.rename_open
                     || egui.ui_state.move_open
                     || egui.ui_state.menu_open;
-                egui_ui::release_focus_if_closed(&ctx, egui.config_open, popup_open, &mut egui.open_prev);
+                egui_ui::release_focus_if_closed(&ctx, egui.ui_state.right_panel != egui_ui::RightPanel::Closed, popup_open, &mut egui.open_prev);
                 full_output = Some(full);
             }
             self.wins[self.cur].egui = egui;
         }
+        let scale = self.scale;
+        self.wins[self.cur].tab_hits = strip_geometry.tabs.iter().map(|r| (r.left() * scale, r.right() * scale)).collect();
+        self.wins[self.cur].add_hit = (strip_geometry.add.left() * scale, strip_geometry.add.right() * scale);
+        self.wins[self.cur].tab_close_hits = strip_geometry.close.into_iter()
+            .map(|r| egui::Rect::from_min_max(r.min * scale, r.max * scale)).collect();
         let (revert, changed, save) = self.wins[self.cur].
             egui
             .as_ref()
@@ -1838,7 +1891,7 @@ impl App {
                 Ok(()) => {
                     log::info!("configuration saved");
                     if let Some(e) = self.wins[self.cur].egui.as_mut() {
-                        e.config_open = false;
+                        e.ui_state.close_panel(egui_ui::RightPanel::Settings);
                     }
                 }
                 Err(err) => self.show_error(err),
@@ -1928,169 +1981,6 @@ impl App {
         // --- Text areas (tab labels + terminal runs), one prepare() per frame ---
         let mut areas: Vec<TextArea> = Vec::new();
         let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-
-        // --- Tab strip ---
-        let mut tab_hits: Vec<(f32, f32)> = Vec::new();
-        let mut add_hit = (0.0f32, 0.0f32);
-        if show_strip {
-            let bar = self.config.tablist_background.to_f32();
-            push_rect(&mut gpu.rects, 0.0, 0.0, wf, self.tab_h, [bar[0], bar[1], bar[2], 1.0]);
-            let text_y = ((self.tab_h - self.tab_text_h) / 2.0).round();
-
-            // Measure the labels first. With enough tabs the strip has to scroll
-            // to keep the active one visible, which needs the total width up
-            // front -- the old code simply stopped drawing past the last pool
-            // slot, so the tail of the tab list silently vanished.
-            struct Face {
-                text: String,
-                marker: bool,
-                w: f32,
-            }
-            let faces: Vec<Face> = self.wins[self.cur].
-                tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let text = tab_label(
-                        t,
-                        i,
-                        i == self.wins[self.cur].active,
-                        self.config.tab_title_max_length,
-                        self.config.tab_title_short_current,
-                        &self.config.tab_shorten_str,
-                    );
-                    let marker_w = if t.entangled { self.tab_char_w } else { 0.0 };
-                    let w = text.chars().count() as f32 * self.tab_char_w
-                        + marker_w
-                        + TAB_PAD * 2.0;
-                    Face { text, marker: t.entangled, w }
-                })
-                .collect();
-
-            let clock_label: Option<String> = match self.config.tab_prepend.as_deref() {
-                Some("clock") => {
-                    let (hh, mm) = local_hhmm();
-                    Some(format!("{hh:02}:{mm:02} "))
-                }
-                _ => None,
-            };
-            let clock_w = clock_label
-                .as_ref()
-                .map(|s| s.chars().count() as f32 * self.tab_char_w + 2.0)
-                .unwrap_or(0.0);
-            // "[+]" is three glyphs; the original's add button carries only a
-            // couple of pixels of padding, not the tabs' 8px.
-            let add_w = 3.0 * self.tab_char_w + 2.0;
-            let total =
-                clock_w + faces.iter().map(|f| f.w + TAB_GAP).sum::<f32>() + add_w;
-
-            // Scroll only as far as revealing the active tab requires.
-            let mut scroll = 0.0f32;
-            if total > wf && !faces.is_empty() {
-                let active_end = clock_w
-                    + add_w
-                    + faces.iter().take(self.wins[self.cur].active + 1).map(|f| f.w + TAB_GAP).sum::<f32>();
-                let want = active_end - (wf - add_w - TAB_PAD);
-                scroll = want.max(0.0).min((total - wf).max(0.0));
-            }
-
-            {
-                let fs = &mut self.font_system;
-                let attrs = &self.tab_attrs;
-                let tpool = &mut gpu.tab_pool;
-                let mut slot = 0usize;
-                let mut x = -scroll;
-
-                if let Some(label) = clock_label.as_deref() {
-                    if slot < tpool.len() {
-                        push_tab_label(tpool, slot, fs, attrs, label, x + 1.0, text_y, self.config.accent_color.to_f32(), &mut areas, self.tab_char_w, bounds);
-                        slot += 1;
-                    }
-                    x += clock_w;
-                }
-
-                // The add button comes FIRST, right after the prepend: the
-                // original packs it with `pack_start`, so it renders to the left
-                // of every tab. Appending it after the tabs (as this did) was the
-                // single most visible difference between the two title bars.
-                {
-                    let c = self.config.add_button_color.to_f32();
-                    let bbg = if self.wins[self.cur].hover_add { brighten(bar, 1.4) } else { brighten(bar, 1.1) };
-                    push_rect(&mut gpu.rects, x, 0.0, add_w, self.tab_h - 1.0, [bbg[0], bbg[1], bbg[2], 1.0]);
-                    if slot < tpool.len() {
-                        push_tab_label(tpool, slot, fs, attrs, "[+]", x + 1.0, text_y, c, &mut areas, self.tab_char_w, bounds);
-                        slot += 1;
-                    }
-                    add_hit = (x, x + add_w);
-                    x += add_w;
-                }
-
-                for (i, face) in faces.iter().enumerate() {
-                    // One pool slot for the label, one more for the entangle
-                    // marker (two areas sharing a Buffer would both render the
-                    // buffer's current contents).
-                    let need = if face.marker { 2 } else { 1 };
-                    if slot + need > tpool.len() {
-                        break;
-                    }
-                    let selected = i == self.wins[self.cur].active;
-                    let t = &self.wins[self.cur].tabs[i];
-                    let mut fgc = if selected {
-                        self.config.tab_color_fg_selected.to_f32()
-                    } else {
-                        self.config.tab_color_fg.to_f32()
-                    };
-                    if t.group < 8 {
-                        fgc = self.config.col[t.group].to_f32();
-                    }
-                    let bgc = if selected {
-                        self.config.tab_color_bg_selected.to_f32()
-                    } else {
-                        self.config.tab_color_bg.to_f32()
-                    };
-                    // Leave the bottom pixel to the bar seam so tabs sit *on*
-                    // the strip instead of covering it.
-                    let body_h = self.tab_h - 1.0;
-                    push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [bgc[0], bgc[1], bgc[2], 1.0]);
-                    if self.wins[self.cur].hover_tab == i && !selected {
-                        // Wash of the label's own colour rather than an invented
-                        // grey, so hover matches whatever theme is configured.
-                        push_rect(&mut gpu.rects, x, 0.0, face.w, body_h, [fgc[0], fgc[1], fgc[2], 0.12]);
-                    }
-                    if let Some((pi, pat)) = self.wins[self.cur].bell_pulse {
-                        if pi == i {
-                            let t = pat.elapsed().as_secs_f32() / 0.9;
-                            if t < 1.0 {
-                                // The palette's own red, fading off the tab -
-                                // unreadable-news marker, not a fire alarm.
-                                let rc = self.config.col[1].to_f32();
-                                push_rect(
-                                    &mut gpu.rects,
-                                    x,
-                                    0.0,
-                                    face.w,
-                                    body_h,
-                                    [rc[0], rc[1], rc[2], 0.4 * (1.0 - t)],
-                                );
-                            }
-                        }
-                    }
-                    let marker_slot = slot;
-                    let label_slot = slot + if face.marker { 1 } else { 0 };
-                    let mut tx = x + TAB_PAD;
-                    if face.marker {
-                        push_tab_label(tpool, marker_slot, fs, attrs, "*", tx, text_y, self.config.tab_color_entangle.to_f32(), &mut areas, self.tab_char_w, bounds);
-                        tx += self.tab_char_w;
-                    }
-                    push_tab_label(tpool, label_slot, fs, attrs, &face.text, tx, text_y, fgc, &mut areas, self.tab_char_w, bounds);
-                    tab_hits.push((x, x + face.w));
-                    slot += need;
-                    x += face.w + TAB_GAP;
-                }
-            }
-        }
-        self.wins[self.cur].tab_hits = tab_hits;
-        self.wins[self.cur].add_hit = add_hit;
 
         // --- Terminal: cell backgrounds ---
         for run in &frame.runs {
@@ -2476,12 +2366,13 @@ impl App {
         // throttling and two-per-frame cap as the preview jobs) and upload
         // them to egui. The thumbnail takes the terminal area of the texture
         // at its own aspect, so a card shows the tab without letterboxing.
-        if sw_open {
-            let Some(ov) = &self.wins[self.cur].overview else { return };
-            let ctx = match self.wins[self.cur].egui.as_ref() {
-                Some(e) => e.ctx.clone(),
-                None => return,
-            };
+        // A card click may have closed the overlay earlier in this draw.
+        // Skip readbacks without returning: the moved-out GPU must be restored.
+        if let (true, Some(ov), Some(ctx)) = (
+            sw_open,
+            self.wins[self.cur].overview,
+            self.wins[self.cur].egui.as_ref().map(|e| e.ctx.clone()),
+        ) {
             let n = self.wins[self.cur].tabs.len();
             let sel = ov.selected.min(n.saturating_sub(1));
             let term_h = ((h as f32) - strip_h).max(1.0);
@@ -2638,7 +2529,11 @@ impl App {
                     self.wins[self.cur].overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
                         selected: self.wins[self.cur].active,
+                        original: self.wins[self.cur].active,
                     });
+                    if let Some(e) = self.wins[self.cur].egui.as_ref() {
+                        egui_ui::release_focus(&e.ctx);
+                    }
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
                 continue;
@@ -2646,6 +2541,11 @@ impl App {
             if line == "shot" {
                 // Test hook: fire the context menu's "Copy as image".
                 self.do_action("copy_as_image", event_loop);
+                continue;
+            }
+            if line == "history" {
+                // Test hook: toggle the command-history panel.
+                self.do_action("show_history", event_loop);
                 continue;
             }
             if line == "alt_up" {
@@ -2731,9 +2631,9 @@ impl App {
             return false;
         }
         let m = egui_mods(mods);
-        let egui = self.wins[self.cur].egui.as_ref().unwrap();
-        if !egui.ctx.egui_wants_keyboard_input() {
-            return false; // nothing focused: egui-winit would not consume it
+        let action = config::find_action(&self.config.bindings, key, mods, false);
+        if !self.egui_owns_keyboard() || matches!(action.as_deref(), Some("show_config" | "show_history")) {
+            return false;
         }
         match key {
             // egui inserts characters from Text events, exactly as a real
@@ -3058,13 +2958,13 @@ impl App {
     /// time; this only associates marks into blocks and forgets tabs that
     /// are gone (a mark racing its tab's death is simply irrelevant).
     fn drain_sems(&mut self) {
-        let evs: Vec<(usize, u8, Option<i32>, usize, usize, usize, bool)> =
+        let evs: Vec<SemanticMark> =
             std::mem::take(&mut *self.sems_ring.lock().unwrap());
         if !self.config.osc133 {
             return;
         }
         let cap = self.config.history_block_bytes;
-        for (tab_id, code, exit, line, row, col, alt) in evs {
+        for SemanticMark { tab_id, code, exit, line, row, col, alt, command, when } in evs {
             // The tab the mark belongs to, wherever it lives now.
             let tab = match self
                 .wins
@@ -3087,6 +2987,14 @@ impl App {
                 self.sem_seq += 1;
             }
             apply_sem_mark(blocks, code, exit, line, row, alt, self.sem_seq);
+            if code == 2 {
+                if let Some(b) = blocks.iter_mut().rev().find(|b| !b.done) {
+                    b.started_at.get_or_insert(when);
+                    if let Some(command) = command {
+                        b.cmd_line = command;
+                    }
+                }
+            }
             if code != 3 {
                 continue;
             }
@@ -3095,6 +3003,7 @@ impl App {
             if !b.done {
                 continue; // a stray second D: the fold ignored it
             }
+            b.finished_at = Some(when);
             if alt || b.alt_seen {
                 // A full-screen program owned the rows this command
                 // "wrote". There is no output to capture; say so.
@@ -3124,7 +3033,7 @@ impl App {
                 b.truncated_head |= b.start_global < base || readable > from;
                 push_block_text(b, &txt, cap);
             }
-            compress_closed_block(b);
+            finish_block(b);
         }
         let budget = self.config.history_bytes;
         evict_to_budget(&mut self.sem_blocks, budget);
@@ -3147,6 +3056,105 @@ impl App {
             .and_then(|t| self.sem_blocks.get_mut(&t.id))
             .map(|q| format_last_output(q, n.max(1) as usize))
             .unwrap_or_default()
+    }
+
+    /// The history panel's rows for one tab: newest first, every field
+    /// precomputed. A closed block's command line came from its C mark
+    /// at dispatch; an idle prompt is kept out of the command list.
+    fn history_rows_for(&self, tab_id: usize) -> Vec<egui_ui::HistoryRow> {
+        self.sem_blocks.get(&tab_id).map(|q| {
+            q.iter().rev().filter(|b| b.is_history_command()).map(|b| {
+                let stamp = b.finished_at.or(b.started_at);
+                let time = stamp
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| local_hms(d.as_secs() as i64))
+                    .unwrap_or_default();
+                let duration = match (b.started_at, b.finished_at) {
+                    (Some(s), Some(f)) => f
+                        .duration_since(s)
+                        .ok()
+                        .map(format_duration)
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let cmd = if b.cmd_line.is_empty() {
+                    b.text.lines().next().unwrap_or_default().to_string()
+                } else {
+                    b.cmd_line.clone()
+                };
+                egui_ui::HistoryRow {
+                    seq: b.seq,
+                    cmd,
+                    exit: b.exit,
+                    done: b.done,
+                    alt_seen: b.alt_seen,
+                    lines: b.line_count,
+                    time,
+                    duration,
+                }
+            }).collect()
+        }).unwrap_or_default()
+    }
+
+    /// What the history panel's action buttons asked for. `seq` identifies
+    /// the block; the panel's own dismissal is not an action. The block's
+    /// data is copied out first: the actions need `&mut self` (clipboard,
+    /// scroll), which cannot coexist with a live borrow of the pool.
+    fn do_history_action(&mut self, seq: u64, action: &str) {
+        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
+            return;
+        };
+        let tab_id = tab.id;
+        let (prompt_line, cmd_line, text) = {
+            let Some(b) = self
+                .sem_blocks
+                .get_mut(&tab_id)
+                .and_then(|q| q.iter_mut().find(|b| b.seq == seq))
+            else {
+                // Evicted while the panel was open: say so, do not guess.
+                self.show_error("That command left the output pool".into());
+                return;
+            };
+            (b.prompt_line, b.cmd_line.clone(), b.readable_text().to_string())
+        };
+        match action {
+            "copy" => {
+                if text.is_empty() {
+                    self.show_error("No captured output to copy".into());
+                } else {
+                    self.copy_text(clipboard::Kind::Clipboard, text);
+                    self.wins[self.cur].notice =
+                        Some(("Command output copied".to_string(), Instant::now()));
+                }
+            }
+            "rerun" => {
+                if cmd_line.is_empty() {
+                    self.show_error("No command line to re-run".into());
+                } else {
+                    let mut bytes = cmd_line.as_bytes().to_vec();
+                    bytes.push(b'\r');
+                    tab.write(&bytes);
+                }
+            }
+            // The same viewport math as `jump_command`: the offset that
+            // puts the prompt line at the top is `history_size - line`.
+            "view" => {
+                let (hist, cur) = {
+                    let term = tab.term.lock();
+                    (term.grid().history_size(), term.grid().display_offset())
+                };
+                let want = hist.saturating_sub(prompt_line);
+                let delta = want as i32 - cur as i32;
+                if delta != 0 {
+                    tab.scroll(alacritty_terminal::grid::Scroll::Delta(delta));
+                    if let Some(w) = &self.wins[self.cur].window {
+                        w.request_redraw();
+                    }
+                }
+            }
+            // The panel draws it disabled; a stray one is a no-op.
+            _ => {}
+        }
     }
 
     /// Scroll so the viewport top lands on the previous/next command's
@@ -3444,15 +3452,12 @@ impl App {
     /// typing into right now. Keys belong to egui only under that
     /// condition; anything else belongs to the terminal or the bindings.
     fn egui_owns_keyboard(&self) -> bool {
+        // The switcher owns navigation even when a sidebar was open before it.
+        if self.wins[self.cur].overview.is_some() { return false; }
         let Some(e) = self.wins[self.cur].egui.as_ref() else {
             return false;
         };
-        let st = &e.ui_state;
-        e.config_open
-            || st.rename_open
-            || st.font_popup.as_ref().is_some_and(|p| p.open)
-            || st.menu_open
-            || st.move_open
+        e.ui_state.owns_keyboard(&e.ctx)
     }
 
     /// Close the rename box without committing (app-side Escape).
@@ -3481,19 +3486,18 @@ impl App {
 
     /// Keys while the Alt-held switcher is open. Returns whether the key is
     /// one of the switcher's own bindings and was consumed. The switcher's
-    /// bindings are plain-Alt + arrow/Home/End/digit/Esc, so a key with any
-    /// other modifier (Ctrl+Shift+Left, Alt+Shift+X, ...) is *not* the
-    /// switcher's: it returns `false` and the caller delegates to the normal
+    /// bindings use Alt with arrows, Home/End, digits, Tab, Enter, or Esc.
+    /// Shift-Tab cycles backwards. Other chords fall through to the normal
     /// handler (configured bindings, then the terminal). Navigation changes
     /// the active tab live, so the preview and the eventual commit are the
     /// same tab; Alt release just dismisses the popup.
     fn handle_switcher_key(&mut self, key: &Key) -> bool {
         use winit::keyboard::NamedKey;
-        let alt_only = self.modifiers.alt_key()
+        let alt_navigation = self.modifiers.alt_key()
             && !self.modifiers.control_key()
-            && !self.modifiers.shift_key()
-            && !self.modifiers.super_key();
-        if !alt_only {
+            && !self.modifiers.super_key()
+            && (!self.modifiers.shift_key() || matches!(key, Key::Named(NamedKey::Tab)));
+        if !alt_navigation {
             return false;
         }
         let n = self.wins[self.cur].tabs.len();
@@ -3501,8 +3505,19 @@ impl App {
             self.close_switcher();
             return true;
         }
-        let cols = grid_cols(n);
+        let screen_width = self.wins[self.cur].window.as_ref()
+            .map(|w| w.inner_size().width as f32 / self.scale.max(1.0)).unwrap_or(1280.0);
+        let cols = egui_ui::switcher_columns(screen_width, n);
         let handled = match key {
+            Key::Named(NamedKey::Tab) => {
+                let step = if self.modifiers.shift_key() { n - 1 } else { 1 };
+                self.wins[self.cur].active = (self.wins[self.cur].active + step) % n;
+                true
+            },
+            Key::Named(NamedKey::Enter) => {
+                self.close_switcher();
+                true
+            },
             Key::Named(NamedKey::ArrowLeft) => {
                 self.wins[self.cur].active = (self.wins[self.cur].active + n - 1) % n;
                 true
@@ -3536,6 +3551,9 @@ impl App {
                 true
             },
             Key::Named(NamedKey::Escape) => {
+                if let Some(overlay) = self.wins[self.cur].overview {
+                    self.wins[self.cur].active = overlay.original.min(n - 1);
+                }
                 self.close_switcher();
                 true
             },
@@ -3706,10 +3724,14 @@ impl App {
                 self.reload_config();
             },
             "show_config" => {
+                self.close_switcher();
+                *self.switcher_alt_at.lock().unwrap() = None;
+                self.switcher_show_req.store(false, Ordering::SeqCst);
                 // Toggle: the chord that summoned the panel is the natural
                 // way to dismiss it (same as every transient overlay here).
                 if let Some(e) = self.wins[self.cur].egui.as_mut() {
-                    e.config_open = !e.config_open;
+                    e.ui_state.toggle_panel(egui_ui::RightPanel::Settings);
+                    egui_ui::release_focus(&e.ctx);
                 }
                 if let Some(w) = &self.wins[self.cur].window {
                     w.request_redraw();
@@ -3752,6 +3774,31 @@ impl App {
                     self.copy_text(clipboard::Kind::Clipboard, text);
                     self.wins[self.cur].notice =
                         Some(("Last output copied".to_string(), Instant::now()));
+                }
+            }
+            "show_history" => {
+                let opening = !self
+                    .wins[self.cur]
+                    .egui
+                    .as_ref()
+                    .is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::History));
+                // The rows are built before the egui borrow: the builder
+                // reads the pool, the toggle writes the UI state.
+                let rows = if opening {
+                    self.wins[self.cur]
+                        .tabs
+                        .get(self.wins[self.cur].active)
+                        .map(|t| self.history_rows_for(t.id))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if let Some(egui) = self.wins[self.cur].egui.as_mut() {
+                    let st = &mut egui.ui_state;
+                    st.toggle_panel(egui_ui::RightPanel::History);
+                    egui_ui::release_focus(&egui.ctx);
+                    st.history_sel = None;
+                    st.history_rows = rows;
                 }
             }
             // The lossless path: the store keeps the untouched upload bytes
@@ -3826,17 +3873,6 @@ impl App {
     }
 }
 
-/// Build the tab strip label text, mimicking the Python tab_format.
-/// Scale a colour toward white, clamped. Mirrors the original's `brighten()`,
-/// which GTK uses for the add-tab button background.
-fn brighten(c: [f32; 3], f: f32) -> [f32; 3] {
-    [
-        (c[0] * f).min(1.0),
-        (c[1] * f).min(1.0),
-        (c[2] * f).min(1.0),
-    ]
-}
-
 /// Local HH:MM. `std::time` has no calendar/local conversion, and pulling in a
 /// date-time crate for a two-number clock label is not worth it.
 fn local_hhmm() -> (u32, u32) {
@@ -3853,64 +3889,45 @@ fn local_hhmm() -> (u32, u32) {
     }
 }
 
-fn tab_label(
-    t: &Tab,
-    idx: usize,
-    selected: bool,
-    max_len: usize,
-    cur_len: usize,
-    shorten: &str,
-) -> String {
-    let mut name = t.display_title();
-    let limit = if selected { cur_len } else { max_len };
-    if limit > 0 && name.chars().count() > limit {
-        name = name.chars().take(limit).collect::<String>() + shorten;
+/// Local HH:MM:SS for a unix timestamp (the history panel's clocks).
+fn local_hms(secs: i64) -> String {
+    // SAFETY: as in `local_hhmm` - `localtime_r` writes the caller's tm.
+    unsafe {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!(
+            "{:02}:{:02}:{:02}",
+            tm.tm_hour.max(0),
+            tm.tm_min.max(0),
+            tm.tm_sec.max(0)
+        )
     }
-    let marker = if t.entangled { "*" } else { "" };
-    let _ = idx;
-    format!("[{marker}{name}]")
-}
-/// Shape a short tab-strip label into a TextArea using the tab pool.
-/// SAFETY: pool indices are unique per call (caller passes distinct slots);
-/// the pool never reallocates after init; the derived shared reference is
-/// only used this frame.
-fn push_tab_label(
-    tpool: &mut [Buffer],
-    slot: usize,
-    fs: &mut FontSystem,
-    attrs: &Attrs,
-    text: &str,
-    x: f32,
-    y: f32,
-    color: [f32; 3],
-    areas: &mut Vec<TextArea>,
-    char_w: f32,
-    bounds: TextBounds,
-) {
-    let b = &mut tpool[slot];
-    b.set_size(None, None);
-    b.set_text(text, attrs, Shaping::Basic, None);
-    b.set_monospace_width(Some(char_w));
-    b.shape_until_scroll(fs, false);
-    let buf: &Buffer = unsafe { &*(b as *const Buffer) };
-    areas.push(TextArea {
-        buffer: buf,
-        left: x,
-        top: y,
-        scale: 1.0,
-        bounds,
-        default_color: glyphon::Color::rgb(
-            (color[0] * 255.0) as u8,
-            (color[1] * 255.0) as u8,
-            (color[2] * 255.0) as u8,
-        ),
-        custom_glyphs: &[],
-    });
 }
 
-/// Render the standalone tab overview: a dark backdrop, a two-line banner, and
-/// a centred grid of tiles. Each tile shows the tab's group colour, its title,
-/// and a scaled thumbnail of the terminal content (built from `frames`).
+/// A duration the panel can read at a glance: ms under a second, one
+/// decimal second under a minute, minutes and seconds beyond.
+fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms < 60_000 {
+        format!("{} s", ms as f32 / 1000.0)
+    } else {
+        format!("{} m {:02} s", ms / 60_000, (ms / 1000) % 60)
+    }
+}
+
+fn tab_title(t: &Tab, selected: bool, max_len: usize, cur_len: usize, shorten: &str) -> String {
+    let name = t.display_title();
+    let limit = if selected { cur_len } else { max_len };
+    if limit > 0 && name.chars().count() > limit {
+        name.chars().take(limit).collect::<String>() + shorten
+    } else { name }
+}
+
+/// Cell backgrounds for an offscreen terminal preview. The switcher crops
+/// the reserved strip region before displaying the terminal thumbnail.
 /// Signature of a whole frame, so a preview buffer is only re-shaped when its
 /// tab actually changed. Same idea as `run_sig`, folded over the frame.
 fn frame_sig(fd: &FrameData, cell_w: f32) -> u64 {
@@ -4180,6 +4197,8 @@ impl App {
                 rows,
                 tab_hits: Vec::new(),
                 add_hit: (0.0, 0.0),
+                tab_close_hits: Vec::new(),
+                tab_close_press: None,
                 pointer: (0.0, 0.0),
                 mouse_button: None,
                 mouse_last: None,
@@ -4387,6 +4406,12 @@ pub struct CommandBlock {
     /// eviction can find the globally oldest closed block instead of
     /// guessing per tab.
     pub seq: u64,
+    /// C and D wall clocks: command execution time excludes time spent
+    /// sitting at the prompt or editing the input.
+    pub started_at: Option<std::time::SystemTime>,
+    pub finished_at: Option<std::time::SystemTime>,
+    /// A prompt alone is not a running command. Set only by C.
+    pub executing: bool,
     /// Buffer-row ID (survives scrollback eviction) of the prompt when
     /// the A mark landed. Capture starts AT the prompt so the echoed
     /// command rides along in the block.
@@ -4409,9 +4434,18 @@ pub struct CommandBlock {
     /// tail. Say so; never silently drop bytes.
     pub truncated_head: bool,
     pub truncated_tail: bool,
+    /// Input copied at the C mark, before the command's output can erase
+    /// it. Available while running as well as after completion.
+    pub cmd_line: String,
+    /// Captured output's line count, for the history panel's details.
+    pub line_count: usize,
 }
 
 impl CommandBlock {
+    pub fn is_history_command(&self) -> bool {
+        self.executing || self.done
+    }
+
     /// Stored size for budget accounting: the compressed form when the
     /// block closed, the live text while it runs.
     pub fn stored_len(&self) -> usize {
@@ -4437,11 +4471,18 @@ impl CommandBlock {
     }
 }
 
-/// Compress a finished block's text in place. Blocks too small to be
-/// worth it, and ones the codec could not shrink, stay plain - the budget
-/// counts stored bytes either way, so both cases cost nothing to detect.
-fn compress_closed_block(b: &mut CommandBlock) {
-    if !b.done || b.text.len() < 512 {
+/// Finalize output metadata and compress it. The command was captured at C,
+/// using terminal cell positions, before any output could erase it. A/D-only
+/// integrations retain the legacy first-line fallback.
+fn finish_block(b: &mut CommandBlock) {
+    b.line_count = b.text.lines().count();
+    if b.cmd_line.is_empty() {
+        b.cmd_line = b.text.lines().next().unwrap_or_default().trim_end().to_string();
+    }
+    // The compression decision is unchanged: blocks too small to be worth
+    // a frame header, and ones the codec cannot shrink, stay plain - the
+    // budget counts stored bytes either way.
+    if b.text.len() < 512 {
         return;
     }
     let frame = lz4_flex::compress(b.text.as_bytes());
@@ -4547,16 +4588,20 @@ fn apply_sem_mark(
                 compressed: None,
                 truncated_head: false,
                 truncated_tail: false,
+                cmd_line: String::new(),
+                line_count: 0,
+                started_at: None,
+                finished_at: None,
+                executing: false,
             });
             while blocks.len() > 512 {
                 blocks.pop_front();
             }
         },
-        // C: command start. The position is not needed (capture begins
-        // at the prompt line anyway), but an alt-screen flag here dooms
-        // the capture, so it must be remembered.
+        // C starts execution; A only opened a prompt awaiting input.
         2 => {
             if let Some(b) = blocks.iter_mut().rev().find(|b| !b.done) {
+                b.executing = true;
                 b.alt_seen |= alt;
             }
         },
@@ -5005,26 +5050,54 @@ impl ApplicationHandler for App {
         let Some(window) = self.wins[self.cur].window.clone() else {
             return;
         };
-        // egui first: it claims events for its own widgets (the config
-        // window) and lets the rest fall through to the app below. State
-        // events (resize, focus, modifiers) are never gated: the app needs
-        // them no matter what egui is doing.
-        let egui_consumed = self.wins[self.cur].
-            egui
-            .as_mut()
-            .map(|e| e.on_event(&window, &event))
-            .unwrap_or(false);
-        // egui may claim the *keyboard* only while one of its surfaces is
-        // actually open. With nothing on screen, a Tab press still reached
-        // egui's focus-traversal machinery and got consumed there - the
-        // terminal never saw it, and Tab is the terminal's most demanded
-        // key (completion). Mouse events keep their old treatment: egui
-        // can consume those whether or not a panel is open.
-        let egui_consumed = if matches!(event, winit::event::WindowEvent::KeyboardInput { .. }) {
-            egui_consumed && self.egui_owns_keyboard()
-        } else {
-            egui_consumed
+        // Decide ownership BEFORE enqueueing the key. egui-winit always
+        // consumes Tab and queues it for focus traversal, even with no editor
+        // focused. Passing it through after enqueueing would let one Tab both
+        // reach the terminal and focus a sidebar control on the next frame.
+        let route_to_egui = match &event {
+            WindowEvent::KeyboardInput { event: key, .. } => {
+                let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
+                self.egui_owns_keyboard()
+                    && !matches!(action.as_deref(), Some("show_config" | "show_history"))
+            }
+            _ => true,
         };
+        // State and pointer events still reach egui regardless of keyboard ownership.
+        let egui_consumed = route_to_egui && self.wins[self.cur].egui.as_mut()
+            .is_some_and(|e| e.on_event(&window, &event));
+        // A move and click can arrive before the next UI pass. With only
+        // a sidebar open, use the actual event position so crossing its
+        // edge neither swallows a terminal click nor leaks a panel click.
+        let egui_consumed = match &event {
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+                if self.wins[self.cur].overview.is_none() => {
+                self.wins[self.cur].egui.as_ref().filter(|e| {
+                    let st = &e.ui_state;
+                    (st.right_panel != egui_ui::RightPanel::Closed) && !st.menu_open && !st.move_open
+                        && !st.rename_open && !st.font_popup.as_ref().is_some_and(|p| p.open)
+                }).map(|e| {
+                    let (x, y) = match &event {
+                        WindowEvent::CursorMoved { position, .. } => (position.x as f32, position.y as f32),
+                        _ => self.wins[self.cur].pointer,
+                    };
+                    let scale = e.ctx.pixels_per_point();
+                    egui_ui::panel_pointer_input(&e.ctx, egui::pos2(x / scale, y / scale))
+                }).unwrap_or(egui_consumed)
+            }
+            _ => egui_consumed,
+        };
+        // egui owns the strip's layout and drawing; native window tab drags
+        // retain the pointer so a drop can cross the client/window boundary.
+        let pointer_at = match &event {
+            WindowEvent::CursorMoved { position, .. } => Some((position.x as f32, position.y as f32)),
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => Some(self.wins[self.cur].pointer),
+            _ => None,
+        };
+        let strip_pointer = pointer_at.is_some_and(|(_, y)| self.show_tab_strip() && y >= 0.0 && y < self.tab_h)
+            && self.wins[self.cur].overview.is_none()
+            && !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open || e.ui_state.rename_open);
+        let egui_consumed = if pointer_at.is_some() && (strip_pointer || self.wins[self.cur].tab_drag.is_some()
+            || self.wins[self.cur].tab_close_press.is_some()) { false } else { egui_consumed };
         // An event egui claimed was claimed *for* a visual change -- hover,
         // press, drag feedback all only exist in the next frame. Every
         // motion over the panel is claimed, so without this the panel's
@@ -5093,7 +5166,11 @@ impl ApplicationHandler for App {
                     self.wins[self.cur].overview = Some(OverviewState {
                         mode: OverviewMode::Switcher,
                         selected: self.wins[self.cur].active,
+                        original: self.wins[self.cur].active,
                     });
+                    if let Some(e) = self.wins[self.cur].egui.as_ref() {
+                        egui_ui::release_focus(&e.ctx);
+                    }
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
                 // Drain tabs whose child exited
@@ -5205,7 +5282,6 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
-
                 if egui_consumed {
                     return;
                 }
@@ -5215,6 +5291,24 @@ impl ApplicationHandler for App {
                     egui_ui::release_focus(&e.ctx);
                 }
                 let at = self.wins[self.cur].pointer;
+                let hit_tab = if self.show_tab_strip() && at.1 >= 0.0 && at.1 < self.tab_h {
+                    self.wins[self.cur].tab_hits.iter().position(|&(left, right)| at.0 >= left && at.0 < right)
+                } else { None };
+                if button == MouseButton::Left {
+                    if let Some(index) = hit_tab.filter(|&i| self.wins[self.cur].tab_close_hits.get(i)
+                        .is_some_and(|rect| rect.contains(egui::pos2(at.0, at.1)))) {
+                        self.wins[self.cur].tab_close_press = Some(self.wins[self.cur].tabs[index].id);
+                        window.request_redraw();
+                        return;
+                    }
+                }
+                if button == MouseButton::Middle {
+                    if let Some(index) = hit_tab {
+                        self.close_tab_at(index, event_loop);
+                        window.request_redraw();
+                        return;
+                    }
+                }
                 // While the app owns the mouse (and Shift is not bypassing it)
                 // the click is the app's, not the selection's: no paste, no
                 // word select, no tab-strip click.
@@ -5256,16 +5350,17 @@ impl ApplicationHandler for App {
                     // convention the original gets free from VTE.
                     if self.cell_at(at.0, at.1).is_some() { self.request_paste(clipboard::Kind::Primary); }
                 } else if button == MouseButton::Left {
-                    if self.wins[self.cur].hover_tab < self.wins[self.cur].tabs.len() {
+                    if let Some(index) = hit_tab {
                         // Pressing a tab arms a drag but does *not* activate
                         // it: switching on press yanks the view -- and its
                         // scrollback position -- out from under a reorder
                         // started from a scrolled-up terminal. The release
                         // decides whether this was a click.
                         self.wins[self.cur].drag = None;
-                        self.wins[self.cur].tab_drag = Some(self.wins[self.cur].hover_tab);
+                        self.wins[self.cur].tab_drag = Some(index);
                         self.wins[self.cur].tab_drag_moved = false;
-                    } else if self.wins[self.cur].hover_add {
+                    } else if self.show_tab_strip() && at.1 >= 0.0 && at.1 < self.tab_h
+                        && at.0 >= self.wins[self.cur].add_hit.0 && at.0 < self.wins[self.cur].add_hit.1 {
                         self.wins[self.cur].drag = None;
                         let cur_active = self.wins[self.cur].active;
                         if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) { tab.clear_selection(); }
@@ -5317,6 +5412,19 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
+                if button == MouseButton::Left {
+                    if let Some(id) = self.wins[self.cur].tab_close_press.take() {
+                        if let Some(index) = self.wins[self.cur].tabs.iter().position(|tab| tab.id == id) {
+                            let (x, y) = self.wins[self.cur].pointer;
+                            if self.wins[self.cur].tab_close_hits.get(index)
+                                .is_some_and(|rect| rect.contains(egui::pos2(x, y))) {
+                                self.close_tab_at(index, event_loop);
+                            }
+                        }
+                        window.request_redraw();
+                        return;
+                    }
+                }
                 // A tab drag ends wherever the button comes up -- even over
                 // egui, whose panels would otherwise swallow the release and
                 // leave the drag armed. A release without a reorder was a
@@ -5405,12 +5513,15 @@ impl ApplicationHandler for App {
                         key.logical_key, key.text, self.modifiers, egui_consumed
                     );
                 }
-                if key.state == ElementState::Pressed && !egui_consumed {
+                if key.state == ElementState::Pressed {
                     let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
+                    // Panel shortcuts remain global while a sidebar field is focused.
+                    // Other consumed presses belong only to egui's editor.
+                    let panel_shortcut = matches!(action.as_deref(), Some("show_config" | "show_history"));
                     let repeatable = action.as_deref().is_none_or(|action| matches!(action,
                         "prev_tab" | "next_tab" | "prev_tab_row" | "next_tab_row" |
                         "scroll_page_up" | "scroll_page_down" | "enlarge_font" | "shrink_font"));
-                    if !key.repeat || repeatable {
+                    if (!egui_consumed || panel_shortcut) && (!key.repeat || repeatable) {
                         self.handle_key(&key.logical_key, Some(&key), event_loop);
                     }
                 } else {
@@ -5503,7 +5614,7 @@ impl ApplicationHandler for App {
                     // the configuration window is open: Alt is a plain key
                     // in its text fields, and a held "Altica" must not raise
                     // the switcher behind the window.
-                    if !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.config_open) {
+                    if !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Settings)) {
                         *self.switcher_alt_at.lock().unwrap() = Some(std::time::Instant::now());
                     }
                     self.switcher_show_req.store(false, Ordering::SeqCst);
@@ -6146,6 +6257,25 @@ mod sem_tests {
     }
 
     #[test]
+    fn idle_prompt_is_not_a_running_command() {
+        let mut blocks = VecDeque::new();
+        apply_sem_mark(&mut blocks, 0, None, 0, 0, false, 1);
+        apply_sem_mark(&mut blocks, 1, None, 0, 0, false, 1);
+        assert!(!blocks[0].is_history_command());
+        apply_sem_mark(&mut blocks, 2, None, 1, 1, false, 1);
+        blocks[0].cmd_line = "printf hello".into();
+        assert!(blocks[0].is_history_command());
+        assert!(!blocks[0].done);
+        apply_sem_mark(&mut blocks, 3, Some(0), 2, 2, false, 1);
+        blocks[0].text = "a multiline prompt\n$ printf hello\nhello".into();
+        super::finish_block(&mut blocks[0]);
+        apply_sem_mark(&mut blocks, 0, None, 3, 3, false, 2);
+        assert!(blocks[0].done);
+        assert_eq!(blocks[0].cmd_line, "printf hello", "finishing output must keep the captured input");
+        assert_eq!(blocks.iter().filter(|b| b.is_history_command()).count(), 1);
+    }
+
+    #[test]
     fn stray_and_missing_marks_survive() {
         let mut b: VecDeque<super::CommandBlock> = VecDeque::new();
         apply_sem_mark(&mut b, 3, Some(2), 5, 5, false, 0); // D without A: no block, no panic
@@ -6198,7 +6328,7 @@ mod sem_tests {
     fn closed_block_compresses_and_round_trips() {
         let original = "line of build output\n".repeat(200);
         let mut b = block(&original, true, 1);
-        super::compress_closed_block(&mut b);
+        super::finish_block(&mut b);
         assert!(b.compressed.is_some(), "repetitive text compresses");
         assert!(b.text.is_empty(), "the live buffer gives way to the codec");
         assert!(b.stored_len() < original.len() / 2, "the budget sees the compressed size");
@@ -6206,7 +6336,7 @@ mod sem_tests {
         assert!(b.compressed.is_none(), "a second query pays nothing");
         // Small blocks are not worth a frame header.
         let mut s = block("tiny", true, 2);
-        super::compress_closed_block(&mut s);
+        super::finish_block(&mut s);
         assert!(s.compressed.is_none());
         assert_eq!(s.readable_text(), "tiny");
     }

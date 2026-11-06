@@ -22,6 +22,7 @@ default_height: 600
 default_maximize: false
 term_opacity: 0
 hide_single_tab: false
+tab_overview_opacity: 0.65
 background_color: '#122e2e'
 ''')
 fixture = work / 'fixture.py'
@@ -46,7 +47,7 @@ env = dict(os.environ, HOME=str(work), MYPIXELS_CONFIG=str(work / '.mypixels'),
            MYPIXELS_KEYS=str(keys), RUST_LOG='info')
 env.pop('WAYLAND_DISPLAY', None)
 log = (work / 'app.log').open('w')
-app = sp.Popen([(os.environ.get('MYPIXELS_BIN') or os.environ.get('MYPIXELS_BIN') or str(root / 'target/debug/mypixels')), 'python3', str(fixture)],
+app = sp.Popen([(os.environ.get('MYPIXELS_BIN') or os.environ.get('MYPIXELS_BIN') or str(root / 'target/debug/mypixels')), '-s', 'python3', str(fixture)],
                env=env, stdout=log, stderr=log)
 
 
@@ -85,7 +86,10 @@ try:
         thumb_box = (thumb_box[0], thumb_box[1] + strip, thumb_box[2], thumb_box[3] + strip)
     assert thumb_box, 'preview frame missing'
     width, height = thumb_box[2] - thumb_box[0], thumb_box[3] - thumb_box[1]
-    assert abs(width - min(300, w / 4 - 20)) <= 3, thumb_box
+    # Preview sizing follows the responsive modal, which reserves its own margins.
+    columns = max(1, min(4, int((min(w * .84, 1400) - 36 + 14) / 220)))
+    expected_width = min(300, (min(w * .84, 1400) - 36 - 14 * (columns - 1)) / columns - 16)
+    assert abs(width - expected_width) <= 3, thumb_box
     source = live.crop(source_box)
     assert abs(width / height - source.width / source.height) < .04, (source_box, thumb_box)
     expected = source.resize((width, height), Image.Resampling.BOX)

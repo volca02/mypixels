@@ -18,6 +18,20 @@ use portable_pty::Child as _;
 
 use winit::window::Window;
 
+/// One shell marker, timestamped on the PTY thread rather than when the
+/// next UI frame happens to drain it.
+pub struct SemanticMark {
+    pub tab_id: usize,
+    pub code: u8,
+    pub exit: Option<i32>,
+    pub line: usize,
+    pub row: usize,
+    pub col: usize,
+    pub alt: bool,
+    pub command: Option<String>,
+    pub when: std::time::SystemTime,
+}
+
 /// Runs on the terminal event loop thread. Notifies the UI to redraw,
 /// records title changes, and reports child exit.
 #[derive(Clone)]
@@ -50,11 +64,10 @@ pub struct SpikeListener {
     pub resets: Arc<Mutex<Vec<usize>>>,
     /// Tabs whose application just asked (CSI 16 t) for the cell size.
     pub cell_sizes: Arc<Mutex<Vec<usize>>>,
-    /// OSC 133 marks as dispatched: (tab_id, code A..D, exit, abs line,
-    /// eviction-proof row id, cursor column, alt-screen flag). Order per
-    /// tab is the stream's own; the app folds them into command blocks
-    /// (see `App::drain_sems`).
-    pub sems: Arc<Mutex<Vec<(usize, u8, Option<i32>, usize, usize, usize, bool)>>>,
+    /// OSC 133 marks with dispatch positions, captured input, and clocks.
+    /// Order per tab is the stream's own; the app folds them into command
+    /// blocks (see `App::drain_sems`).
+    pub sems: Arc<Mutex<Vec<SemanticMark>>>,
 }
 
 impl SpikeListener {
@@ -91,9 +104,13 @@ impl EventListener for SpikeListener {
             Event::Apc { payload, line, col } => {
                 self.apcs.lock().unwrap().push((self.tab_id, payload, line, col));
             },
-            Event::Semantic { code, exit, line, row, col, alt } => {
+            Event::Semantic { code, exit, line, row, col, alt, command } => {
                 log::debug!("sem mark tab {} code {} exit {:?} line {} row {} col {} alt {}", self.tab_id, code, exit, line, row, col, alt);
-                self.sems.lock().unwrap().push((self.tab_id, code, exit, line, row, col, alt));
+                self.sems.lock().unwrap().push(SemanticMark {
+                    tab_id: self.tab_id, code, exit, line, row, col, alt, command,
+                    when: std::time::SystemTime::now(),
+                });
+                self.notify_window();
             },
             Event::Bell => {
                 log::info!("bell received (tab {})", self.tab_id);

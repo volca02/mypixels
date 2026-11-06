@@ -9,6 +9,12 @@ Performance measurements below use release builds unless marked otherwise.
 
 Current priorities:
 
+- **Shared right-side panels: completed.** A single sidebar state makes history
+  and settings mutually exclusive, clears child popups on panel changes, and
+  both surfaces use the same theme-derived background and controls. Sidebars
+  keep terminal keyboard input active until an editor is explicitly focused;
+  panel shortcuts stay global.
+
 1. **Readable and responsive terminal (P0).** Fixed filename wrapping/overlap,
    fractional grid drift, ignored bold/italic, non-ASCII fallback replacing a
    font's own glyphs, invisible padding being shaped, and unpaced Wayland
@@ -20,8 +26,10 @@ Current priorities:
    initial text (egui), selection autoscroll whose speed answers the pull,
    drag-to-reorder tabs, select-all, Ctrl+wheel zoom, font dialog, themes.
    Open: **IME** and keyboard-grown text selection (Shift+arrows).
-4. **Tab strip usability (P1).** Open: keep the active tab reachable with many
-   tabs, configured wrapping/placement, verify title-update cadence.
+4. **Tab strip usability (P1).** Done: compact egui strip with numbered tabs,
+   close/add controls, active-tab scrolling, and native reorder/detach behavior.
+   Shared UI styling lives in `src/ui_style.rs` (see `docs/ui_style.md`).
+   Open: configured wrapping/placement and verify title-update cadence.
 5. **Task-done notifications: shipped.** An unseen BEL (window unfocused,
    or a tab you are not looking at) becomes a compositor attention request
    plus a red pulse on that tab's cell. `scripts/shell_integration.{bash,

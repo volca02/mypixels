@@ -53,3 +53,41 @@ xvfb-run -a python3 tests/preview_smoke.py
 Requires ImageMagick `import` and Pillow. It compares a switcher thumbnail
 against a downscaled live frame, checking all four edges, aspect ratio, glyph
 placement, and colors. Screenshots are left in `/tmp/mypixels-preview-*`.
+
+To check command history with real zsh, bash, and fish shells (whichever
+are installed), run:
+
+```sh
+xvfb-run -a python3 tests/history_smoke.py
+```
+
+It uses isolated homes and multiline Unicode prompts, checks captured output
+and re-running a command, and opens/dismisses the terminal context menu while
+the history sidebar remains open. It requires xdotool, xsel, ImageMagick's
+`import`, and Pillow, and leaves screenshots in `/tmp/mypixels-history-*`.
+
+For settings navigation, Save/Cancel, font and color pickers, and a small
+window preview:
+
+```sh
+xvfb-run -a python3 tests/settings_smoke.py
+```
+
+It uses an isolated HOME and configuration, checks persistence and cancellation,
+and leaves screenshots in `/tmp/mypixels-settings-*`. Requires xdotool,
+ImageMagick's `import`, and Pillow.
+
+`xvfb-run -a python3 tests/switcher_smoke.py` exercises eight live terminal
+previews, Tab/Shift-Tab and Enter, Escape restoration, card clicks, and navigation
+in a small window. It saves screenshots for visual review. The settings smoke
+also verifies exclusive sidebar visibility and identical surface backgrounds.
+
+`xvfb-run -a python3 tests/panel_keyboard_smoke.py` checks that history and
+settings remain passive for Tab, typing, Enter, Escape, and arrow keys, including
+after clicking panel buttons. It also checks explicit editor focus and global
+shortcuts. Set `MYPIXELS_BIN=target/release/mypixels` to check the release build.
+
+`xvfb-run -a python3 tests/tab_bar_smoke.py` checks the egui strip's add,
+selection, close and close-cancel behavior, drag reordering, 20-tab overflow,
+middle-click close, and native detach into another window. It leaves visual
+artifacts in `/tmp/mypixels-tab-bar-*`.

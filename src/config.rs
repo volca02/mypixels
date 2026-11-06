@@ -175,6 +175,8 @@ impl Default for Config {
         // Copy the last command's captured output (the OSC 133 pool) without
         // leaving the terminal - the in-app twin of `mypixels last --copy`.
         bind("copy_last_output", &["CONTROL+SHIFT+l"]);
+        // The command-history panel (list, filters, search, actions).
+        bind("show_history", &["MOD1+SHIFT+h"]);
         bind("select_all", &["CONTROL+SHIFT+a"]);
         bind("paste_primary", &["SHIFT+Insert"]);
         bind("scroll_page_up", &["SHIFT+Page_Up"]);

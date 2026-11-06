@@ -1,11 +1,7 @@
 # mypixels shell integration (zsh): command marks + a bell on failure.
-#
-#   source /path/to/this/file   (e.g. from ~/.zshrc)
-#
-# OSC 133: precmd reports D (with the exit status, captured first thing)
-# and A (new prompt); preexec reports C (command execution begins). See
-# shell_integration.bash for the bell's meaning - escalation to attention
-# + red tab pulse when the bell is unseen. Sourcing twice is harmless.
+# Source from ~/.zshrc, after prompt setup. Sourcing twice is harmless.
+# B belongs at the end of the rendered prompt, before the user types;
+# preexec runs after ZLE has echoed the input and moved to the next row.
 __mypixels_precmd() {
     local rc=$?
     printf '\e]133;D;%d\a' "$rc"
@@ -13,12 +9,15 @@ __mypixels_precmd() {
         printf '\a'
     fi
     printf '\e]133;A\a'
+    local input_start=$'%{\e]133;B\a%}'
+    if [[ $PS1 != *"$input_start" ]]; then
+        PS1+=$input_start
+    fi
+    return 0
 }
 __mypixels_preexec() {
-    printf '\e]133;B\a\e]133;C\a'
+    printf '\e]133;C\a'
 }
 autoload -U add-zsh-hook
-if [[ -z ${functions[__mypixels_precmd]} ]] || [[ ${precmd_functions[(I)__mypixels_precmd]} -eq 0 ]]; then
-    add-zsh-hook precmd __mypixels_precmd
-    add-zsh-hook preexec __mypixels_preexec
-fi
+add-zsh-hook precmd __mypixels_precmd
+add-zsh-hook preexec __mypixels_preexec

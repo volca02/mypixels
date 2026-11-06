@@ -1,1 +1,6 @@
 target/
+__pycache__/
+*.orig
+*.rej
+*~
+.pi/
