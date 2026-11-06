@@ -172,6 +172,9 @@ impl Default for Config {
         // text feeds the *primary* buffer separately and needs no key.
         bind("copy", &["CONTROL+SHIFT+c"]);
         bind("paste", &["CONTROL+SHIFT+v"]);
+        // Copy the last command's captured output (the OSC 133 pool) without
+        // leaving the terminal - the in-app twin of `mypixels last --copy`.
+        bind("copy_last_output", &["CONTROL+SHIFT+l"]);
         bind("select_all", &["CONTROL+SHIFT+a"]);
         bind("paste_primary", &["SHIFT+Insert"]);
         bind("scroll_page_up", &["SHIFT+Page_Up"]);
@@ -904,6 +907,7 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(find_action(&cfg.bindings, &Key::Character("C".into()), M::CONTROL | M::SHIFT, false).as_deref(), Some("copy"));
         assert_eq!(find_action(&cfg.bindings, &Key::Character("V".into()), M::CONTROL | M::SHIFT, false).as_deref(), Some("paste"));
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("L".into()), M::CONTROL | M::SHIFT, false).as_deref(), Some("copy_last_output"));
         assert_eq!(find_action(&cfg.bindings, &Key::Named(NamedKey::Insert), M::SHIFT, false).as_deref(), Some("paste_primary"));
     }
 

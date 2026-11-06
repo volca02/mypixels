@@ -99,9 +99,11 @@ tooling:
    3-6x the effective memory. Scrollback-grid compression (kitty-style
    line storage) remains the separate, much bigger vendored-grid project;
    do NOT conflate them.
-3. **`mypixels last [n] [--copy]`** over the session bus: `last | grep
-   error`, `last 2 --copy`. One extraction core serves this, the
-   `copy_last_output` action, and MCP - transports stay thin.
+3. **`mypixels last [n] [--copy]`: DONE** over the session bus: `last | grep
+   error`, `last 2 --copy`. One extraction core (`last_output_text`) serves
+   the CLI, the D-Bus reply, the `copy_last_output` action (Ctrl+Shift+L,
+   right-click "Copy last output" - the in-app twin of `last --copy`), and
+   MCP - transports stay thin.
 4. **Images to clipboard: DONE (menu action).** Right-click > "Copy last
    image" puts the untouched upload payload of the tab's newest placed
    image on the clipboard losslessly - `kitty::KittyImage.source` per

@@ -1404,6 +1404,7 @@ impl App {
         add("Select all", "select_all", has_tab, true);
         add("Copy as image", "copy_as_image", has_tab, true);
         add("Copy last image", "copy_last_image", has_image, false);
+        add("Copy last output", "copy_last_output", has_tab, false);
         add("New tab", "new_tab", true, true);
         add("Rename tab", "rename_tab", has_tab, false);
         add("Close tab", "close_tab", has_tab, false);
@@ -3739,6 +3740,18 @@ impl App {
                 self.wins[self.cur].shot = true;
                 for w in self.window_slot.lock().unwrap().iter() {
                     w.request_redraw();
+                }
+            }
+            // The in-app twin of `mypixels last --copy`: the newest
+            // finished block of the pool, straight onto the clipboard.
+            "copy_last_output" => {
+                let text = self.last_output_text(0, 1);
+                if text.is_empty() {
+                    self.show_error("No captured output to copy".into());
+                } else {
+                    self.copy_text(clipboard::Kind::Clipboard, text);
+                    self.wins[self.cur].notice =
+                        Some(("Last output copied".to_string(), Instant::now()));
                 }
             }
             // The lossless path: the store keeps the untouched upload bytes
