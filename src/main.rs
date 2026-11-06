@@ -1433,12 +1433,15 @@ impl App {
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
+            // `put_tab` stores the tab byte in the cell; it is invisible and
+            // shapes to a .notdef box, so it draws as a plain space.
+            let c = if cell.c.is_control() { ' ' } else { cell.c };
 
             let mut fg = resolve(&cell.fg);
             let mut bg = resolve(&cell.bg);
             if cell.flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
             if cell.flags.contains(Flags::DIM) { fg = fg.map(|v| v * 0.66); }
-            let attrs = self.cell_attrs(cell.c, cell.flags);
+            let attrs = self.cell_attrs(c, cell.flags);
             let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
 
             // Continue the current run in place. Building a `String` per cell is
@@ -1452,7 +1455,7 @@ impl App {
                 {
                     r.cells.push((r.text.len(), r.width));
                     r.width += width;
-                    r.text.push(cell.c);
+                    r.text.push(c);
                     if let Some(zw) = cell.zerowidth() {
                         r.text.extend(zw.iter().copied());
                     }
@@ -1463,7 +1466,7 @@ impl App {
                 push_run(&mut runs, r, fg, bg);
             }
             let mut glyph = String::with_capacity(4);
-            glyph.push(cell.c);
+            glyph.push(c);
             if let Some(zw) = cell.zerowidth() {
                 glyph.extend(zw.iter());
             }
