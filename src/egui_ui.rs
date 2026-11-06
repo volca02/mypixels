@@ -1241,7 +1241,7 @@ pub fn switcher_screen(
                         text(
                             ui,
                             help,
-                            "Tab / ⇧Tab: move · release Alt: switch · Esc: cancel",
+                            "← →: move · release Alt: switch · Esc: cancel",
                             colors.muted,
                             11.0,
                             false,
@@ -1253,7 +1253,7 @@ pub fn switcher_screen(
                             // Keep the help centered; its labels describe the actual Alt-held controls.
                             ui.add_space(((full - 650.0) * 0.5).max(0.0));
                             for (key, label) in
-                                [("Tab / Shift-Tab", "move"), ("Enter / release Alt", "switch"), ("Esc", "cancel")]
+                                [("← / →", "move"), ("Enter / release Alt", "switch"), ("Esc", "cancel")]
                             {
                                 egui::Frame::new()
                                     .fill(colors.card)
