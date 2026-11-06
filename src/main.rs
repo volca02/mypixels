@@ -5009,11 +5009,14 @@ fn lettered_f(fin: u8, mcode: u8) -> Vec<u8> {
 /// motion, 64/65 wheel) already OR'd with the modifier bits (4 shift, 8 alt,
 /// 16 ctrl); coordinates are 1-based viewport cells.
 fn mouse_report_bytes(mode: TermMode, code: u16, col: u16, row: u16, release: bool) -> Vec<u8> {
-    let tail = if release { 'm' } else { 'M' };
+    let tail = if release { b'm' } else { b'M' };
     if mode.contains(TermMode::SGR_MOUSE) {
-        format!("\x1b[{};{};{}{}", code, col, row, tail).into_bytes()
+        // SGR mode (?1006): CSI < Cb ; Cx ; Cy M/m - the leading < is what
+        // distinguishes it, and parsers without it drop the report.
+        format!("\x1b[<{};{};{}{}", code, col, row, tail as char).into_bytes()
     } else {
-        format!("\x1b[<{};{};{}{}", code, col, row, tail).into_bytes()
+        // X10/normal mode: CSI M plus three binary bytes, each value +32.
+        vec![0x1b, b'[', b'M', (code + 32).min(255) as u8, (col + 32).min(255) as u8, (row + 32).min(255) as u8]
     }
 }
 
@@ -6017,20 +6020,25 @@ mod mouse_report_tests {
     #[test]
     fn x10_press_release_and_wheel() {
         let mode = mode_with(&[TermMode::MOUSE_REPORT_CLICK]);
-        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0, 42, 17, false)).unwrap(), "\x1b[<0;42;17M");
-        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 3, 42, 17, true)).unwrap(), "\x1b[<3;42;17m");
-        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 64, 1, 1, false)).unwrap(), "\x1b[<64;1;1M");
+        // Normal mode is CSI M plus binary bytes (value + 32), not text.
+        assert_eq!(mouse_report_bytes(mode, 0, 42, 17, false), vec![0x1b, b'[', b'M', 32, 74, 49]);
+        // release carries no tail in normal mode; the button code says it
+        assert_eq!(mouse_report_bytes(mode, 3, 42, 17, true), vec![0x1b, b'[', b'M', 35, 74, 49]);
+        assert_eq!(mouse_report_bytes(mode, 64, 1, 1, false), vec![0x1b, b'[', b'M', 96, 33, 33]);
         // ctrl + middle press: modifier bits are OR'd into the button code
-        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 1 | 16, 5, 6, false)).unwrap(), "\x1b[<17;5;6M");
+        assert_eq!(mouse_report_bytes(mode, 1 | 16, 5, 6, false), vec![0x1b, b'[', b'M', 49, 37, 38]);
     }
 
     #[test]
-    fn sgr_uses_semicolons_and_no_bracket() {
+    fn sgr_keeps_the_leading_bracket() {
         let mode = mode_with(&[TermMode::MOUSE_REPORT_CLICK, TermMode::SGR_MOUSE]);
-        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0, 42, 17, false)).unwrap(), "\x1b[0;42;17M");
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0, 42, 17, false)).unwrap(), "\x1b[<0;42;17M");
         // motion with the left button held
-        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0 | 32, 3, 9, false)).unwrap(), "\x1b[32;3;9M");
-        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 3 | 8, 3, 9, true)).unwrap(), "\x1b[11;3;9m");
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 0 | 32, 3, 9, false)).unwrap(), "\x1b[<32;3;9M");
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 3 | 8, 3, 9, true)).unwrap(), "\x1b[<11;3;9m");
+        // wheel up and down
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 64, 10, 5, false)).unwrap(), "\x1b[<64;10;5M");
+        assert_eq!(String::from_utf8(mouse_report_bytes(mode, 65, 10, 5, false)).unwrap(), "\x1b[<65;10;5M");
     }
 }
 
