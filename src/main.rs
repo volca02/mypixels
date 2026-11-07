@@ -1402,8 +1402,8 @@ impl App {
         let palette = Palette::from_colors(content.colors, &self.config.palette);
         use alacritty_terminal::vte::ansi::{Color, NamedColor};
         let resolve = |color: &Color| palette.resolve_with(color, self.fg, self.bg, self.config.cursor_color.to_f32());
-        let fg = resolve(&Color::Named(NamedColor::Foreground));
-        let bg = resolve(&Color::Named(NamedColor::Background));
+        let def_fg = resolve(&Color::Named(NamedColor::Foreground));
+        let def_bg = resolve(&Color::Named(NamedColor::Background));
         // The cursor is the one element the user must never have to hunt
         // for, whatever palette the theme carries: boost it halfway to
         // white. A theme that already chose a bright cursor loses nothing
@@ -1463,7 +1463,7 @@ impl App {
                 }
             }
             if let Some(r) = cur.take() {
-                push_run(&mut runs, r, fg, bg);
+                push_run(&mut runs, r, def_fg, def_bg);
             }
             let mut glyph = String::with_capacity(4);
             glyph.push(c);
@@ -1482,7 +1482,7 @@ impl App {
             });
         }
         if let Some(r) = cur.take() {
-            push_run(&mut runs, r, fg, bg);
+            push_run(&mut runs, r, def_fg, def_bg);
         }
 
         let cursor = if !show_cursor {
@@ -1498,7 +1498,7 @@ impl App {
             }
         };
 
-        FrameData { runs, cursor, fg, bg, cursor_color }
+        FrameData { runs, cursor, fg: def_fg, bg: def_bg, cursor_color }
     }
 
     /// Which way (and how fast) a selection drag at pointer height `py`
